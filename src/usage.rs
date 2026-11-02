@@ -1098,6 +1098,214 @@ mod tests {
         assert!(matches!(parse_usage("not json"), Err(Error::UsageParse(_))));
     }
 
+    // --- optional quota windows: RED oracles A–D, landed ignored (issue #1591, umbrella #1590) ---
+    //
+    // Since 2026-10-30 a verified Ultra account's usage reply carries `"five_hour": null`. At
+    // `fd8640b`, `parse_usage` rejected that whole reply because it required both windows. The
+    // four oracles below grade the parser fix that serves such a reply (design blocks B-1 and B-2
+    // under #1590) and land BEFORE it: `#[ignore]`d so the suite stays green, each proven RED by
+    // an exact-name `--ignored` run: A, B and D against `fd8640b`, C against the scratch mutant
+    // that fabricates both windows (at `fd8640b` C is GREEN, as its doc comment says). On a tree
+    // that carries the #1613 hot-fix, which reads that reply's session window as `0.0`, A passes
+    // and B fails on its session-window assertion instead of its `expect`; C and D are unchanged.
+    // The fix item removes the four `#[ignore]` attributes and edits nothing else in this block.
+    // The fixture bodies carry quota fields only, never an identity field.
+
+    /// The captured quota fields of a verified Ultra account's reply (2026-11-01T07:20:52Z):
+    /// `five_hour` is JSON null, the weekly window is in `seven_day` and in `limits[weekly_all]`,
+    /// and a `weekly_scoped` entry is present and inactive. No identity field, ever.
+    const CAPTURED_NULL_SESSION_QUOTA_FIELDS: &str = r#"{"five_hour":null,"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":12,"severity":"normal","resets_at":"2026-11-06T22:59:59.916182+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]}"#;
+
+    /// A reply that carries no window at all (no observed instance; pins decision D1).
+    const WINDOWLESS_QUOTA_FIELDS: &str = r#"{"five_hour":null,"seven_day":null,"limits":[]}"#;
+
+    /// A reply that carries a session window and no weekly window (no observed instance; the
+    /// operator's "maybe eventually they will make some account w/o weekly limits").
+    const SESSION_ONLY_QUOTA_FIELDS: &str =
+        r#"{"five_hour":{"utilization":42.0,"resets_at":null},"seven_day":null,"limits":[]}"#;
+
+    /// Reads a window's fraction the same way before and after the `f64` → `Option<f64>` lift
+    /// (issue #1590), so one assertion text compiles, and passes `clippy -D warnings`, on both sides.
+    fn optional_fraction(window: impl Into<Option<f64>>) -> Option<f64> {
+        window.into()
+    }
+
+    /// Oracle A grades REQ-RPL-B-001, "a null session window is served, not rejected": the
+    /// captured null-session reply parses `Ok`, its weekly window reads `0.90` from the top-level
+    /// `seven_day` (the active `weekly_all` entry agrees; the inactive `weekly_scoped` entry's
+    /// `0.12` would be wrong), its raw weekly reset stamp is kept, and its weekly severity is
+    /// `None` because the top-level object carries none — pinned so that the separate
+    /// top-level-shape severity defect (#1606) is never conflated with this fix.
+    /// RED at `fd8640b`: the `expect` fails with `UsageParse("no session (five_hour) dimension")`.
+    /// Un-ignore obligation: the parser fix item under #1590 removes the attributes and edits
+    /// nothing else here.
+    #[test]
+    #[ignore = "RED oracle: pre-authored ahead of the optional-quota-windows parser fix (umbrella #1590), which un-ignores it"]
+    fn oracle_a_the_captured_null_session_reply_parses_with_its_weekly_window() {
+        let report = parse_usage(CAPTURED_NULL_SESSION_QUOTA_FIELDS)
+            .expect("oracle A: the captured null-session reply must parse Ok");
+        let weekly = optional_fraction(report.weekly);
+        assert!(
+            weekly.is_some_and(|fraction| (fraction - 0.90).abs() < 1e-9),
+            "oracle A: weekly window — expected Some(0.90) within 1e-9, got {weekly:?}"
+        );
+        assert_eq!(
+            report.weekly_resets_at.as_deref(),
+            Some("2026-11-06T22:59:59.916061+00:00"),
+            "oracle A: weekly window — the raw reset stamp must be kept verbatim"
+        );
+        assert_eq!(
+            report.weekly_severity, None,
+            "oracle A: weekly window — the top-level `seven_day` carries no severity"
+        );
+    }
+
+    /// Oracle B grades REQ-RPL-C-001, "never a fabricated window value, kept and widened", and
+    /// the session half of REQ-RPL-B-001: the captured reply's absent session window is reported
+    /// absent, never as `0.0` or any fraction, and carries no reset stamp and no severity (a
+    /// window that does not apply has neither). A parser that fills the missing window with
+    /// `0.0` passes Oracle A and fails here, which is why A alone does not suffice.
+    /// RED at `fd8640b`: the `expect` fails with `UsageParse("no session (five_hour) dimension")`.
+    /// Un-ignore obligation: the parser fix item under #1590 removes the attributes and edits
+    /// nothing else here.
+    #[test]
+    #[ignore = "RED oracle: pre-authored ahead of the optional-quota-windows parser fix (umbrella #1590), which un-ignores it"]
+    fn oracle_b_the_captured_reply_reports_no_session_window_never_a_fraction() {
+        let report = parse_usage(CAPTURED_NULL_SESSION_QUOTA_FIELDS).expect(
+            "oracle B: the captured reply must parse Ok before its session window can be read",
+        );
+        let session = optional_fraction(report.session);
+        assert_eq!(
+            session, None,
+            "oracle B: session window — must be absent, never 0.0 or any fraction"
+        );
+        assert_eq!(
+            report.session_resets_at, None,
+            "oracle B: session window — an absent window has no reset stamp"
+        );
+        assert_eq!(
+            report.session_severity, None,
+            "oracle B: session window — an absent window has no severity"
+        );
+    }
+
+    /// Oracle C grades REQ-RPL-B-003, "a reply with no applicable window takes D1's answer":
+    /// under decision D1 (a), the standing default, a 200 reply with no applicable window stays a
+    /// hard parse error and never yields a fraction. The error text is deliberately not pinned,
+    /// because D1 decides the outcome, not the wording: at `fd8640b` the rejection names only
+    /// the session window, and from the #1613 hot-fix on it names both. GREEN at `fd8640b` and
+    /// on a tree carrying #1613, and RED against a parser that fabricates both windows as `0.0`.
+    /// Un-ignore obligation: the parser fix item under #1590 removes the attributes and edits
+    /// nothing else here.
+    #[test]
+    #[ignore = "RED oracle: pre-authored ahead of the optional-quota-windows parser fix (umbrella #1590), which un-ignores it"]
+    fn oracle_c_a_reply_with_no_window_is_never_two_fabricated_windows() {
+        assert!(
+            matches!(
+                parse_usage(WINDOWLESS_QUOTA_FIELDS),
+                Err(Error::UsageParse(_))
+            ),
+            "oracle C: a windowless reply is a parse error under D1 (a), never a reading"
+        );
+    }
+
+    /// Oracle D grades REQ-RPL-B-002, "an absent weekly window is served too" (marked `[ASSUMED]`
+    /// in the PRD: no such reply has been observed): a session-only reply parses `Ok`, its session
+    /// window reads `0.42`, its weekly window is reported absent, never as `0.0` or any fraction,
+    /// with no weekly reset stamp and no weekly severity; and its session reset stamp is `None`
+    /// because the body's `resets_at` is JSON null.
+    /// RED at `fd8640b`: the `expect` fails with `UsageParse("no weekly (seven_day) dimension")`.
+    /// Un-ignore obligation: the parser fix item under #1590 removes the attributes and edits
+    /// nothing else here.
+    #[test]
+    #[ignore = "RED oracle: pre-authored ahead of the optional-quota-windows parser fix (umbrella #1590), which un-ignores it"]
+    fn oracle_d_a_session_only_reply_parses_with_its_weekly_window_absent() {
+        let report = parse_usage(SESSION_ONLY_QUOTA_FIELDS)
+            .expect("oracle D: a session-only reply must parse Ok");
+        let session = optional_fraction(report.session);
+        let weekly = optional_fraction(report.weekly);
+        assert!(
+            session.is_some_and(|fraction| (fraction - 0.42).abs() < 1e-9),
+            "oracle D: session window — expected Some(0.42) within 1e-9, got {session:?}"
+        );
+        assert_eq!(
+            weekly, None,
+            "oracle D: weekly window — must be absent, never 0.0 or any fraction"
+        );
+        assert_eq!(
+            report.weekly_resets_at, None,
+            "oracle D: weekly window — an absent window has no reset stamp"
+        );
+        assert_eq!(
+            report.weekly_severity, None,
+            "oracle D: weekly window — an absent window has no severity"
+        );
+        assert_eq!(
+            report.session_resets_at, None,
+            "oracle D: session window — the body's `resets_at` is JSON null, so no stamp"
+        );
+    }
+
+    /// The three oracle fixture bodies are well-formed JSON objects whose top-level keys are
+    /// exactly `five_hour`, `seven_day` and `limits`, and the window an oracle reads as absent is
+    /// JSON null in its body: `five_hour` in the captured and windowless bodies, `seven_day` in
+    /// the windowless and session-only bodies. A RED above is therefore never a malformed
+    /// fixture, and no identity field was ever pasted into a body. Not ignored: it passes today
+    /// and stays green.
+    #[test]
+    fn the_oracle_fixture_bodies_are_well_formed_json_carrying_only_quota_fields() {
+        // (constant name, body, `five_hour` must be JSON null, `seven_day` must be JSON null)
+        let bodies = [
+            (
+                "CAPTURED_NULL_SESSION_QUOTA_FIELDS",
+                CAPTURED_NULL_SESSION_QUOTA_FIELDS,
+                true,
+                false,
+            ),
+            (
+                "WINDOWLESS_QUOTA_FIELDS",
+                WINDOWLESS_QUOTA_FIELDS,
+                true,
+                true,
+            ),
+            (
+                "SESSION_ONLY_QUOTA_FIELDS",
+                SESSION_ONLY_QUOTA_FIELDS,
+                false,
+                true,
+            ),
+        ];
+        let quota_keys = std::collections::BTreeSet::from(["five_hour", "limits", "seven_day"]);
+        for (name, body, five_hour_is_null, seven_day_is_null) in bodies {
+            let root: Value = serde_json::from_str(body)
+                .unwrap_or_else(|err| panic!("{name} is not well-formed JSON: {err}"));
+            let keys: std::collections::BTreeSet<&str> = root
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} is not a JSON object"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys, quota_keys,
+                "{name}: the top-level keys must be exactly five_hour, seven_day and limits"
+            );
+            if five_hour_is_null {
+                assert_eq!(
+                    root.get("five_hour"),
+                    Some(&Value::Null),
+                    "{name}: five_hour must be JSON null"
+                );
+            }
+            if seven_day_is_null {
+                assert_eq!(
+                    root.get("seven_day"),
+                    Some(&Value::Null),
+                    "{name}: seven_day must be JSON null"
+                );
+            }
+        }
+    }
+
     // --- resets_at normalization to epoch (issue #11) ---
 
     #[test]
