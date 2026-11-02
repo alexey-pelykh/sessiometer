@@ -43,10 +43,12 @@ Example Mapping: 🟦 6 rules · 🟩 34 examples · 🟥 0 open
 > pre-#1598 build fails to read, so an older daemon's compaction stalls instead of erasing) and with a
 > deployment rule that names the older daemon as the binary that erases; D13 as the default, amended
 > with a per-axis `samples: Option<u32>` on each present tier statistic (#1610 absorbed). The fence's
-> conditions take their scenarios under Rule 6 (C1 to C5 and C7; C6, the operator text, is the module
-> doc's under Rule 5 and the runbook item #1603's), the `samples` count under Rule 4, and `CLAUDE.md`'s
-> naming of the store's generation under Rule 5; every scenario holds under both rulings, and one that
-> rests on a ruling says so in its name. D12
+> conditions C1 to C5 and C7 take their scenarios under Rule 6, with C1's committed-fixture arm in
+> Rule 4's T10 scenario; C6, the operator text, is the module doc's under Rule 5 and the runbook item
+> #1603's; the per-axis `samples` count takes its scenarios under Rule 4, with its module-doc clause
+> under Rule 5 and its pins in Rule 6's T17; and `CLAUDE.md`'s naming of the store's generation sits
+> under Rule 5. Every scenario holds under both rulings, and a scenario added or amended under a ruling
+> carries that ruling in its name. D12
 > (`Sample.weekly` optional), the omitted-key reader (design AD-10 against PRD § 11.4) and the
 > serialization refusal of a non-finite `Some` are open, each built for its recorded default with the
 > alternative stated in #1598; a scenario that depends on one says so in its name. Every rule, tier
@@ -334,17 +336,18 @@ Scenario: the version-skew asymmetry, as an fd8640b build meets a store this bin
   Given a store written by this item's binary: raw lines carrying `"session":null`, and the fenced
         rollup `{"format":2,"rollup":{…}}` its first compaction wrote
    When the build at `fd8640b` runs against that store
-   Then its `compact_and_roll` fails at `read_rollup` (`src/usage_store.rs:475-486`: a present-but-
-        unparseable rollup is a hard error, never a silent reset) before it reads or rewrites the raw
-        file — the stall; the fd8640b daemon discards that error (`if let Ok(summary) =
+   Then its `compact_and_roll` reads the raw file and then fails at `read_rollup`
+        (`read_rollup` at `src/usage_store.rs:475-486`: a present-but-unparseable rollup is a hard
+        error, never a silent reset), before it rewrites either file — the stall; the fd8640b daemon
+        discards that error (`if let Ok(summary) =
         compact_and_roll(…)` in `stats_events_for_poll`, `src/daemon.rs:894`) and stops compacting
         without a word, while its `stats` fails loudly with `UsageRollupMalformed`
     And its `reliability` reads the raw file through `read_samples`, which skips every `null` line in
         silence, so its report leaves them out — it deletes nothing
     And only a rollup the older build can decode — none after the first fenced write, unless the file
         is deleted or moved by hand, or lines were appended before a failed first pass — lets its
-        `read_samples` skip the `null` lines and its next `compact_and_roll` rewrite the raw file
-        without them: the silent loss, D6's accepted residual
+        `compact_and_roll` go on to rewrite the raw file without the `null` lines its `read_samples`
+        skipped: the silent loss, D6's accepted residual
     But NOT either outcome counted as a pass of REQ-SMP-Q-001 — loss by an older daemon is D6's
         residual, recorded in PRD § 12, never counted
     But NOT an older `stats` or `reliability` named as the binary that erases — both only read
@@ -466,6 +469,8 @@ Scenario: a rollup written at fd8640b reads back unchanged (D13 as ruled)
     And every statistic's `samples` reads `None` — not recorded, never the bucket's `count` and never `0`
     And encoding it again keeps both members present
     And the decoded `Rollup`, encoded again with `serde_json::to_string`, carries no `samples` key
+    And that re-encoded text, parsed as a `Value`, equals the input parsed as a `Value` — no count
+        gained, no field lost
     But NOT `UsageRollupMalformed` — the loud failure is reserved for the reverse skew, an older
         `stats` over a fenced rollup (an older daemon meets the same error and discards it in silence)
     # The literal is the one quoted in Rule 6's "a legacy rollup survives its first fenced compaction…":
@@ -478,7 +483,7 @@ Scenario Outline: a defensive same-key merge never fabricates an absent axis (D1
   # AC-13 owes for it: the same-key merge fills an absent axis with a zero statistic, and T11 FAILS; it
   # does not compile against origin/main, where the helpers take `&HourStat` / `&DayStat`; low priority:
   # the path is unreachable under roll-once-per-whole-day and reached only through `upsert_hour` /
-  # `upsert_day` on a duplicate key) · covers AC-5
+  # `upsert_day` on a duplicate key) · covers AC-5, AC-26 (the not-recorded arm)
   Given an existing bucket whose session statistic is <existing> and an incoming same-key bucket
         whose session statistic is <incoming>
    When the two are merged
@@ -492,11 +497,11 @@ Examples:
   | Some(max 0.5, mean 0.4), bucket count 2  | None                                     | Some(max 0.5, mean 0.4) — the Some side, unchanged              |
   | Some(max 0.5, mean 0.4), bucket count 2  | Some(max 0.7, mean 0.6), bucket count 2  | Some(max 0.7, mean 0.5) — today's merge, weighted by the counts |
   # Every operand here records no count (`samples: None`), so the merge takes the arm that weights by
-  # the two BUCKET counts — exact only when every sample in both buckets carried the axis, which holds
-  # on the only path that reaches it. When both operands record a count the merge weights by those
-  # instead ("a same-key merge weights each axis by its recorded counts…" below). The `total == 0.0`
-  # arm of `weighted_mean` (`src/usage_store.rs:779-787`) stays as dead defence: both weights are at
-  # least 1 here.
+  # the two bucket counts, as `fd8640b` does, and the merged statistic records no count. When both
+  # operands record a count the merge weights by those instead ("a same-key merge weights each axis
+  # by its recorded counts…" below). The `total == 0.0` arm of
+  # `weighted_mean` (`src/usage_store.rs:779-787`) stays as dead defence: both weights are at least 1
+  # here.
   # `merge_day_stat` (`src/usage_store.rs:770-777`) takes the same arms, with `p95` the max of the
   # two and `cap_hits` additive.
 
@@ -521,7 +526,8 @@ Scenario: each present statistic records how many of its bucket's readings it is
         omits…" and "a mixed bucket folds each axis…" above state — day 14774400 session
         `{max 0.5, mean 0.4, p95 0.5, cap_hits 0}` and weekly `{max 0.76, mean 0.73, p95 0.76, cap_hits 0}`,
         hour 14781600 session `{max 0.5, mean 0.4}` and weekly `{max 0.76, mean 0.73}`
-    But NOT `count` or `coverage` reduced to a per-axis count
+    But NOT `count` or `coverage` reduced to a per-axis count — `count` stays the bucket's whole sample
+        count and `coverage` its ratio to the expected count; the per-axis count is `samples`
     But NOT a count written for an axis no sample carried, not even `0` — an omitted statistic and a
         count of zero say the same thing, and the format must not carry both
     # #1610's own fixture (its eight lines under AC-23) differs from Rule 3's aged lines only in its
@@ -533,15 +539,17 @@ Scenario Outline: the count invariant holds at both tiers for both axes, whether
   # Tier A — graded by usage_store::tests::count_invariants_hold_for_every_folded_bucket (#1598 AC-24
   # as absorbed, a new test beside T8b; no RED at fd8640b: the field does not exist at the base tree,
   # so the test can only fail to compile there; mutant, AC-24's record: counting a sample whose reading
-  # is absent makes the exactly-one case record 4 and fail) · covers AC-24
+  # is absent makes the exactly-one case record 4 and fail) · covers AC-24, AC-5
   Given one hour of four samples, inside a day wholly older than the raw window at
         `now = 200 * DAY_SECS`, in which the <axis> axis is carried by <carriers> and the other axis by
         all four
    When `compact_and_roll` runs once and the hour bucket and the day bucket are read back
    Then at both tiers the <axis> statistic is <statistic>
     And the bucket's `count` is 4 at both tiers
-    But NOT a statistic present without a recorded count, or a count present without a statistic
-    But NOT a recorded count below 1 or above the bucket's `count`
+    But NOT a statistic present without a recorded count, or a count present without a statistic — the
+        fold records a count exactly when it builds a statistic (#1598 Specification § 5)
+    But NOT a recorded count below 1 or above the bucket's `count` — a statistic exists only over at
+        least one reading, and no axis is carried by more samples than the bucket holds
 
 Examples:
   | axis    | carriers    | statistic                                                   |
@@ -559,12 +567,15 @@ Examples:
 Scenario: a rollup written without the count, with an axis omitted in one bucket and a statistic over fewer readings than its bucket in another, reads every statistic as not recorded (D13 as ruled)
   # Tier A — graded by
   # usage_store::tests::a_rollup_without_the_count_reads_every_statistic_as_not_recorded (#1598 AC-25
-  # as absorbed, shape two, a new test beside T10; no RED at fd8640b: a compatibility guard, green at
-  # the base tree by construction, that asserts through the new field and so compiles only after the
-  # change; mutants, AC-25's records: reading a missing count as the bucket's `count`, and separately
-  # as `Some(0)`, each fail) · covers AC-25
+  # as absorbed, shape two, a new test beside T10; a compatibility guard, and no RED owed: the base
+  # tree refuses this file (hour 0 omits `session`, which the base `HourBucket` requires) and the
+  # assertions name `samples`, so the test compiles only after the change; the mutation records are
+  # the evidence — AC-25's: reading a missing count as the bucket's `count`, and separately as
+  # `Some(0)`, each fail) · covers AC-25, AC-5
   Given a rollup file holding
-        `{"rolled_through_ts":9,"hourly":[{"hour_start":0,"count":4,"weekly":{"max":0.76,"mean":0.73}},{"hour_start":3600,"count":4,"session":{"max":0.5,"mean":0.4},"weekly":{"max":0.76,"mean":0.73}}],"daily":[]}`
+    """
+    {"rolled_through_ts":9,"hourly":[{"hour_start":0,"count":4,"weekly":{"max":0.76,"mean":0.73}},{"hour_start":3600,"count":4,"session":{"max":0.5,"mean":0.4},"weekly":{"max":0.76,"mean":0.73}}],"daily":[]}
+    """
    When `read_rollup` decodes it and the decoded `Rollup` is encoded again with `serde_json::to_string`
    Then the decode is `Ok`
     And hour 0 has no session statistic and its weekly `samples` is `None`
@@ -576,7 +587,8 @@ Scenario: a rollup written without the count, with an axis omitted in one bucket
     But NOT a missing count read as the bucket's `count` — hour 3600 would then claim four samples
         behind a mean over two
     But NOT a missing count read as `0` — the store never writes an unknown as a number
-    But NOT a legacy bucket refused
+    But NOT a legacy bucket refused — a bucket without a count is the shape every upgraded store
+        holds, and refusing it would stop compaction and `stats` at their first read
     # No released build writes this shape: #1598 writes the format-2 envelope, with the count, from its
     # first compaction. Neither this shape nor T10's has a `format` key, so both read as the legacy
     # format 1; "re-encoding" is `serde_json::to_string` of the decoded `Rollup`, not `write_rollup`,
@@ -588,7 +600,7 @@ Scenario Outline: a same-key merge weights each axis by its recorded counts when
   # (#1598 AC-26 as absorbed, a new test beside T11, which keeps the not-recorded arm; no RED at
   # fd8640b: a new signature, which does not compile against origin/main; mutant, AC-26's record:
   # weighting by the bucket counts when both counts are recorded fails the first two rows, 0.6 against
-  # 2/3) · covers AC-26
+  # 2/3) · covers AC-26, AC-5
   Given an existing bucket of `count` 4 whose session statistic is <a> and an incoming same-key bucket
         of `count` 4 whose session statistic is <b>
    When the two are merged by <helper>
@@ -599,12 +611,14 @@ Scenario Outline: a same-key merge weights each axis by its recorded counts when
         pooled mean over 6 is 2/3
 
 Examples:
-  | helper            | a                                                 | b                                                 | merged                                                               |
-  | `merge_hour_stat` | `{max 0.5, mean 0.4}` over 2                      | `{max 0.9, mean 0.8}` over 4                      | `{max 0.9, mean 2/3}` over 6 — not the 0.6 the bucket counts give     |
-  | `merge_day_stat`  | `{max 0.5, mean 0.4, p95 0.5, cap_hits 0}` over 2 | `{max 1.2, mean 0.8, p95 1.2, cap_hits 1}` over 4 | `{max 1.2, mean 2/3, p95 1.2, cap_hits 1}` over 6                    |
-  | `merge_hour_stat` | `{max 0.5, mean 0.4}` over 2                      | `{max 0.9, mean 0.8}`, not recorded               | `{max 0.9, mean 0.6}`, not recorded — weighted by the bucket counts  |
-  | `merge_hour_stat` | `{max 0.5, mean 0.4}` over 2                      | absent                                            | the present side unchanged, count included, in both orders           |
-  | `merge_hour_stat` | absent                                            | absent                                            | absent                                                               |
+  | helper            | a                                                 | b                                                        | merged                                                                              |
+  | `merge_hour_stat` | `{max 0.5, mean 0.4}` over 2                      | `{max 0.9, mean 0.8}` over 4                             | `{max 0.9, mean 2/3}` over 6 — not the 0.6 the bucket counts give                   |
+  | `merge_day_stat`  | `{max 0.5, mean 0.4, p95 0.5, cap_hits 0}` over 2 | `{max 1.2, mean 0.8, p95 1.2, cap_hits 1}` over 4        | `{max 1.2, mean 2/3, p95 1.2, cap_hits 1}` over 6                                   |
+  | `merge_hour_stat` | `{max 0.5, mean 0.4}` over 2                      | `{max 0.9, mean 0.8}`, not recorded                      | `{max 0.9, mean 0.6}`, not recorded — weighted by the bucket counts, in both orders |
+  | `merge_day_stat`  | `{max 0.5, mean 0.4, p95 0.5, cap_hits 0}` over 2 | `{max 1.2, mean 0.8, p95 1.2, cap_hits 1}`, not recorded | `{max 1.2, mean 0.6, p95 1.2, cap_hits 1}`, not recorded, in both orders            |
+  | `merge_hour_stat` | `{max 0.5, mean 0.4}` over 2                      | absent                                                   | the present side unchanged, count included, in both orders                          |
+  | `merge_day_stat`  | `{max 0.5, mean 0.4, p95 0.5, cap_hits 0}` over 2 | absent                                                   | the present side unchanged, count included, in both orders                          |
+  | `merge_hour_stat` | absent                                            | absent                                                   | absent                                                                              |
   # The pooled mean is `(m_a·n_a + m_b·n_b) / (n_a + n_b)`: `(0.4·2 + 0.8·4) / 6 = 2/3`, where the two
   # bucket counts give `(0.4·4 + 0.8·4) / 8 = 0.6`. `max` stays the larger of the two, `p95` the larger
   # of the two, `cap_hits` the sum, and the merged statistic records `n_a + n_b` (#1598 Specification
@@ -612,7 +626,7 @@ Examples:
   # roll-once-per-whole-day, and reached only through `upsert_hour` / `upsert_day` on a duplicate key.
 ```
 
-## Rule 5 — the records move with the shape: the module doc says "every dimension the account has" and states the store's format and the version-skew residual; the count posture is corrected wherever it was restated; and `CLAUDE.md` names the store's generation
+## Rule 5 — the records move with the shape: the module doc says "every dimension the account has", says what `samples` means, and states the store's format and the version-skew residual; the count posture is corrected wherever it was restated; and `CLAUDE.md` names the store's generation
 
 ```gherkin
 Scenario: the module doc stops asserting both quota dimensions and states the version-skew residual
@@ -664,8 +678,7 @@ Scenario: the module doc stops asserting both quota dimensions and states the ve
 Scenario: the module doc states the store's format, what an older and a newer build do with it, and what `samples` means (D6 and D13 as ruled)
   # Tier B — pending: documentation, graded through AC-14 by the source text,
   # `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` and the merge judge; the
-  # two greps below decide the citation half; no test binds it · covers AC-14, AC-28, AC-5 (its doc
-  # clause)
+  # two greps below decide the citation half; no test binds it · covers AC-14, AC-28
   Given the module doc of `src/usage_store.rs`
    When #1598 lands
    Then a section headed `# Store format and version skew` — or the operator's rewording — states: from
@@ -694,9 +707,11 @@ Scenario: the module doc states the store's format, what an older and a newer bu
         drops it
     But NOT the daemon-replacement runbook cited as carrying the rule — it carries none until #1603
         lands in tranche 2
-    # The scenario above carries AC-10's heading move and token sweep; this one carries the fence's and
-    # the count's clauses of the same module doc (#1598 Specification § 7). AC-28, as absorbed, is
-    # graded through AC-14, and its original sentence is not written.
+    # The scenario above carries AC-10's heading move and token sweep, and asserts the fence's
+    # version-skew clauses as well; this one carries the fence's section and the `samples` sentence of
+    # the same module doc (#1598 Specification § 7). AC-28, as absorbed, is graded through AC-14, and
+    # its original sentence is not written; the `samples` sentence is graded with it, and the doc
+    # comments AC-5 names are AC-5's, graded by `cargo doc` and review.
 
 Scenario: the count posture is corrected everywhere it was restated, found by its own vocabulary (D13 as ruled)
   # Tier B — pending: documentation, graded by the query, its canary, review and the doc build
@@ -711,15 +726,16 @@ Scenario: the count posture is corrected everywhere it was restated, found by it
     And the pull request body reports the cardinality and the executed query verbatim
     And every returned line carries one disposition: corrected in-band · propagated as a tracked item
         carrying the corrected fact verbatim · recorded as not restating the posture, with the reason ·
-        recorded as frozen by construction, with the reason
-    And if the head adds vocabulary the token set misses, the set is widened, the delta re-run and the
-        widened set recorded
+        recorded as frozen by construction (a scoping-time record that must not be rewritten), with the
+        reason
+    And if the head adds vocabulary the token set misses, the set is widened, the delta (hits that name
+        the vocabulary and cite neither AD-11 nor D13) re-run and the widened set recorded
     But NOT a sweep keyed on citations to AD-11 or D13 — `src/usage_store.rs` names the vocabulary and
         cites neither, which is why a citation-keyed sweep would miss it
     # The corrected proposition: "an axis statistic in a tier bucket records the number of samples it
     # is over; `count` is the bucket's whole sample count; a merge or a pooled read weights by the
-    # recorded count". This stub returns under the query as well, every one of its lines in that
-    # posture, so #1598's executor records each as not restating the posture.
+    # recorded count". This stub returns under the query as well, and each of its returned lines takes
+    # a disposition like any other.
 
 Scenario: `CLAUDE.md` § Schema versions names the store's generation, its home and its bump rule (D6 as ruled)
   # Tier B — pending: documentation, graded by AC-30's greps and their canary; no RED is owed and no
@@ -739,14 +755,15 @@ Scenario: `CLAUDE.md` § Schema versions names the store's generation, its home 
         written shape of either store file bumps the constant — `ROLLUP_FORMAT` is the store's on-disk
         generation, written as the top-level `format` key of `usage-rollup.json`, and a file with no
         key is generation 1
-    But NOT the constant documented only in `src/usage_store.rs`
+    But NOT the constant documented only in `src/usage_store.rs` — `CLAUDE.md` § Schema versions is
+        where a contributor looks for what a shape change bumps
     But NOT a `src/<file>.rs:NNN` citation in the paragraph — no citation gate inspects it
     # The paragraph lands in #1598's pull request, right after the `FORMAT_VERSION` paragraph of
     # `CLAUDE.md`'s "Schema versions are four independent wires", in that section's voice (#1598
-    # Specification § 10); this item only specifies the scenario that grades it.
+    # Specification § 10); this stub only specifies the scenario that grades it.
 ```
 
-## Rule 6 — the rollup fence: every rollup this build writes is the `{"format":2,"rollup":{…}}` envelope, read by explicit dispatch on `format`; every older build refuses it before rewriting either file, a newer generation is refused and left byte-identical, the written shape is pinned to its generation, and a stalled daemon says so
+## Rule 6 — the rollup fence: every rollup this build writes is the `{"format":2,"rollup":{…}}` envelope, read by explicit dispatch on `format`; every older build refuses it before rewriting either file, a legacy rollup survives its first fenced compaction bucket for bucket, a newer generation is refused and left byte-identical, the written shape is pinned to its generation, and a stalled daemon says so
 
 ```gherkin
 Scenario: every rollup this build writes is the format-2 envelope, by `write_rollup` alone and by `compact_and_roll` (D6 as ruled)
@@ -783,9 +800,9 @@ Scenario Outline: a corrupt envelope is reported at its own position, and a `for
         did not match any variant of untagged enum", losing the field's own position
 
 Examples:
-  | file                                                                     | result                                                                                                 |
-  | `{"format":2,"rollup":{"rolled_through_ts":"x","hourly":[],"daily":[]}}` | `Err(Error::UsageRollupMalformed { line: 1, column })` with `column` above 0, the field's own position |
-  | `{"format":"2","rolled_through_ts":0,"hourly":[],"daily":[]}`            | `Err(Error::UsageRollupMalformed { .. })`                                                              |
+  | file                                                                     | result                                                                                                             |
+  | `{"format":2,"rollup":{"rolled_through_ts":"x","hourly":[],"daily":[]}}` | `Err(Error::UsageRollupMalformed { line: 1, column })` with `column` above 0 — never `untagged`'s line 0, column 0 |
+  | `{"format":"2","rolled_through_ts":0,"hourly":[],"daily":[]}`            | `Err(Error::UsageRollupMalformed { .. })`                                                                          |
   # The probe's `format` is a `u32`, so a `format` that is not a number fails inside `serde` with its
   # own line and column, which `read_rollup` reports as `UsageRollupMalformed`, as it does today (#1598
   # Specification § 9).
@@ -797,6 +814,8 @@ Scenario: the dispatch on `format` is explicit, never `#[serde(untagged)]` (D6 a
   Given `src/usage_store.rs` on the pull request's head
    When `git grep -n 'untagged' -- src/usage_store.rs` runs
    Then it prints nothing and exits 1
+    And the grep reads every line of the file, its test module included, so neither T13's messages
+        and comments nor the docs may name the rejected attribute
     And the canary through the same command, `git grep -c 'fn read_rollup' -- src/usage_store.rs`,
         prints `src/usage_store.rs:1` on `origin/main` and on the head
     But NOT an empty result read as a pass without its canary — `git grep` prints nothing on no match
@@ -814,7 +833,7 @@ Scenario: a rollup this build writes is refused by frozen copies of the fd8640b 
   # to catch) · covers AC-18
   Given a nested test module `fd8640b_tiers` holding `Rollup`, `HourBucket`, `HourStat`, `DayBucket` and
         `DayStat`, copied field for field as `fd8640b` declares them — the five types from `Rollup` to
-        `DayStat` at `src/usage_store.rs:223-287` on `main`, identical to `fd8640b`'s, whose
+        `DayStat` at `src/usage_store.rs:223-287` at `40d0e81`, identical to `fd8640b`'s, whose
         `git show fd8640b:src/usage_store.rs` is the reference — deriving `Deserialize` only, the module
         `#[allow(dead_code)]` (its fields are decoded, never read), under the comment "Frozen at
         `fd8640b`: the tier types every pre-#1598 build decodes. Never edit: issue #1598's fence is
@@ -826,7 +845,8 @@ Scenario: a rollup this build writes is refused by frozen copies of the fd8640b 
         bucket omits an axis
    When each file's bytes are decoded with `serde_json::from_slice::<fd8640b_tiers::Rollup>`
    Then each decode is `Err`, its message containing `missing field`
-    But NOT the frozen types edited to track a later shape
+    But NOT the frozen types edited to track a later shape — edited types would decode the new shape,
+        and the test would stop proving that an older build refuses it
     But NOT the test removed or `#[ignore]`d by a later commit — the ruling: "The test stays in every
         later commit"
     # Rollup (b) is there because D13's omitted axis alone fences only a bucket in which no sample
@@ -877,7 +897,8 @@ Scenario: a store a newer generation wrote is refused with its own error, and bo
     And `every_error_variant_enumerates_every_declared_variant` (`src/daemon.rs` tests) stays green,
         with the new variant listed in `every_error_variant()` in declaration order
     But NOT a newer store reported as malformed — which invites deleting it
-    But NOT a newer store reset or rewritten
+    But NOT a newer store reset or rewritten — the newer build's data would be lost; the refusal
+        leaves both files for that build
     # The variant's home and shape: `UsageRollupNewerFormat { found, supported }`, declared right after
     # `UsageRollupMalformed` (`src/error.rs:1136`), its `Display` carrying two integers and nothing else
     # (the redaction meter renders it), its exit code the generic `1`, as `UsageRollupMalformed`'s is.
@@ -925,7 +946,8 @@ Scenario: only compaction rewrites the raw file, and it reads the generation fir
     And `write_samples`' doc states the rule: its one caller is `compact_and_roll`, after `read_rollup`
         has checked the generation, and any new caller checks it first, or it rewrites a store that a
         newer generation wrote
-    But NOT a new caller of `write_samples` that has not read the rollup
+    But NOT a new caller of `write_samples` that has not read the rollup — it would rewrite a raw file
+        that a newer generation wrote, with no generation check before it
     # `compact_and_roll` already reads the rollup, and so checks the generation, before it rewrites
     # either file; the ruling's C5 is that order, kept by the doc sentence and the grep (#1598
     # Specification § 9).
@@ -946,7 +968,8 @@ Scenario: a daemon whose compaction fails says so on its stderr, and emits no ev
     And the existing `stats_events_for_poll` tests in `src/daemon.rs` stay green — the error arm adds no
         event
     But NOT a new event kind for the stall — the event log is outside #1598
-    But NOT the error swallowed in another arm
+    But NOT the error swallowed in another arm — a stall without a word is the failure C7 exists to
+        end
     # Where the line goes: to a file only under a CLI-installed agent, whose plist routes stderr to
     # `daemon.err.log`; the app bundle's agent plist routes stderr to no file, so for the app-registered
     # agent a stall shows only as `stats unavailable` on the socket verb and through #1604's read of the
@@ -964,7 +987,7 @@ is named as such, with what grades it instead.
 | AC-2 — a line carrying `null` on either axis decodes | Rule 2 "a weekly-only line decodes…"; Rule 2 "a session-only line decodes…" | T1, T2 |
 | AC-3 — compaction retains such lines | Rule 3 "compaction keeps every in-window weekly-only line…"; Rule 1's key-set clause | T8a (retention half) |
 | AC-4 — an all-absent axis folds to a finite, readable rollup with no statistic on that axis | Rule 4 "an hour and a day holding only session-less samples fold to a finite, readable rollup"; Rule 4 "a bucket whose readings carried no session reading omits…"; Rule 4 "a mixed bucket folds each axis over exactly the readings that carried it" | T8a (rollup half) with AC-4's first mutant record; T8b with its second, the fabricating fold |
-| AC-5 — the tiers' representation is the per-axis `Option`, and each present statistic records its sample count | Rule 4 "a bucket whose readings carried no session reading omits…" (the omitted member); Rule 4 "a rollup written at fd8640b reads back unchanged"; Rule 4 "a defensive same-key merge…"; Rule 4 "each present statistic records how many of its bucket's readings it is over…"; Rule 4 "the count invariant holds at both tiers for both axes…"; Rule 4 "a rollup written without the count…"; Rule 4 "a same-key merge weights each axis by its recorded counts…"; Rule 5 "the module doc states the store's format…" (the doc clause) | T8b; T10 for the backward read, every statistic's `samples` `None`; T11 for the merge arms; the tests of AC-23 to AC-26 for the count; the doc comments by `cargo doc` and review |
+| AC-5 — the tiers' representation is the per-axis `Option`, and each present statistic records its sample count | Rule 4 "a bucket whose readings carried no session reading omits…" (the omitted member); Rule 4 "a rollup written at fd8640b reads back unchanged"; Rule 4 "a defensive same-key merge…"; Rule 4 "each present statistic records how many of its bucket's readings it is over…"; Rule 4 "the count invariant holds at both tiers for both axes…"; Rule 4 "a rollup written without the count…"; Rule 4 "a same-key merge weights each axis by its recorded counts…" | T8b; T10 for the backward read, every statistic's `samples` `None`; T11 for the merge arms; the tests of AC-23 to AC-26 for the count; the doc comments by `cargo doc` and review |
 | AC-6 — the non-finite guard moves with the shape and is not deleted | Rule 2 "the canary's null arm moves…"; Rule 2 "the five non-finite spellings stay refused at decode" (Tier B); Rule 1 "a non-finite Some fraction is refused at serialization" | T6's moved `null` arm; the committed decode arms under AC-6's presence check; T6's near-end arm with its AC-13 RED run and AC-6's mutant record. T7 (`landing_refuses_a_non_finite_parked_reading_rather_than_fabricating_one`, `src/reliability.rs:7444`) stays green under the reliability rule's own move and has no scenario here |
 | AC-7 — the round-trip test gains the `null` case for both axes | Rule 2 "a Sample round-trips with a null reading on either axis…" | T5, extended, with AC-7's mutant record for the weekly key |
 | AC-8 — a line omitting the `session` key reads as no session reading | Rule 2 "a line omitting the session key reads as no session reading" | T4, written form |
@@ -987,6 +1010,6 @@ is named as such, with what grades it instead.
 | AC-25 (from #1610) `buckets-written-before-the-field-read-as-not-recorded` | Rule 4 "a rollup written at fd8640b reads back unchanged" (shape one); Rule 4 "a rollup written without the count…" (shape two) | T10; `a_rollup_without_the_count_reads_every_statistic_as_not_recorded`; AC-25's two mutant records |
 | AC-26 (from #1610) `same-key-merge-weights-each-axis-by-its-recorded-count` | Rule 4 "a same-key merge weights each axis by its recorded counts…"; Rule 4 "a defensive same-key merge never fabricates an absent axis" (the not-recorded arm) | `a_same_key_merge_weights_each_axis_by_its_recorded_count` with AC-26's mutant record; T11 |
 | AC-27 (from #1610) `corrected-posture-is-stated-everywhere-it-was-restated` | Rule 5 "the count posture is corrected everywhere it was restated…" (Tier B) | the query and its canary, base and head; the cardinality and one disposition per line in the pull request body; review and `cargo doc` |
-| AC-28 (from #1610) `version-skew-is-written-where-a-reader-will-see-it` | Rule 5 "the module doc states the store's format…" (Tier B, its first `But NOT`) | graded through AC-14, as #1598 absorbs it: the source text, `cargo doc`, the merge judge |
+| AC-28 (from #1610) `version-skew-is-written-where-a-reader-will-see-it` | Rule 5 "the module doc states the store's format…" (Tier B, its first `But NOT` and its `samples` clause) | graded through AC-14, as #1598 absorbs it: the source text, `cargo doc`, the merge judge |
 | AC-29 (from #1610) `gates-are-green` | none | the commands AC-29 lists, in its order with flags verbatim: the five `test` steps, the `msrv` build and test, `./scripts/check-no-security-framework.sh` and `cargo deny check advisories sources licenses`; never `--include-ignored` |
 | AC-30 — `CLAUDE.md` § Schema versions names the rollup's generation | Rule 5 "`CLAUDE.md` § Schema versions names the store's generation…" (Tier B) | AC-30's greps and its `FORMAT_VERSION` canary, base and head |

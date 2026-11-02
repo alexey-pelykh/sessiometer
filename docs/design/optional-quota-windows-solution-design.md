@@ -434,7 +434,8 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   the writer the same three choices on that axis — a number (forbidden), no line (contradicts gap
   honesty), or `null`.
 - `read_samples` (`src/usage_store.rs:449-467`) decodes such a line; `compact_and_roll` (its `read_samples` … `write_samples` sequence at `src/usage_store.rs:535-544`) retains it (`REQ-SMP-B-002`).
-- **The tiers** (D13, author-chosen, ratification-pending): `HourBucket.session` /
+- **The tiers** (D13, ratified by the council ruling of 2026-11-02, which also added the per-axis
+  `samples: Option<u32>` count absorbed from #1610): `HourBucket.session` /
   `HourBucket.weekly` (`src/usage_store.rs:237`, `HourStat` at `src/usage_store.rs:250`) and
   `DayBucket.session` / `DayBucket.weekly` (`src/usage_store.rs:261`, `DayStat` at `src/usage_store.rs:278`) become `Option<_>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`;
   the fold at `src/usage_store.rs:669-680` (`HourStat`) folds each axis over the samples that carry
@@ -456,8 +457,10 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   `usage-rollup.json` becomes `{"format":2,"rollup":{…}}`, which every pre-#1598 build fails to read, so
   its `compact_and_roll` returns before it rewrites the raw file — and with the deployment rule B-12
   carries (`REQ-DEP-C-001`). The fence's conditions C1 to C5 and C7 take their scenarios in the stub's
-  Rule 6, C6 (the operator text) in its Rule 5, and D13's per-axis `samples` count its scenarios in
-  the stub's Rule 4, all in `docs/specs/sample-store-session-null.feature.md`.
+  Rule 6, with C1's committed-fixture arm in Rule 4's T10 scenario; C6, the operator text, is the
+  module doc's under Rule 5 and the runbook item #1603's; the per-axis `samples` count takes its
+  scenarios in Rule 4, with its module-doc clause in Rule 5 and its pins in Rule 6's T17 — all in
+  `docs/specs/sample-store-session-null.feature.md`.
 - Tests that move with the shape (`REQ-SMP-C-001`): the canary
   `the_sample_store_cannot_carry_a_non_finite_session_reading` (`src/reliability.rs:7386`) moves twice.
   Its decode loop (`from_str` … `is_err` at `src/reliability.rs:7414-7423`) moves its `"null"` arm to assert
