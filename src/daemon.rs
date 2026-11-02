@@ -83,7 +83,7 @@
 //! least-bad account, its `cause=` (session-blocked vs weekly-exhausted) and, when
 //! known, the `resets_at=` of the relief that unblocks it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Write;
@@ -662,7 +662,11 @@ const SCRUB_ADOPT_WINDOW: Duration = Duration::from_secs(3600);
 /// future multi-provider store stays distinguishable, so the collector names it.
 const USAGE_PROVIDER: &str = "claude";
 
-/// Record ONE usage sample for a poll (issue #156), fail-open, to the INJECTED store path.
+/// Record at most ONE usage sample for a poll (issue #156), fail-open, to the INJECTED store path.
+///
+/// A failed poll records none, and so does a reading flagged
+/// [`session_window_absent`](PolledReading::session_window_absent) while the issue #1613
+/// hot-fix serves; [`append_sample_for_poll`] owns both skips.
 ///
 /// The poll-loop entry point. `samples_path` is `Some` when production wired the real
 /// `crate::paths::usage_samples()` path via `Daemon::with_usage_samples` — then delegate to
@@ -684,7 +688,7 @@ fn record_usage_sample(
     append_sample_for_poll(samples_path, account_label, polled, now);
 }
 
-/// Append one usage [`Sample`] for a poll to `samples_path`, fail-open (issue #156).
+/// Append at most one usage [`Sample`] for a poll to `samples_path`, fail-open (issue #156).
 ///
 /// The collector's testable core — an injected `now` and path make it hermetic:
 ///
@@ -692,7 +696,12 @@ fn record_usage_sample(
 ///   swap poll already fetched, never issuing its own usage request.
 /// - **Gap honesty**: a FAILED poll (`Err` — API error, 401, offline) records
 ///   NOTHING. A gap is absent, never a fabricated zero/healthy sample (issue #157
-///   reads a missing sample as UNKNOWN, never zero).
+///   reads a missing sample as UNKNOWN, never zero). A reading flagged
+///   [`session_window_absent`](PolledReading::session_window_absent) (issue #1613) also
+///   records NOTHING: its `session` is the idle value the hot-fix substitutes, not a
+///   measurement, so it leaves no stored sample rather than a fabricated zero. It is
+///   still a READING, not a gap, to the `usage_gap` tracker — see
+///   [`stats_events_for_poll`].
 /// - **Redaction-clean**: `acct` is the account's roster `label` — never a token or a
 ///   credential-read email. Since #444/#447 an operator-*authored* label MAY be an
 ///   email (the capture prompt pre-fills the harvested address), so the store carries
@@ -715,6 +724,17 @@ fn append_sample_for_poll(
     let Ok(reading) = polled else {
         return; // gap: a poll with no reading records no sample
     };
+    // Gap honesty (issue #1613 hot-fix): a reading whose reply carried no readable session
+    // window (the parse's session lookup found none: a window absent from the reply, or one
+    // present without a numeric fraction) reaches the swap decision as idle (`session: 0.0`),
+    // but that zero is a substitute, not a measurement. Stored, it would read as a real idle
+    // session, where a missing sample reads as UNKNOWN (issue #157). So record nothing: no
+    // stored sample, never a stored zero. (To the `usage_gap` tracker this poll is still a
+    // reading, not a gap: see `stats_events_for_poll`.) Issue #1598 replaces this skip with a
+    // `null` session on the sample line, and issue #1596 removes the flag.
+    if reading.session_window_absent {
+        return;
+    }
     let sample = Sample::new(
         now,
         USAGE_PROVIDER,
@@ -805,9 +825,12 @@ struct StatsState {
 /// the poll loop):
 ///
 /// - **Gap** (`is_gap`): a no-reading poll recorded no sample (#156's gap-honesty), and MAY
-///   surface a rate-limited `usage_gap`. The first poll of a streak emits (`since = now`);
-///   later gapping polls re-emit only once `cadence.gap_reemit_secs` has elapsed, `since` fixed
-///   at the streak start. A reading clears the account's streak.
+///   surface a rate-limited `usage_gap`. A reading flagged `session_window_absent` (#1613)
+///   records no sample either, yet it is not a gap here: `is_gap` only says the poll had no
+///   reading, so such a poll clears the streak and emits no `usage_gap`. The first poll of a
+///   streak emits (`since = now`); later gapping polls re-emit only once
+///   `cadence.gap_reemit_secs` has elapsed, `since` fixed at the streak start. A reading
+///   clears the account's streak.
 /// - **Rollup**: at most once per `cadence.roll_cadence_secs`, run `compact_and_roll` under
 ///   `policy`; when a pass folds ≥1 raw sample, emit a `usage_rollup`.
 ///
@@ -1676,6 +1699,77 @@ struct DecisionState {
     /// fresh verdict IS the edge trigger for the durable `canary_drift` / `canary_ambiguous` /
     /// `canary_cleared` events, and [`Daemon::snapshot`] copies it onto the `status` wire.
     canary: Option<CanaryStatus>,
+    /// The accounts whose absent-session-window stderr line has been printed for their CURRENT
+    /// episode of flagged readings (issue #1613), keyed by `account_uuid`: an entry exists only
+    /// while an episode is open, so a roster reload never has to reindex it. The uuid, and not
+    /// the roster label the printed line names: roster validation keeps `account_uuid` unique but
+    /// checks a label only for emptiness (`src/config/validate.rs`), so two accounts may share a
+    /// label, and a label-keyed latch would give them one entry, each one's unflagged reading
+    /// closing the other's episode. ([`StatsState::gap_state`] predates this and keys on the
+    /// label.) Folded per poll by
+    /// [`note_session_window_absence`](Self::note_session_window_absence); an unflagged reading
+    /// removes the entry, a failed poll leaves it, and a roster reload that drops the account
+    /// drops its entry with the rest of its state (`reconcile_roster`), so a re-added account
+    /// opens a new episode. Removed together with the flag by issue #1596.
+    absent_session_line_noted: BTreeSet<String>,
+}
+
+impl DecisionState {
+    /// Fold one poll's absent-session-window flag (issue #1613) into the latch entry keyed by
+    /// `account_uuid`, and write the operator-facing line, naming the account by `label`, to
+    /// `out` exactly on the FIRST flagged reading of an episode. Later flagged readings in the
+    /// same episode write nothing, so a weekly-only account logs once per episode rather than
+    /// once per poll (the daemon polls it every cycle until #1596 lands); an unflagged reading
+    /// writes nothing, closes the episode and re-arms the line, so the next flagged reading
+    /// writes again. Not called for a failed poll (no reading, so no flag to fold), which is
+    /// what keeps an outage from splitting an episode in two. Both handles arrive as strings,
+    /// as `append_sample_for_poll` and `stats_events_for_poll` take theirs: the dispositioned
+    /// reader of the roster's identity fields is the caller, [`Daemon::tick`]
+    /// (`HANDLE_READ_REGISTER` in `src/use_account.rs`); this helper reads none itself.
+    ///
+    /// The write is a DISCARDED `writeln!` and never `eprintln!`, for the reason
+    /// `run_loop::emit_best_effort` states (issue #1494): `eprintln!` panics when the stderr
+    /// write ITSELF fails, under launchd stderr is a file on the event log's volume, and `tick`
+    /// is awaited by the run loop with no unwind guard, so that panic would end the daemon to
+    /// report one line. A failed write still opens the episode: the line is best-effort, the
+    /// latch is not. The line names the account by its roster label only (never a token, the
+    /// uuid or response bytes), cites #1613 and says #1596 removes it. Production passes the
+    /// daemon's `absent_session_line_out` (stderr); a test passes a sink.
+    ///
+    /// The line is deliberately undated and stderr-only, like the sibling `usage-sample write
+    /// skipped` line. It carries no `ts=`, `event=` or `diag=` field, so `sessiometer log
+    /// --event` cannot select it, and `--since` places it only through the diagnostic channel's
+    /// carry-forward from the nearest preceding timestamped line; with no such line before it,
+    /// `--since` drops it. That is a default install's case: diagnostics are off unless
+    /// `[tunables] verbose` or `-v` turns them on, so the diagnostic channel holds no timestamped
+    /// line, `sessiometer log --since` never selects this one, and only an unwindowed
+    /// `sessiometer log --channel diag` or `daemon.err.log` itself shows it. Nothing is written
+    /// when an episode ends, and the latch lives in memory, so a daemon restart writes the line
+    /// again for every account whose readings are still flagged. A dated start-and-end record
+    /// would be a new log surface, which this hot-fix does not add.
+    fn note_session_window_absence(
+        &mut self,
+        account_uuid: &str,
+        label: &str,
+        flagged: bool,
+        out: &mut dyn Write,
+    ) {
+        if !flagged {
+            self.absent_session_line_noted.remove(account_uuid);
+            return;
+        }
+        // `insert` is `true` only when the uuid was not there: the first flagged reading.
+        if self
+            .absent_session_line_noted
+            .insert(account_uuid.to_owned())
+        {
+            let _ = writeln!(
+                out,
+                "sessiometer: usage reply for {label} carried no readable session window; served \
+                 as idle, no usage sample recorded (issue #1613 hot-fix, removed by #1596)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1931,14 +2025,34 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// collector (#156) runs independently, gated on its own `usage_samples_path` seam — this
     /// `stats` seam adds only the roll + gap-event layer.
     stats: Option<RetentionPolicy>,
+    /// Where the `stats` layer's store lives: `None` (production, and the default) resolves the
+    /// real `crate::paths::usage_samples()` / `usage_rollup()` pair inside
+    /// [`maintain_stats_store`](Self::maintain_stats_store); `Some` is a test's injected
+    /// `(samples, rollup)` pair (`with_stats_store_paths`, test-only). Those real paths come
+    /// from the operator's support dir and are never env-overridable, so a test build refuses
+    /// them ([`stats_store_pair`](Self::stats_store_pair) panics): a tick test that wires
+    /// `with_stats` without this injection fails instead of compacting the real store — the
+    /// same #315 isolation [`usage_samples_path`](Self::usage_samples_path) already has.
+    stats_store_paths: Option<(PathBuf, PathBuf)>,
+    /// Where the issue-#1613 absent-session-window line is written: the operator's stderr in
+    /// production (`std::io::stderr()`, the channel the sibling `usage-sample write skipped`
+    /// line uses), or a test's sink (`with_absent_session_line_out`, test-only), so the
+    /// once-per-episode gate is observable where the line is WRITTEN and not only in the latch.
+    /// Every write to it is a DISCARDED `writeln!` (`DecisionState::note_session_window_absence`),
+    /// for the reason `run_loop::emit_best_effort` states (issue #1494): under launchd stderr is a
+    /// file on the event log's volume, and a failed write must not end the daemon. Removed
+    /// together with the line by issue #1596.
+    absent_session_line_out: Box<dyn Write>,
     /// The per-poll usage-sample store path (issue #156/#315), or `None` to disable the
     /// collector (the hermetic-test default — a test with no on-disk store wires nothing, so
     /// ticking a `FakeDaemon` writes NO sample and the developer's real store stays untouched).
     /// Production wires the real `crate::paths::usage_samples()` path via
-    /// [`with_usage_samples`](Self::with_usage_samples); when `Some`, each successful poll
-    /// appends one redacted `Sample` to it. The path is INJECTED, never resolved inline, so a
-    /// test cannot reach the real support dir (issue #315) — the same reason `NativeHistoryStore`
-    /// holds its paths so a test can point one at a temp dir.
+    /// [`with_usage_samples`](Self::with_usage_samples); when `Some`, each poll appends at most
+    /// one redacted `Sample` to it: none for a failed poll, nor for a reading flagged
+    /// [`session_window_absent`](PolledReading::session_window_absent) (issue #1613). The path
+    /// is INJECTED, never resolved inline, so a test cannot reach the real support dir
+    /// (issue #315) — the same reason `NativeHistoryStore` holds its paths so a test can point
+    /// one at a temp dir.
     usage_samples_path: Option<PathBuf>,
     /// The fleet-runway probe seam (issue #650), or `None` to disable the warn check entirely
     /// (the hermetic-test default — a probe-less `FakeDaemon` tick never reads the real usage
@@ -2125,6 +2239,12 @@ where
             // No usage-stats store maintenance by default (issue #161); production opts in via
             // `with_stats`. Left unset, the collector's roll/gap-event layer is inert.
             stats: None,
+            // The stats layer, when wired, resolves the real store paths unless a test injects
+            // its own pair (`with_stats_store_paths`); production never sets this.
+            stats_store_paths: None,
+            // The issue-#1613 absent-session-window line goes to the operator's stderr; a test
+            // redirects it (`with_absent_session_line_out`) to observe the once-per-episode gate.
+            absent_session_line_out: Box::new(std::io::stderr()),
             // No per-poll usage-sample collector by default (issue #156/#315); production opts
             // in via `with_usage_samples`. Left unset, ticking writes NO sample, so `cargo test`
             // never touches the developer's real store — the isolation the injected path buys.
@@ -2230,14 +2350,37 @@ where
     /// `usage_gap` on a no-reading poll. `policy` is the config-derived
     /// [`StatsConfig::retention_policy`](crate::config::StatsConfig::retention_policy).
     /// Builder-style to mirror `with_swap_lock` / `with_config_path` and keep `new`'s args
-    /// stable; a hermetic test drives the pure [`stats_events_for_poll`] core directly instead.
+    /// stable. A hermetic test drives the pure [`stats_events_for_poll`] core directly, or
+    /// wires `with_stats_store_paths` (test-only) to a temp dir to observe the layer through a
+    /// tick.
     pub(crate) fn with_stats(mut self, policy: RetentionPolicy) -> Self {
         self.stats = Some(policy);
         self
     }
 
-    /// Wire the per-poll usage-sample store path (issue #156/#315): the daemon then appends one
-    /// redacted `Sample` to `path` after each successful poll. Production sets the real
+    /// Point the `stats` layer at an injected `(samples, rollup)` store pair instead of the real
+    /// `crate::paths` pair — test-only, so a tick test can wire [`with_stats`](Self::with_stats)
+    /// without `compact_and_roll` ever reaching the operator's support dir (the #315 isolation
+    /// the sample path has via [`with_usage_samples`](Self::with_usage_samples)). Production
+    /// never calls it; the field stays `None` there.
+    #[cfg(test)]
+    pub(crate) fn with_stats_store_paths(mut self, samples: PathBuf, rollup: PathBuf) -> Self {
+        self.stats_store_paths = Some((samples, rollup));
+        self
+    }
+
+    /// Redirect the issue-#1613 absent-session-window line from stderr to `out` — test-only, so
+    /// a tick test reads the line back and pins the once-per-episode gate where the line is
+    /// written. Production never calls it; the field holds `std::io::stderr()` there.
+    #[cfg(test)]
+    pub(crate) fn with_absent_session_line_out(mut self, out: Box<dyn Write>) -> Self {
+        self.absent_session_line_out = out;
+        self
+    }
+
+    /// Wire the per-poll usage-sample store path (issue #156/#315): the daemon then appends at
+    /// most one redacted `Sample` to `path` per poll (none for a failed poll, nor for a reading
+    /// flagged `session_window_absent`, issue #1613). Production sets the real
     /// `crate::paths::usage_samples()` path; left unset, the collector is inert so a hermetic
     /// `FakeDaemon` tick writes nothing to the real support dir. The path is INJECTED rather than
     /// resolved inline precisely so a test cannot reach the real store (issue #315).
@@ -2264,24 +2407,47 @@ where
         self
     }
 
+    /// The `(samples, rollup)` pair the stats layer maintains: the injected pair when a test set
+    /// one (`with_stats_store_paths`), else the real `crate::paths` pair, or `None` when a real
+    /// path is unavailable. `crate::paths` resolves the operator's support dir and is never
+    /// env-overridable, so a TEST build never takes that fallback: it panics here, before
+    /// `crate::paths` is read, and a tick test that wires `with_stats` without
+    /// `with_stats_store_paths` fails instead of letting `compact_and_roll` rewrite the live
+    /// store. That keeps the #315 isolation [`usage_samples_path`](Self::usage_samples_path) has
+    /// from resting on each test remembering the pair. `cfg!(test)` is false in every other
+    /// build, so production resolves the real pair as before.
+    fn stats_store_pair(&self) -> Option<(PathBuf, PathBuf)> {
+        if let Some((samples, rollup)) = &self.stats_store_paths {
+            return Some((samples.clone(), rollup.clone()));
+        }
+        if cfg!(test) {
+            panic!(
+                "the stats store pair was looked up in a test build with no injected pair, and \
+                 the fallback is the operator's real usage store: wire \
+                 `with_stats_store_paths` beside `with_stats`"
+            );
+        }
+        Some((
+            crate::paths::usage_samples().ok()?,
+            crate::paths::usage_rollup().ok()?,
+        ))
+    }
+
     /// The stats-store maintenance layer wired into [`tick`](Self::tick) (issue #161): a thin
-    /// adapter over the pure [`stats_events_for_poll`] core. Resolve the real store paths, run
-    /// the core under the wired policy + carried gap/roll state, and append any redacted events
-    /// to this tick's batch. A no-op when the stats seam is unset (`with_stats` not called) or a
-    /// store path is unavailable — fail-open, exactly like [`record_usage_sample`]: sampling
-    /// telemetry never breaks the poll/swap loop. `i` is the polled roster index; `is_gap` is
-    /// whether that poll yielded no reading.
+    /// adapter over the pure [`stats_events_for_poll`] core. Resolve the store pair
+    /// ([`stats_store_pair`](Self::stats_store_pair): the injected pair when a test set one,
+    /// else the real `crate::paths` pair, which a test build refuses), run the core under the
+    /// wired policy + carried gap/roll state, and append any redacted events to this tick's
+    /// batch. A no-op when the stats seam is unset (`with_stats` not called) or a real store
+    /// path is unavailable — fail-open, exactly like [`record_usage_sample`]: sampling telemetry
+    /// never breaks the poll/swap loop. `i` is the polled roster index; `is_gap` is whether that
+    /// poll yielded no reading.
     fn maintain_stats_store(&mut self, i: usize, is_gap: bool, now: i64, events: &mut Vec<Event>) {
         let Some(policy) = &self.stats else {
             return; // stats seam not wired (hermetic-test default) → inert
         };
-        let samples_path = match crate::paths::usage_samples() {
-            Ok(path) => path,
-            Err(_) => return,
-        };
-        let rollup_path = match crate::paths::usage_rollup() {
-            Ok(path) => path,
-            Err(_) => return,
+        let Some((samples_path, rollup_path)) = self.stats_store_pair() else {
+            return; // a real store path is unavailable → inert, fail-open
         };
         let produced = stats_events_for_poll(
             &StorePaths {
@@ -2718,9 +2884,10 @@ where
             .filter(|&i| !self.account_backing_off(i) && !self.exhausted_slow_polling(i, active))
         {
             let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
-            // Record ONE usage sample for this poll (issue #156): piggyback the
+            // Record at most ONE usage sample for this poll (issue #156): piggyback the
             // reading just fetched (no extra usage-API call), recording nothing on a
-            // gap and swallowing any store error. The store path is INJECTED (issue #315):
+            // gap or on a reading flagged `session_window_absent` (issue #1613 hot-fix),
+            // and swallowing any store error. The store path is INJECTED (issue #315):
             // `None` in the hermetic-test default, so ticking a `FakeDaemon` writes nothing —
             // off the swap-decision path, so a sampling failure never perturbs the loop below.
             record_usage_sample(
@@ -2735,6 +2902,24 @@ where
             // wired the retention policy; off the swap-decision path, so a store failure is
             // swallowed and never perturbs the loop below.
             self.maintain_stats_store(i, polled.is_err(), wall_clock_now_secs(), &mut events);
+            // Issue #1613 hot-fix visibility: a reading served through the substituted-idle path
+            // (no readable session window in its reply: absent, or present without a numeric
+            // fraction) stores no sample, and no event marks the substitution (the poll still
+            // counts as a reading, so it takes part in other events as one), so say so ONCE per
+            // account per episode on `absent_session_line_out`: stderr in production, the
+            // channel the sibling `usage-sample write skipped` line uses, or a test's sink. The
+            // fold, the once-per-episode gate and the fail-open write all live in
+            // `note_session_window_absence`. Roster label only, never a token or response bytes.
+            // The latch re-arms on the account's next unflagged reading; a failed poll leaves it
+            // as it is. Issue #1596 removes the flag and this line with it.
+            if let Ok(reading) = &polled {
+                self.state.note_session_window_absence(
+                    &self.roster[i].account_uuid,
+                    &self.roster[i].label,
+                    reading.session_window_absent,
+                    &mut *self.absent_session_line_out,
+                );
+            }
             // Project to the lean `Usage` the decision path consumes; the sample-only
             // `severity` does not travel past here.
             let mut result = polled.map(|reading| reading.usage);
@@ -6293,6 +6478,12 @@ mod tests {
         Unauthorized,
         Locked,
         ScopeMissing,
+        /// A reading whose reply carried no readable SESSION window (issue #1613: absent, or
+        /// present without a numeric fraction): served to the decision as idle (`session:
+        /// 0.0`) and flagged `session_window_absent`, so the tick-level usage-sample skip and
+        /// its `usage_gap` interplay are observable through a real tick rather than only at
+        /// the `append_sample_for_poll` seam.
+        OkSessionAbsent(Usage),
     }
 
     /// Scripts each account's poll outcome keyed by `account_uuid`: `ok` yields a
@@ -6377,6 +6568,20 @@ mod tests {
             );
             self
         }
+        /// Script a weekly-only reply (issue #1613): the reading carries `weekly` and an idle
+        /// session with no reset stamp, and the poller flags it `session_window_absent`.
+        pub(super) fn ok_session_absent(mut self, uuid: &str, weekly: f64) -> Self {
+            self.readings.insert(
+                uuid.to_owned(),
+                Scripted::OkSessionAbsent(Usage {
+                    session: 0.0,
+                    weekly,
+                    weekly_resets_at: None,
+                    session_resets_at: None,
+                }),
+            );
+            self
+        }
         pub(super) fn failing(mut self, uuid: &str) -> Self {
             self.readings.insert(uuid.to_owned(), Scripted::Transient);
             self
@@ -6416,6 +6621,13 @@ mod tests {
                 Some(Scripted::Ok(usage)) => Ok(PolledReading {
                     usage: *usage,
                     severity: None,
+                    session_window_absent: false,
+                }),
+                // The issue-#1613 weekly-only reading: the same shape, flagged.
+                Some(Scripted::OkSessionAbsent(usage)) => Ok(PolledReading {
+                    usage: *usage,
+                    severity: None,
+                    session_window_absent: true,
                 }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::Locked) => Err(Error::KeychainLocked { op: "read" }),
@@ -7221,11 +7433,20 @@ mod tests {
                 Some(Scripted::Ok(usage)) => Ok(PolledReading {
                     usage: *usage,
                     severity: None,
+                    session_window_absent: false,
+                }),
+                // The issue-#1613 weekly-only reading: the same shape, flagged. Scripted here as
+                // well so a test can move ONE account between flagged, unflagged and failed
+                // outcomes across ticks (the outcome cell is shared and mutable).
+                Some(Scripted::OkSessionAbsent(usage)) => Ok(PolledReading {
+                    usage: *usage,
+                    severity: None,
+                    session_window_absent: true,
                 }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
-                // Only `Ok` / `Unauthorized` / `ScopeMissing` are scripted here; anything
-                // else (or an unscripted account) is an unavailable transient gap.
+                // Only `Ok` / `OkSessionAbsent` / `Unauthorized` / `ScopeMissing` are scripted
+                // here; anything else (or an unscripted account) is an unavailable transient gap.
                 _ => Err(Error::UsageTransient {
                     status: 0,
                     retry_after: None,
@@ -19668,8 +19889,10 @@ mod tests {
 
     // --- Usage-sample collector (issue #156) ------------------------------
 
-    /// A successful poll writes EXACTLY ONE sample carrying the redacted handle and
-    /// every projected field — including the widened `severity` — with no secret.
+    /// A successful poll whose reading is not flagged `session_window_absent` writes EXACTLY
+    /// ONE sample carrying the redacted handle and every projected field — including the
+    /// widened `severity` — with no secret. A flagged reading writes none (issue #1613:
+    /// `collector_records_nothing_for_a_reading_whose_session_window_was_absent`).
     #[test]
     fn collector_writes_one_redacted_sample_per_successful_poll() {
         let dir = tempfile::tempdir().unwrap();
@@ -19682,6 +19905,7 @@ mod tests {
                 session_resets_at: Some(1_700_003_600),
             },
             severity: Some("critical".to_owned()),
+            session_window_absent: false,
         });
 
         append_sample_for_poll(&samples_path, "work", &reading, 1_700_000_000);
@@ -19732,6 +19956,7 @@ mod tests {
                 session_resets_at: Some(1_700_003_600),
             },
             severity: Some("critical".to_owned()),
+            session_window_absent: false,
         });
         let authored = "alice@example.com";
 
@@ -19770,6 +19995,7 @@ mod tests {
                 session_resets_at: None,
             },
             severity: None,
+            session_window_absent: false,
         });
 
         append_sample_for_poll(&samples_path, "spare", &reading, 42);
@@ -19807,6 +20033,7 @@ mod tests {
                 session_resets_at: None,
             },
             severity: None,
+            session_window_absent: false,
         });
         append_sample_for_poll(&samples_path, "work", &ok, 200);
         let transient: Result<PolledReading> = Err(Error::UsageTransient {
@@ -19878,6 +20105,7 @@ mod tests {
                 session_resets_at: None,
             },
             severity: Some("warning".to_owned()),
+            session_window_absent: false,
         });
 
         // Must NOT panic / unwind: reaching the assertion below proves the write
@@ -19952,6 +20180,853 @@ mod tests {
                 s.acct,
             );
         }
+    }
+
+    /// ISOLATION (the stats-layer half of issue #315): the hermetic `FakeDaemon` default wires
+    /// NO stats policy and NO store pair, so ticking it never runs `compact_and_roll` — and could
+    /// not aim it at the real store if it did: the real `crate::paths` pair is resolved only with
+    /// `stats` wired AND no pair injected, a test build refuses even that
+    /// (`a_test_build_refuses_the_real_stats_store_pair`), and that pair comes from the
+    /// operator's support dir, which no environment variable redirects. Asserts the two
+    /// field defaults — the structural guarantee — like its companion
+    /// `tick_records_no_usage_sample_without_an_injected_path`;
+    /// `tick_compacts_the_injected_stats_store_pair` proves the injected pair is honored.
+    #[tokio::test]
+    async fn tick_wires_no_stats_policy_and_no_store_pair_by_default() {
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.11, 0.10)
+                .ok("u-B", 0.22, 0.10)
+                .ok("u-C", 0.33, 0.10),
+        )
+        .await;
+        assert!(
+            daemon.stats.is_none(),
+            "a FakeDaemon must not wire the stats layer (issue #315 isolation)",
+        );
+        assert!(
+            daemon.stats_store_paths.is_none(),
+            "a FakeDaemon must not wire a stats store pair (issue #315 isolation)",
+        );
+        let _ = warmed_tick(&mut daemon).await;
+        assert!(
+            daemon.stats.is_none() && daemon.stats_store_paths.is_none(),
+            "ticking must wire neither (issue #315)",
+        );
+    }
+
+    /// STORE SAFETY (the stats-layer half of issue #315): a test build never resolves the
+    /// operator's real store pair. With the stats layer wired and NO pair injected, the lookup
+    /// panics, naming the missing `with_stats_store_paths`, before `crate::paths` is read. This
+    /// calls the lookup alone and never ticks, so if the guard is ever dropped, this test fails
+    /// on the missing panic without reaching `compact_and_roll`, and the real store is not
+    /// touched: `crate::paths` only builds the paths.
+    #[tokio::test]
+    #[should_panic(expected = "wire `with_stats_store_paths` beside `with_stats`")]
+    async fn a_test_build_refuses_the_real_stats_store_pair() {
+        let daemon = three_account_daemon(FakeRosterPoller::new())
+            .await
+            .with_stats(RetentionPolicy::default());
+        let _ = daemon.stats_store_pair();
+    }
+
+    /// SEAM HONORED (the stats-layer half of issue #315): with the pair injected via
+    /// `with_stats_store_paths`, a due roll compacts THAT pair — the rollup checkpoint lands at
+    /// the injected rollup path, and the injected samples file is rewritten to what the roll
+    /// leaves — so the stats layer is observable through a tick while every write stays inside
+    /// a test-owned temp dir. The proof is the positive one, because the real pair cannot be
+    /// inspected without racing a live daemon: the injected files change exactly as a roll
+    /// changes them, which a layer that resolved any other pair would leave undone.
+    #[tokio::test]
+    async fn tick_compacts_the_injected_stats_store_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let rollup_path = dir.path().join("usage-rollup.json");
+        // One seeded sample whose whole day aged past the 14-day raw window (it rolls) and one
+        // inside it (it stays raw), relative to the wall clock the tick stamps its roll with.
+        let now = wall_clock_now_secs();
+        let aged = now - 20 * 86_400;
+        let fresh = now - 3_600;
+        for ts in [aged, fresh] {
+            append_sample(&samples_path, &Sample::new(ts, "claude", "spare", 0.5, 0.6)).unwrap();
+        }
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.11, 0.10)
+                .ok("u-B", 0.22, 0.10)
+                .ok("u-C", 0.33, 0.10),
+        )
+        .await
+        .with_usage_samples(samples_path.clone())
+        .with_stats(RetentionPolicy::default())
+        .with_stats_store_paths(samples_path.clone(), rollup_path.clone());
+        assert!(!rollup_path.exists(), "no rollup before the first roll");
+
+        // The first tick polls `work` and its roll is due (no roll anchor yet).
+        let outcome = daemon.tick().await;
+        let rollups: Vec<&Event> = outcome
+            .events
+            .iter()
+            .filter(|e| matches!(e, Event::UsageRollup { .. }))
+            .collect();
+        assert_eq!(
+            rollups.len(),
+            1,
+            "the due roll folded the aged sample: {:?}",
+            outcome.events
+        );
+        assert!(
+            matches!(
+                rollups[0],
+                Event::UsageRollup {
+                    rolled_through,
+                    raw_lines,
+                } if *rolled_through == aged && *raw_lines == 1
+            ),
+            "the event names the folded sample: {:?}",
+            rollups[0]
+        );
+        // The INJECTED rollup path received the checkpoint.
+        let rollup = crate::usage_store::read_rollup(&rollup_path)
+            .expect("the injected rollup file was written");
+        assert_eq!(
+            rollup.rolled_through_ts, aged,
+            "the watermark advanced past the folded sample"
+        );
+        assert_eq!(
+            rollup.daily.len(),
+            1,
+            "one daily bucket: the aged sample's day"
+        );
+        // The INJECTED samples file holds what the roll leaves: the in-window seed plus the
+        // tick's own `work` sample (appended BEFORE the roll ran), and the aged one no more.
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        let kept: Vec<(i64, &str)> = samples.iter().map(|s| (s.ts, s.acct.as_str())).collect();
+        assert_eq!(
+            samples.len(),
+            2,
+            "the aged sample was compacted away and the rest kept: {kept:?}"
+        );
+        assert!(
+            samples.iter().any(|s| s.ts == fresh && s.acct == "spare"),
+            "the in-window seed is kept: {kept:?}"
+        );
+        assert!(
+            samples.iter().any(|s| s.acct == "work" && s.ts >= now),
+            "the tick's own sample is kept: {kept:?}"
+        );
+        assert!(
+            samples.iter().all(|s| s.ts != aged),
+            "the aged sample is gone from the raw tier: {kept:?}"
+        );
+    }
+
+    // --- Issue #1613: the absent-session-window line, observed where it is written ---------
+
+    /// A `Write` sink a tick test hands to `Daemon::with_absent_session_line_out` and keeps a
+    /// handle on, so the issue-#1613 line is read back after a tick: clones share one buffer.
+    #[derive(Clone, Default)]
+    pub(super) struct SharedSink(Rc<RefCell<Vec<u8>>>);
+
+    impl SharedSink {
+        /// Every line written so far, in order.
+        pub(super) fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.borrow().clone())
+                .expect("the line is UTF-8")
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    impl std::io::Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A `Write` whose every write fails: the full-volume stderr the fail-open discipline of
+    /// issue #1494 exists for.
+    pub(super) struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("stderr is a file on a full volume"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The issue-#1613 line's contract, as the hot-fix item pins it: it names the account by its
+    /// roster `label`, says what the parse established, cites #1613 and says #1596 removes it,
+    /// and carries no account uuid (nor a token or response bytes, which these fakes never hold).
+    pub(super) fn assert_absent_session_line(line: &str, label: &str) {
+        assert!(
+            line.starts_with("sessiometer: "),
+            "the daemon's stderr prefix: {line}"
+        );
+        assert!(
+            line.contains(&format!("usage reply for {label} ")),
+            "names the account by its label: {line}"
+        );
+        assert!(
+            line.contains("no readable session window"),
+            "says what the parse established: {line}"
+        );
+        assert!(
+            line.contains("#1613") && line.contains("#1596"),
+            "cites the hot-fix and its retirement: {line}"
+        );
+        assert!(
+            !line.contains("u-A") && !line.contains("u-B") && !line.contains("u-C"),
+            "no account uuid: {line}"
+        );
+    }
+
+    /// Issue #1613: the hot-fix's two tick-level effects for a reading flagged
+    /// `session_window_absent` (its reply carried no readable session window), observed
+    /// through a real tick with BOTH stores wired to a temp dir — the per-poll sample path and
+    /// the stats maintenance layer. The flagged account writes no sample and emits no
+    /// `usage_gap` (to the gap tracker, which keys on `polled.is_err()`, it is a READING); an
+    /// unflagged account through the same wiring writes exactly one; and a FAILING account
+    /// proves the gap tracker is live through this wiring, so the flagged account's silence is
+    /// not the silence of an unwired seam.
+    #[tokio::test]
+    async fn tick_stores_no_sample_and_logs_no_gap_for_a_reading_whose_session_window_was_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let rollup_path = dir.path().join("usage-rollup.json");
+        // `work` (the active) answers weekly-only; `spare` answers with both windows;
+        // `backup` fails outright. The #366 interleave schedules `[work, spare, work, backup]`.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok_session_absent("u-A", 0.10)
+                .ok("u-B", 0.22, 0.10)
+                .failing("u-C"),
+        )
+        .await
+        .with_usage_samples(samples_path.clone())
+        .with_stats(RetentionPolicy::default())
+        .with_stats_store_paths(samples_path.clone(), rollup_path)
+        // `work`'s flagged reading writes the issue-#1613 line; a sink keeps it off the test
+        // run's raw stderr, as the sibling tick tests do.
+        .with_absent_session_line_out(Box::new(SharedSink::default()));
+
+        let polled = |outcome: &TickOutcome| -> String {
+            outcome
+                .diagnostics
+                .iter()
+                .find_map(|d| match d {
+                    Diagnostic::Poll { account, .. } => Some(account.clone()),
+                    _ => None,
+                })
+                .expect("the tick polled an account")
+        };
+        let gaps = |outcome: &TickOutcome| -> Vec<String> {
+            outcome
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::UsageGap { account, .. } => Some(account.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let stored = || crate::usage_store::read_samples(&samples_path).unwrap();
+
+        // Tick 1 — the flagged account: no sample stored, no `usage_gap` emitted.
+        let t1 = daemon.tick().await;
+        assert_eq!(polled(&t1), "work", "tick 1 polls the flagged active");
+        assert!(stored().is_empty(), "a flagged reading stores no sample");
+        assert!(
+            gaps(&t1).is_empty(),
+            "a flagged reading is a reading, not a gap: no usage_gap"
+        );
+
+        // Tick 2 — an unflagged account through the same wiring writes exactly one sample.
+        let t2 = daemon.tick().await;
+        assert_eq!(polled(&t2), "spare", "tick 2 polls the unflagged peer");
+        let samples = stored();
+        assert_eq!(samples.len(), 1, "an unflagged reading stores one sample");
+        assert_eq!(
+            samples[0].acct, "spare",
+            "and it is the unflagged account's"
+        );
+        assert!(gaps(&t2).is_empty());
+
+        // Tick 3 — the flagged account again: still nothing of its own stored, still no gap.
+        let t3 = daemon.tick().await;
+        assert_eq!(polled(&t3), "work", "tick 3 re-polls the flagged active");
+        assert_eq!(stored().len(), 1, "the flagged account added no sample");
+        assert!(gaps(&t3).is_empty());
+
+        // Tick 4 — the failing account: the gap tracker IS live through this wiring.
+        let t4 = daemon.tick().await;
+        assert_eq!(polled(&t4), "backup", "tick 4 polls the failing peer");
+        assert_eq!(
+            gaps(&t4),
+            vec!["backup".to_owned()],
+            "a no-reading poll emits usage_gap, so the flagged silence above was observed"
+        );
+        assert_eq!(stored().len(), 1, "a failed poll stores nothing either");
+    }
+
+    /// Issue #1613: the rate limit on the absent-session-window stderr line is
+    /// once per account per EPISODE — the first flagged reading prints, later ones in the same
+    /// run are silent, an unflagged reading re-arms it, and the next flagged reading prints
+    /// again; another account's episode is independent. Pinned here because a line per flagged
+    /// poll would repeat every cycle for every weekly-only account until #1596 lands.
+    #[test]
+    fn the_absent_session_line_fires_once_per_episode_and_re_arms_on_an_unflagged_reading() {
+        let mut state = DecisionState::default();
+        let mut out = SharedSink::default();
+        state.note_session_window_absence("u-A", "work", true, &mut out);
+        assert_eq!(
+            out.lines().len(),
+            1,
+            "the first flagged reading of an episode prints"
+        );
+        assert_absent_session_line(&out.lines()[0], "work");
+        state.note_session_window_absence("u-A", "work", true, &mut out);
+        assert_eq!(
+            out.lines().len(),
+            1,
+            "a second flagged reading in the same episode is silent"
+        );
+        state.note_session_window_absence("u-A", "work", true, &mut out);
+        assert_eq!(out.lines().len(), 1, "and so is a third");
+        state.note_session_window_absence("u-B", "spare", true, &mut out);
+        assert_eq!(
+            out.lines().len(),
+            2,
+            "another account's first flagged reading is its own episode"
+        );
+        assert_absent_session_line(&out.lines()[1], "spare");
+        state.note_session_window_absence("u-A", "work", false, &mut out);
+        assert_eq!(
+            out.lines().len(),
+            2,
+            "an unflagged reading prints nothing and closes the episode"
+        );
+        assert!(
+            !state.absent_session_line_noted.contains("u-A"),
+            "the episode is closed"
+        );
+        state.note_session_window_absence("u-A", "work", true, &mut out);
+        assert_eq!(
+            out.lines().len(),
+            3,
+            "the next flagged reading opens a new episode and prints"
+        );
+        state.note_session_window_absence("u-B", "spare", true, &mut out);
+        assert_eq!(
+            out.lines().len(),
+            3,
+            "while the other account's episode is still open"
+        );
+    }
+
+    /// A failed write of the line (under launchd stderr is a file on the event log's volume, so
+    /// a full volume fails it) is swallowed, never a panic, and the episode still opens: the
+    /// line is best-effort, the latch is not. The companion of the run loop's discarded
+    /// `writeln!` discipline (issue #1494), which `eprintln!` would have broken here.
+    #[test]
+    fn a_failed_write_of_the_absent_session_line_does_not_panic_and_still_opens_the_episode() {
+        let mut state = DecisionState::default();
+        // Must NOT panic / unwind: reaching the assertions below proves the write error was
+        // swallowed and control returned to the (simulated) poll loop.
+        state.note_session_window_absence("u-A", "work", true, &mut FailingWriter);
+        assert!(
+            state.absent_session_line_noted.contains("u-A"),
+            "the episode opened although its line could not be written"
+        );
+        // The episode is open, so the next flagged reading attempts no write at all — observed
+        // through a sink that would have recorded one.
+        let mut sink = SharedSink::default();
+        state.note_session_window_absence("u-A", "work", true, &mut sink);
+        assert!(
+            sink.lines().is_empty(),
+            "no second line: the failed first write still counted as the episode's line"
+        );
+    }
+
+    /// The poll loop folds the latch for the polled account only, and writes the line where the
+    /// latch says it is due: the flagged active's first poll opens its episode and writes the
+    /// line once; the unflagged peer's poll opens no episode of its own, closes none but its own
+    /// and writes nothing; and the active's next flagged poll finds its episode still open, so
+    /// no second line. The line is read off the injected sink, so a loop that wrote on every
+    /// flagged poll, or never wrote, fails here even with the latch state intact. Each tick's
+    /// polled account is asserted from its `Diagnostic::Poll` before the latch is read, so the
+    /// unflagged peer's step is exercised rather than assumed from the schedule.
+    #[tokio::test]
+    async fn tick_opens_the_absent_session_line_episode_for_the_polled_account_only() {
+        let sink = SharedSink::default();
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok_session_absent("u-A", 0.10)
+                .ok("u-B", 0.22, 0.10)
+                .ok("u-C", 0.33, 0.10),
+        )
+        .await
+        .with_absent_session_line_out(Box::new(sink.clone()));
+        let noted = |daemon: &FakeDaemon| -> Vec<String> {
+            daemon
+                .state
+                .absent_session_line_noted
+                .iter()
+                .cloned()
+                .collect()
+        };
+        assert!(noted(&daemon).is_empty(), "no episode before any poll");
+        assert!(sink.lines().is_empty(), "no line before any poll");
+        let t1 = daemon.tick().await;
+        assert!(peer_polled(&t1, "work"), "tick 1 polls the flagged active");
+        assert_eq!(
+            noted(&daemon),
+            vec!["u-A".to_owned()],
+            "the first flagged reading opens the active's episode, keyed by its uuid"
+        );
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 1, "and writes the line once: {lines:?}");
+        assert_absent_session_line(&lines[0], "work");
+        let t2 = daemon.tick().await;
+        assert!(
+            peer_polled(&t2, "spare") && !peer_polled(&t2, "work"),
+            "tick 2 polls the unflagged peer, not the active"
+        );
+        assert_eq!(
+            noted(&daemon),
+            vec!["u-A".to_owned()],
+            "an unflagged reading opens no episode and closes none but its own"
+        );
+        assert_eq!(sink.lines().len(), 1, "and writes nothing");
+        let t3 = daemon.tick().await;
+        assert!(
+            peer_polled(&t3, "work"),
+            "tick 3 polls the flagged active again"
+        );
+        assert_eq!(
+            noted(&daemon),
+            vec!["u-A".to_owned()],
+            "still one open episode: one line per episode"
+        );
+        assert_eq!(
+            sink.lines().len(),
+            1,
+            "a later flagged reading in the open episode writes no second line"
+        );
+    }
+
+    /// A roster reload that drops an account drops its absent-session-line entry with the rest of
+    /// its state (`reconcile_roster`), and a reload that drops ANOTHER account leaves the open
+    /// episode alone. Re-added while its replies are still weekly-only, the account opens a new
+    /// episode and its line is written again; a latch that kept the removed account's entry
+    /// would leave that first flagged reading silent.
+    #[tokio::test]
+    async fn a_roster_reload_that_drops_an_account_closes_its_absent_session_episode() {
+        let sink = SharedSink::default();
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.11, 0.10)
+                .ok_session_absent("u-B", 0.10)
+                .ok("u-C", 0.33, 0.10),
+        )
+        .await
+        .with_absent_session_line_out(Box::new(sink.clone()));
+        let t1 = daemon.tick().await;
+        assert!(peer_polled(&t1, "work"), "tick 1 polls the active");
+        let t2 = daemon.tick().await;
+        assert!(peer_polled(&t2, "spare"), "tick 2 polls the flagged peer");
+        assert_eq!(
+            sink.lines().len(),
+            1,
+            "its first flagged reading writes the line"
+        );
+        assert!(
+            daemon.state.absent_session_line_noted.contains("u-B"),
+            "and opens its episode"
+        );
+
+        assert_eq!(
+            daemon.reconcile_roster(
+                vec![account("u-A", "work"), account("u-B", "spare")],
+                ReloadIntent::Mutating,
+            ),
+            commands::ReconcileOutcome::Adopted,
+        );
+        assert!(
+            daemon.state.absent_session_line_noted.contains("u-B"),
+            "a reload that drops another account leaves the open episode alone"
+        );
+
+        assert_eq!(
+            daemon.reconcile_roster(vec![account("u-A", "work")], ReloadIntent::Mutating),
+            commands::ReconcileOutcome::Adopted,
+        );
+        assert!(
+            daemon.state.absent_session_line_noted.is_empty(),
+            "a reload that drops the account drops its entry with the rest of its state"
+        );
+
+        assert_eq!(
+            daemon.reconcile_roster(
+                vec![account("u-A", "work"), account("u-B", "spare")],
+                ReloadIntent::AppendOnly,
+            ),
+            commands::ReconcileOutcome::Adopted,
+        );
+        let mut polled_spare = false;
+        for _ in 0..4 {
+            let t = daemon.tick().await;
+            if peer_polled(&t, "spare") {
+                polled_spare = true;
+                break;
+            }
+        }
+        assert!(
+            polled_spare,
+            "the re-added account is polled within one schedule cycle"
+        );
+        let lines = sink.lines();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the re-added account's first flagged reading opens a new episode and writes again: \
+             {lines:?}"
+        );
+        assert_absent_session_line(&lines[1], "spare");
+    }
+
+    /// Two roster accounts may share a label: validation keeps `account_uuid` unique but checks
+    /// a label only for emptiness. The absent-session-line latch keys on the uuid, so the peer's
+    /// unflagged polls neither open an episode of their own nor close the flagged account's:
+    /// that episode opens on its first poll and stays open, one entry across the cycles, and its
+    /// line is written exactly once. (Keyed by label, the two accounts would share one entry,
+    /// and the peer's reading would close the flagged account's episode every cycle, re-arming
+    /// its line into one per cycle.)
+    #[tokio::test]
+    async fn tick_keeps_an_absent_session_episode_open_past_an_unflagged_peer_sharing_its_label() {
+        // `u-A` (the active) answers weekly-only; its peer `u-B` carries the SAME label and answers
+        // with both windows. Built inline because every shared fixture gives distinct labels.
+        let roster = vec![account("u-A", "work"), account("u-B", "work")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        std::mem::forget(dir); // kept alive for the daemon's lifetime, as the shared fixtures do
+        let tun = tunables(95, 80, 0);
+        let sink = SharedSink::default();
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new()
+                .ok_session_absent("u-A", 0.10)
+                .ok("u-B", 0.22, 0.10),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+        .with_absent_session_line_out(Box::new(sink.clone()));
+        let open_episodes = |daemon: &FakeDaemon| daemon.state.absent_session_line_noted.len();
+
+        for cycle in 1..=3 {
+            let _ = daemon.tick().await;
+            // The #366 interleave polls `[u-A, u-B]` each cycle: pinned before reading the latch
+            // off it, since both accounts print the same label on the tick diagnostics.
+            assert_eq!(
+                daemon.state.poll_schedule,
+                vec![0, 1],
+                "cycle {cycle}: the active `u-A` is polled first, then its peer `u-B`"
+            );
+            assert_eq!(
+                open_episodes(&daemon),
+                1,
+                "cycle {cycle}: the flagged account's episode is open after its poll"
+            );
+            assert_eq!(
+                sink.lines().len(),
+                1,
+                "cycle {cycle}: its line was written once, on its first poll, and not again"
+            );
+            let _ = daemon.tick().await;
+            assert_eq!(
+                open_episodes(&daemon),
+                1,
+                "cycle {cycle}: the unflagged peer sharing the label neither opens an episode \
+                 of its own nor closes the flagged account's"
+            );
+            assert_eq!(
+                sink.lines().len(),
+                1,
+                "cycle {cycle}: and the peer's poll writes no line"
+            );
+        }
+        assert_absent_session_line(&sink.lines()[0], "work");
+    }
+
+    // --- Issue #1613: one account moving between outcomes across ticks -------------------
+
+    /// The daemon the outcome-transition tests drive (issue #1613): ONE roster account (`work`
+    /// = `u-A`, the active), so with no peers the #366 schedule polls it on EVERY tick; a
+    /// [`SeamPoller`] whose shared cell lets a test move that account between the flagged,
+    /// unflagged and failed outcomes between ticks; the issue-#1613 line redirected to a sink;
+    /// and BOTH stores wired to a temp dir — the per-poll usage-sample collector and the stats
+    /// layer. Store safety: `with_stats` is always wired beside `with_stats_store_paths`, and a
+    /// test build refuses the operator's live store anyway (`Daemon::stats_store_pair` panics
+    /// rather than resolve the real `crate::paths` pair, which no environment variable
+    /// redirects).
+    struct TransitionRig {
+        daemon: Daemon<SeamPoller, FakeCredentialStore, FakeAccountStash, FakeClock>,
+        outcomes: SeamOutcomes,
+        sink: SharedSink,
+        samples_path: PathBuf,
+        /// Keeps the temp store alive for the rig's lifetime.
+        _dir: tempfile::TempDir,
+    }
+
+    impl TransitionRig {
+        async fn new(first: Scripted) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let samples_path = dir.path().join("usage-samples.jsonl");
+            let rollup_path = dir.path().join("usage-rollup.json");
+            let roster = vec![account("u-A", "work")];
+            let store = store_holding(b"A-token").await;
+            let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
+            let (json_dir, json) = claude_json("u-A");
+            std::mem::forget(json_dir); // kept alive for the daemon's lifetime, as the fixtures do
+            let tun = tunables(95, 80, 0);
+            let outcomes: SeamOutcomes =
+                Rc::new(RefCell::new(HashMap::from([("u-A".to_owned(), first)])));
+            let sink = SharedSink::default();
+            let daemon = Daemon::new(
+                roster,
+                SeamPoller {
+                    outcomes: outcomes.clone(),
+                },
+                store,
+                stash,
+                FakeClock::frozen(),
+                json,
+                &tun,
+            )
+            .with_absent_session_line_out(Box::new(sink.clone()))
+            .with_usage_samples(samples_path.clone())
+            .with_stats(RetentionPolicy::default())
+            .with_stats_store_paths(samples_path.clone(), rollup_path);
+            Self {
+                daemon,
+                outcomes,
+                sink,
+                samples_path,
+                _dir: dir,
+            }
+        }
+
+        /// Script the account's outcome for its NEXT poll.
+        fn script(&self, outcome: Scripted) {
+            self.outcomes.borrow_mut().insert("u-A".to_owned(), outcome);
+        }
+
+        /// One tick, which must have POLLED the account: asserted off the tick's own
+        /// diagnostics, so a skipped poll (a back-off window still armed) fails here instead
+        /// of passing every later assertion on carried state.
+        async fn tick(&mut self) -> TickOutcome {
+            let outcome = self.daemon.tick().await;
+            assert!(
+                outcome
+                    .diagnostics
+                    .iter()
+                    .any(|d| matches!(d, Diagnostic::Poll { account, .. } if account == "work")),
+                "the tick must have polled `work`: {:?}",
+                outcome.diagnostics
+            );
+            outcome
+        }
+
+        /// A transient poll arms the account's per-account back-off window on the monotonic
+        /// clock (issue #293), inside which its next poll is SKIPPED. Advance the frozen clock
+        /// to the window's end, as real time would, so the next tick polls the account again.
+        fn clear_backoff(&mut self) {
+            let until = self.daemon.state.accounts[0]
+                .health
+                .poll_backoff_until
+                .expect("a transient poll arms the per-account back-off (issue #293)");
+            let now = self.daemon.clock.now();
+            self.daemon
+                .clock
+                .advance(until.saturating_duration_since(now));
+        }
+
+        fn episode_open(&self) -> bool {
+            self.daemon.state.absent_session_line_noted.contains("u-A")
+        }
+        fn lines(&self) -> usize {
+            self.sink.lines().len()
+        }
+        fn stored(&self) -> usize {
+            crate::usage_store::read_samples(&self.samples_path)
+                .unwrap()
+                .len()
+        }
+        fn gap_streak_open(&self) -> bool {
+            self.daemon.state.stats_state.gap_state.contains_key("work")
+        }
+    }
+
+    /// The `since` of every `usage_gap` this tick emitted for `work`.
+    fn usage_gaps_for_work(outcome: &TickOutcome) -> Vec<i64> {
+        outcome
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::UsageGap { account, since } if account == "work" => Some(*since),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Flagged → unflagged → flagged: the unflagged reading closes the episode (and stores its
+    /// sample), and the next flagged reading opens a new one, so the line is due AGAIN. Pins
+    /// the re-arm through the poll loop, which only an unflagged READING performs.
+    #[tokio::test]
+    async fn an_unflagged_reading_closes_the_absent_session_episode_and_the_next_flagged_one_reopens_it(
+    ) {
+        let mut rig = TransitionRig::new(Scripted::OkSessionAbsent(reading(0.0, 0.10))).await;
+
+        let t1 = rig.tick().await;
+        assert!(
+            rig.episode_open(),
+            "the first flagged reading opens the episode"
+        );
+        assert_eq!(rig.lines(), 1, "and writes the line once");
+        assert_eq!(rig.stored(), 0, "a flagged reading stores no sample");
+        assert!(
+            usage_gaps_for_work(&t1).is_empty(),
+            "a flagged reading is a reading, not a gap"
+        );
+
+        rig.script(Scripted::Ok(reading(0.30, 0.10)));
+        let t2 = rig.tick().await;
+        assert!(
+            !rig.episode_open(),
+            "an unflagged reading closes the episode"
+        );
+        assert_eq!(rig.lines(), 1, "and writes no line");
+        assert_eq!(rig.stored(), 1, "an unflagged reading stores its sample");
+        assert!(usage_gaps_for_work(&t2).is_empty());
+
+        rig.script(Scripted::OkSessionAbsent(reading(0.0, 0.10)));
+        let t3 = rig.tick().await;
+        assert!(
+            rig.episode_open(),
+            "the next flagged reading opens a new episode"
+        );
+        assert_eq!(rig.lines(), 2, "and the line is due again");
+        assert_eq!(rig.stored(), 1, "a flagged reading stores no sample");
+        assert!(usage_gaps_for_work(&t3).is_empty());
+    }
+
+    /// Flagged → failed → flagged: a failed poll has no reading, so it folds nothing into the
+    /// latch and leaves the episode OPEN; the flagged reading after the outage finds it still
+    /// open, so no second line. (The failed poll is a gap to the stats layer all the same.)
+    #[tokio::test]
+    async fn a_failed_poll_inside_an_absent_session_episode_leaves_it_open_so_no_second_line() {
+        let mut rig = TransitionRig::new(Scripted::OkSessionAbsent(reading(0.0, 0.10))).await;
+
+        let _t1 = rig.tick().await;
+        assert!(
+            rig.episode_open(),
+            "the first flagged reading opens the episode"
+        );
+        assert_eq!(rig.lines(), 1, "and writes the line once");
+
+        rig.script(Scripted::Transient);
+        let t2 = rig.tick().await;
+        assert!(rig.episode_open(), "a failed poll leaves the episode open");
+        assert_eq!(rig.lines(), 1, "and writes no line");
+        assert_eq!(
+            usage_gaps_for_work(&t2).len(),
+            1,
+            "a no-reading poll is a gap to the stats layer: usage_gap"
+        );
+        assert_eq!(rig.stored(), 0, "a failed poll stores nothing");
+
+        rig.clear_backoff();
+        rig.script(Scripted::OkSessionAbsent(reading(0.0, 0.10)));
+        let t3 = rig.tick().await;
+        assert!(rig.episode_open(), "the episode is still the same one");
+        assert_eq!(
+            rig.lines(),
+            1,
+            "the episode survived the outage, so no second line"
+        );
+        assert!(
+            usage_gaps_for_work(&t3).is_empty(),
+            "a flagged reading ends the gap streak"
+        );
+        assert_eq!(rig.stored(), 0, "a flagged reading stores no sample");
+    }
+
+    /// Failed → flagged → failed: to the `usage_gap` tracker a flagged reading is a READING, so
+    /// it ends the account's gap streak although it stores no sample; the failure after it
+    /// opens a NEW streak and emits at once — a continuing streak would have been rate-limited
+    /// for `GAP_REEMIT_MIN_SECS`, which is the difference a flagged poll that skipped the stats
+    /// layer would show. The episode, opened by the flagged reading, survives the failure.
+    #[tokio::test]
+    async fn a_flagged_reading_between_two_failed_polls_ends_the_gap_streak_and_the_next_failure_opens_a_new_one(
+    ) {
+        let mut rig = TransitionRig::new(Scripted::Transient).await;
+
+        let t1 = rig.tick().await;
+        let first = usage_gaps_for_work(&t1);
+        assert_eq!(
+            first.len(),
+            1,
+            "the first failed poll opens a streak: usage_gap"
+        );
+        assert!(rig.gap_streak_open(), "the streak is carried");
+        assert!(!rig.episode_open(), "no reading, no episode");
+        assert_eq!(rig.lines(), 0, "and no line");
+        assert_eq!(rig.stored(), 0, "a failed poll stores nothing");
+
+        rig.clear_backoff();
+        rig.script(Scripted::OkSessionAbsent(reading(0.0, 0.10)));
+        let t2 = rig.tick().await;
+        assert!(
+            usage_gaps_for_work(&t2).is_empty(),
+            "a flagged reading is a reading to the gap tracker: no usage_gap"
+        );
+        assert!(!rig.gap_streak_open(), "and it ends the streak");
+        assert!(rig.episode_open(), "the flagged reading opens the episode");
+        assert_eq!(rig.lines(), 1, "and writes the line once");
+        assert_eq!(rig.stored(), 0, "yet it stores no sample");
+
+        rig.script(Scripted::Transient);
+        let t3 = rig.tick().await;
+        let second = usage_gaps_for_work(&t3);
+        assert_eq!(
+            second.len(),
+            1,
+            "the next failed poll opens a NEW streak and emits at once: a continuing streak \
+             would be rate-limited for {GAP_REEMIT_MIN_SECS}s"
+        );
+        assert!(
+            second[0] >= first[0],
+            "the new streak starts at or after the old one: {first:?} then {second:?}"
+        );
+        assert!(rig.gap_streak_open(), "the new streak is carried");
+        assert!(rig.episode_open(), "a failed poll leaves the episode open");
+        assert_eq!(rig.lines(), 1, "and writes no line");
+        assert_eq!(rig.stored(), 0);
     }
 
     // --- Usage-stats store maintenance events (issue #161) ------------------

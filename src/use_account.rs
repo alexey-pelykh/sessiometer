@@ -1377,6 +1377,7 @@ mod tests {
                         session_resets_at: None,
                     },
                     severity: None,
+                    session_window_absent: false,
                 }),
                 Probe::Dead => Err(Error::UsageUnauthorized),
                 Probe::ScopeMissing => Err(Error::UsageScopeMissing),

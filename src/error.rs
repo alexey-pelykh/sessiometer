@@ -549,9 +549,13 @@ pub(crate) enum Error {
     )]
     UsageScopeMissing,
 
-    /// The poll returned `200` but the body could not be parsed into both quota
-    /// dimensions. The wrapped message is a structural hint (a field/shape name)
-    /// — never any response bytes. Treated like missing data: skip, never swap.
+    /// The poll returned `200` but the body is not JSON or carries no readable weekly
+    /// (`seven_day`) quota dimension. A SESSION dimension that cannot be found, beside
+    /// a readable weekly one, is not this error while the issue #1613 hot-fix serves:
+    /// `parse_usage` reads that session as idle and flags the reading instead, and
+    /// issue #1596 replaces the idle read with `None`. The wrapped message is a
+    /// structural hint (a field/shape name) — never any response bytes. Treated like
+    /// missing data: skip, never swap.
     #[error("malformed usage response: {0}")]
     UsageParse(String),
 

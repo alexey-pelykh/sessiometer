@@ -772,9 +772,9 @@ impl Config {
         let s = &self.stats;
         out.push_str("\n[stats]\n");
         out.push_str(
-            "# The usage-stats store: the daemon records one sample per poll and periodically\n\
-             # rolls aged raw samples down into hourly then daily aggregates. These horizons bound\n\
-             # each tier; the `stats` verb reads the store offline.\n",
+            "# The usage-stats store: the daemon records at most one sample per poll and\n\
+             # periodically rolls aged raw samples down into hourly then daily aggregates. These\n\
+             # horizons bound each tier; the `stats` verb reads the store offline.\n",
         );
         out.push_str(
             "# Seconds a raw per-poll sample is kept before its whole aged-out day is folded into\n\
