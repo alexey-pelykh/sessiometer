@@ -455,9 +455,9 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   (a comment on #1598) ratified this representation and amended it with a **rollup fence** #1598 builds —
   `usage-rollup.json` becomes `{"format":2,"rollup":{…}}`, which every pre-#1598 build fails to read, so
   its `compact_and_roll` returns before it rewrites the raw file — and with the deployment rule B-12
-  carries (`REQ-DEP-C-001`). The fence's conditions C1–C7 and D13's per-axis `samples` count are
-  #1598's; the ruling schedules their record in this planning set as a records change after the scope
-  pull request merges.
+  carries (`REQ-DEP-C-001`). The fence's conditions C1–C7 take their scenarios in the stub's Rule 6 and
+  D13's per-axis `samples` count its scenarios in the stub's Rule 4, both in
+  `docs/specs/sample-store-session-null.feature.md`.
 - Tests that move with the shape (`REQ-SMP-C-001`): the canary
   `the_sample_store_cannot_carry_a_non_finite_session_reading` (`src/reliability.rs:7386`) moves twice.
   Its decode loop (`from_str` … `is_err` at `src/reliability.rs:7414-7423`) moves its `"null"` arm to assert
