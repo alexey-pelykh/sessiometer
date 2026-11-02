@@ -85,7 +85,11 @@ const POLL_TIMEOUT_SECS: u32 = 30;
 /// worst-case scalar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Usage {
-    /// Fraction in `[0.0, 1.0]` of the rolling 5-hour session window consumed.
+    /// Fraction in `[0.0, 1.0]` of the rolling 5-hour session window consumed. While
+    /// the issue #1613 hot-fix serves, a reply that carried no readable session window
+    /// beside a readable weekly one also reaches here, as an idle `0.0` that is a
+    /// substitute, not a measurement: [`PolledReading::session_window_absent`] marks it,
+    /// and issue #1596 replaces the substitute with `None`.
     pub(crate) session: f64,
     /// Fraction in `[0.0, 1.0]` of the weekly window consumed.
     pub(crate) weekly: f64,
@@ -97,7 +101,9 @@ pub(crate) struct Usage {
     /// whose reset actually ends the all-exhausted state.
     pub(crate) weekly_resets_at: Option<i64>,
     /// Epoch seconds at which the rolling 5-hour SESSION window resets, when the
-    /// API reported a parseable timestamp; `None` otherwise. Carried so `status`
+    /// API reported a parseable timestamp; `None` otherwise, including for a reply
+    /// that carried no readable session window, which the issue #1613 hot-fix serves
+    /// as idle (see [`session`](Usage::session)). Carried so `status`
     /// can show a per-account "resets in" (issue #72): in normal rotation an
     /// account is session-exhausted (out for hours) while its weekly window is
     /// fine, so the SESSION reset — not the weekly one — is when it becomes usable
@@ -124,6 +130,20 @@ pub(crate) struct PolledReading {
     /// ([`crate::usage_store::Sample`]); a tolerant free string, never parsed to an
     /// enum, so an unrecognised future value is retained rather than dropped.
     pub(crate) severity: Option<String>,
+    /// `true` when the reply carried no readable SESSION window (the session lookup in
+    /// [`parse_usage`] found none) beside a readable weekly one, so `usage.session` is the
+    /// idle `0.0` the hot-fix substitutes, not a measurement (issue #1613). It GATES THE
+    /// USAGE-SAMPLE WRITER: `append_sample_for_poll` records NO sample for a flagged
+    /// reading (no stored sample, never a stored zero; to the `usage_gap` tracker the poll
+    /// is still a reading, not a gap). Its one other reader is the daemon's poll loop, which
+    /// folds it into a per-account latch (`DecisionState::note_session_window_absence`) that
+    /// writes one stderr line on the first flagged reading of an episode. The swap-decision
+    /// path does not read it; it keeps using the idle `0.0` in `usage`.
+    ///
+    /// `false` for every reply whose session window was found, whatever its fraction: a
+    /// window present at `0.0` with no reset stamp is a real idle reading and is not
+    /// flagged. Issue #1596 removes this field together with the substitution.
+    pub(crate) session_window_absent: bool,
 }
 
 /// The full parse of a usage response: both dimensions plus each window's reset
@@ -153,6 +173,12 @@ struct UsageReport {
     /// The weekly window's provider-reported `severity`, verbatim, when present
     /// (see `session_severity`).
     weekly_severity: Option<String>,
+    /// `true` when the session lookup found no window, so `session` is the idle value the
+    /// hot-fix substitutes (`0.0`, no reset stamp, no severity) and not a reading (issue
+    /// #1613; see [`parse_usage`]). Derived from the lookup's `None`, never from a zero
+    /// `session`: a window that is present at `0.0` is a real reading and stays
+    /// `false`. The poll path carries it onto [`PolledReading::session_window_absent`].
+    session_absent: bool,
 }
 
 impl UsageReport {
@@ -189,10 +215,11 @@ impl UsageReport {
 }
 
 /// Seam: reads one account's usage quota as a [`PolledReading`] — the swap-decision
-/// [`Usage`] plus the sample-only `severity`, from a SINGLE usage-API call (issue
-/// #156). The only impl ([`RealUsageSource`]) polls the API; it is exercised in tests
-/// through its [`UsageTransport`] seam (a fake transport returns scripted responses),
-/// not a separate fake source.
+/// [`Usage`], the sample-only `severity` and, while the issue #1613 hot-fix serves, the
+/// [`session_window_absent`](PolledReading::session_window_absent) flag — from a SINGLE
+/// usage-API call (issue #156). The only impl ([`RealUsageSource`]) polls the API; it is
+/// exercised in tests through its [`UsageTransport`] seam (a fake transport returns
+/// scripted responses), not a separate fake source.
 pub(crate) trait UsageSource {
     async fn usage(&self) -> Result<PolledReading>;
 }
@@ -241,14 +268,16 @@ where
         let status = response.status;
         match classify_status(status) {
             UsageStatus::Unauthorized => Err(Error::UsageUnauthorized),
-            // The one fetch+classify success path: parse ONCE and keep both the
-            // decision `Usage` and the sample-only `severity` (issue #156), so the
-            // daemon's sample piggybacks this poll with no extra API call.
+            // The one fetch+classify success path: parse ONCE and keep the decision
+            // `Usage`, the sample-only `severity` (issue #156) and the issue #1613
+            // `session_window_absent` flag, so the daemon's sample piggybacks this poll
+            // with no extra API call and skips a flagged reading.
             UsageStatus::Success => {
                 let report = parse_usage(&response.body)?;
                 Ok(PolledReading {
                     usage: report.to_usage(),
                     severity: report.severity(),
+                    session_window_absent: report.session_absent,
                 })
             }
             UsageStatus::ScopeMissing => Err(Error::UsageScopeMissing),
@@ -443,16 +472,58 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 ///
 /// A window that cannot be found is a hard [`Error::UsageParse`] (never a
 /// fabricated `0`): the loop must skip, not swap, on missing data.
+///
+/// **One exception, a hot-fix (issue #1613):** a SESSION window that cannot be found,
+/// beside a WEEKLY window that can, is read as idle on the decision path (`session`
+/// `0.0`, no session reset, no session severity), and the report is flagged
+/// `session_absent` so the usage-sample writer records no sample for it. Issue #1596
+/// replaces this read with `None`.
+///
+/// "Cannot be found" covers every shape the session lookup ([`dimension`]) returns
+/// `None` for, that is, no readable fraction in the top-level `five_hour` and none in
+/// `limits[]`: a `five_hour` that is absent or `null`, a `five_hour` object with no
+/// numeric `utilization` (or `percent`), and a `limits[]` session entry without
+/// `percent` or `utilization` (no readable fraction: [`fraction_of`] tries both on a
+/// `limits[]` entry too), or no such entry at all. A reply with no WEEKLY window stays
+/// a hard error, whether or not it carries a session window.
+///
+/// The idle read is JUSTIFIED only for a reply that carries no session window anywhere:
+/// a `five_hour` that is absent or `null` AND no session entry in `limits[]`. Such an
+/// account has no session window, so it is never session-blocked, and rejecting its whole
+/// reply left the daemon blind to every such account. An absent or `null` `five_hour`
+/// alone does not establish that: the lookup falls back to `limits[]`, where a session
+/// entry may still carry a window — readable, in which case the lookup does not return
+/// `None` at all, or unreadable, which is the third shape above. Every other `None` shape
+/// may carry a session window the lookup cannot read; it is served idle all the same
+/// under the scoping decision for this hot-fix, ratification-pending: the branch keys on
+/// the lookup's `None` because #1596 keeps [`dimension`] unchanged and reads every such
+/// shape as `None` too, so narrowing only the hot-fix would diverge from the design that
+/// retires it. Whether an unreadable window should stay a parse error instead is issue
+/// #1614's open question.
 fn parse_usage(body: &str) -> Result<UsageReport> {
     let root: Value =
         serde_json::from_str(body).map_err(|_| Error::UsageParse("body is not JSON".into()))?;
 
-    let (session, session_resets_at, session_severity) =
-        dimension(&root, "five_hour", &["session", "five_hour"])
-            .ok_or_else(|| Error::UsageParse("no session (five_hour) dimension".into()))?;
-    let (weekly, weekly_resets_at, weekly_severity) =
-        dimension(&root, "seven_day", &["weekly_all", "seven_day", "weekly"])
-            .ok_or_else(|| Error::UsageParse("no weekly (seven_day) dimension".into()))?;
+    let session = dimension(&root, "five_hour", &["session", "five_hour"]);
+    let weekly = dimension(&root, "seven_day", &["weekly_all", "seven_day", "weekly"]);
+    let Some((weekly, weekly_resets_at, weekly_severity)) = weekly else {
+        // Name exactly what was missing: with the session lookup no longer a hard error
+        // (issue #1613), a reply with NO usable window at all would otherwise carry the
+        // weekly-alone message. The text is read where the error is printed whole, the CLI's
+        // `sessiometer: malformed usage response: …` line from `main`; the daemon's poll
+        // diagnostics keep only the class, `transient`, which both rejections share.
+        let message = if session.is_none() {
+            "no session (five_hour) and no weekly (seven_day) dimension"
+        } else {
+            "no weekly (seven_day) dimension"
+        };
+        return Err(Error::UsageParse(message.into()));
+    };
+    // The flag records that the LOOKUP found nothing (issue #1613), not that the
+    // fraction is zero: a session window present at `0.0` with no reset stamp is a real
+    // idle reading and must not be flagged.
+    let session_absent = session.is_none();
+    let (session, session_resets_at, session_severity) = session.unwrap_or((0.0, None, None));
 
     Ok(UsageReport {
         session,
@@ -461,6 +532,7 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
         weekly_resets_at,
         session_severity,
         weekly_severity,
+        session_absent,
     })
 }
 
@@ -892,6 +964,136 @@ mod tests {
     }
 
     #[test]
+    fn a_weekly_only_reply_is_served_with_its_session_read_as_idle_until_the_lift() {
+        // Issue #1613: the captured reply of an account that has no session window
+        // at all (`five_hour` is `null`) beside a present `seven_day` window and
+        // `limits[]` weekly entries. It parses to `Ok`, the absent session read as
+        // idle (`0.0`, no reset, no severity) and flagged so the sample store can
+        // skip it.
+        let body = r#"{"five_hour":null,"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":12,"severity":"normal","resets_at":"2026-11-06T22:59:59.916182+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]}"#;
+        let report = parse_usage(body).expect("a weekly-only reply must parse");
+        assert_eq!(report.session, 0.0);
+        assert_eq!(report.session_resets_at, None);
+        assert_eq!(report.session_severity, None);
+        assert!((report.weekly - 0.90).abs() < 1e-9);
+        assert_eq!(
+            report.weekly_resets_at.as_deref(),
+            Some("2026-11-06T22:59:59.916061+00:00")
+        );
+        assert!(
+            report.session_absent,
+            "the absent session window must be flagged"
+        );
+    }
+
+    #[test]
+    fn a_two_window_reply_is_not_flagged_as_missing_its_session() {
+        // Issue #1613 regression guard: a reply carrying both windows parses as it
+        // always did and does not set the absent-session flag.
+        let body = r#"{
+            "limits": [
+                {"kind": "session", "percent": 42, "resets_at": "2026-06-26T18:00:00Z", "is_active": true},
+                {"kind": "weekly_all", "percent": 88, "severity": "critical", "resets_at": "2026-06-30T00:00:00Z", "is_active": true}
+            ]
+        }"#;
+        let report = parse_usage(body).unwrap();
+        assert!((report.session - 0.42).abs() < 1e-9);
+        assert!((report.weekly - 0.88).abs() < 1e-9);
+        assert!(
+            !report.session_absent,
+            "a two-window reply carries its session window"
+        );
+    }
+
+    #[test]
+    fn a_reply_with_neither_window_is_a_parse_error() {
+        // Issue #1613 regression guard: only a missing SESSION window is lifted to
+        // idle. A reply with no usable window at all stays a hard parse error.
+        let body = r#"{"five_hour":null,"seven_day":null,"limits":[]}"#;
+        assert!(matches!(parse_usage(body), Err(Error::UsageParse(_))));
+    }
+
+    /// Issue #1613: the two rejections name the windows they lack. The weekly-alone
+    /// message is fixed word for word by that issue's specification; the
+    /// neither-window message is distinct and names both, so an empty reply never reads
+    /// as the weekly-alone case where the error is printed whole, the CLI's
+    /// `malformed usage response` line (before #1613 the neither-window body failed on the
+    /// SESSION message, and it would otherwise have moved silently onto the weekly one).
+    #[test]
+    fn a_rejected_reply_names_the_windows_it_lacks() {
+        let session_only = r#"{"limits": [{"kind": "session", "percent": 10}]}"#;
+        match parse_usage(session_only) {
+            Err(Error::UsageParse(message)) => {
+                assert_eq!(message, "no weekly (seven_day) dimension")
+            }
+            other => panic!("expected UsageParse, got {other:?}"),
+        }
+
+        let neither = r#"{"five_hour":null,"seven_day":null,"limits":[]}"#;
+        match parse_usage(neither) {
+            Err(Error::UsageParse(message)) => assert_eq!(
+                message,
+                "no session (five_hour) and no weekly (seven_day) dimension"
+            ),
+            other => panic!("expected UsageParse, got {other:?}"),
+        }
+    }
+
+    // --- Issue #1613: every shape the session lookup cannot read ---
+
+    /// Asserts the hot-fix's absent-session reading on `body`: served (`Ok`), the session
+    /// idle with no reset stamp and no severity, the weekly window read, and the report
+    /// flagged. The weekly fraction is the caller's, so a body whose weekly entry was
+    /// mis-read fails here rather than passing on the session assertions alone.
+    fn assert_served_idle_and_flagged(body: &str, weekly: f64) {
+        let report = parse_usage(body).expect("a weekly-only reply must parse");
+        assert_eq!(report.session, 0.0, "the absent session reads as idle");
+        assert_eq!(
+            report.session_resets_at, None,
+            "no session reset stamp is carried"
+        );
+        assert_eq!(
+            report.session_severity, None,
+            "no session severity is carried"
+        );
+        assert!(
+            (report.weekly - weekly).abs() < 1e-9,
+            "the weekly window is read"
+        );
+        assert!(report.session_absent, "the report is flagged");
+    }
+
+    /// The flag keys on the session LOOKUP returning `None`, not on `five_hour` being JSON
+    /// `null`: a reply with no `five_hour` key at all (and no session entry in `limits[]`)
+    /// is the same absent window. A fix deriving the flag from a literal `null` passes the
+    /// captured-body oracle above and misses this shape.
+    #[test]
+    fn a_reply_with_no_five_hour_key_is_served_idle_and_flagged() {
+        let body = r#"{"seven_day":{"utilization":40.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"},"limits":[{"kind":"weekly_all","group":"weekly","percent":40,"severity":"normal","resets_at":"2026-11-06T22:59:59.916061+00:00","is_active":true}]}"#;
+        assert_served_idle_and_flagged(body, 0.40);
+    }
+
+    /// A `five_hour` OBJECT whose `utilization` is `null` and which carries no `percent`
+    /// has no readable fraction, so the lookup returns `None` for it too. Its `resets_at`
+    /// and `severity` are deliberately present: the lookup found no window, so neither is
+    /// carried onto the idle reading.
+    #[test]
+    fn a_five_hour_object_with_a_null_utilization_is_served_idle_and_flagged() {
+        let body = r#"{"five_hour":{"utilization":null,"resets_at":"2026-11-02T03:00:00Z","severity":"normal"},"seven_day":{"utilization":40.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+        assert_served_idle_and_flagged(body, 0.40);
+    }
+
+    /// With no readable top-level `five_hour`, a `limits[]` entry of kind `session` that
+    /// carries neither `percent` nor `utilization` is skipped by the lookup (`fraction_of`
+    /// finds no fraction), so the lookup finds no readable session window here either —
+    /// again with a `resets_at` and `severity` on the entry that must NOT reach the reading.
+    #[test]
+    fn a_limits_session_entry_with_no_readable_fraction_is_served_idle_and_flagged() {
+        let body = r#"{"limits":[{"kind":"session","severity":"normal","resets_at":"2026-11-02T03:00:00Z","is_active":true},{"kind":"weekly_all","percent":40,"severity":"normal","resets_at":"2026-11-06T22:59:59.916061+00:00","is_active":true}]}"#;
+        assert_served_idle_and_flagged(body, 0.40);
+    }
+
+    #[test]
     fn non_json_body_is_a_parse_error() {
         assert!(matches!(parse_usage("not json"), Err(Error::UsageParse(_))));
     }
@@ -1009,6 +1211,7 @@ mod tests {
             weekly_resets_at: Some("2025-06-26T18:00:00Z".to_owned()),
             session_severity: None,
             weekly_severity: None,
+            session_absent: false,
         };
         let usage = report.to_usage();
         assert_eq!(usage.weekly_resets_at, Some(1_750_960_800));
@@ -1189,6 +1392,80 @@ mod tests {
         assert!((reading.usage.weekly - 0.70).abs() < 1e-9);
         // No `severity` on either limit → the reading carries none (issue #156).
         assert_eq!(reading.severity, None);
+    }
+
+    #[tokio::test]
+    async fn a_weekly_only_reply_through_the_poll_path_carries_the_absent_session_flag() {
+        // Issue #1613 AC-8: the flag must survive the poll path. The `parse_usage`
+        // oracles above never reach the `PolledReading` that `RealUsageSource::usage`
+        // builds, so a fix that parses correctly yet leaves the flag `false` where
+        // that reading is built would pass all of them and store a fabricated
+        // `session: 0.0` sample for a weekly-only account.
+        //
+        // A captured weekly-only reply (`five_hour` null, no session limit).
+        let weekly_only = r#"{"five_hour":null,"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":12,"severity":"normal","resets_at":"2026-11-06T22:59:59.916182+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]}"#;
+        let src = source(vec![FakeUsageTransport::ok(200, weekly_only)]);
+        let reading = src
+            .usage()
+            .await
+            .expect("a weekly-only reply is served through the poll path, not rejected");
+        assert!(
+            reading.session_window_absent,
+            "the poll path must carry the absent-session flag onto the reading"
+        );
+
+        // The same seam with both windows present leaves the flag clear.
+        let two_window =
+            r#"{"limits":[{"kind":"session","percent":30},{"kind":"weekly_all","percent":70}]}"#;
+        let src = source(vec![FakeUsageTransport::ok(200, two_window)]);
+        let reading = src
+            .usage()
+            .await
+            .expect("a two-window reply is served through the poll path");
+        assert!(
+            !reading.session_window_absent,
+            "a two-window reply must not be flagged as missing its session window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_present_idle_session_window_through_the_poll_path_is_not_flagged() {
+        // Issue #1613 AC-9: the flag records that the session LOOKUP found no
+        // window, not that the session fraction is zero. A parked account's
+        // session window can be present with a zero fraction and no reset stamp
+        // (the warm-up design's row C-1); it is a real idle reading, so the poll
+        // path must not flag it as a missing window.
+        let idle_session = r#"{"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":40.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+        let src = source(vec![FakeUsageTransport::ok(200, idle_session)]);
+        let reading = src
+            .usage()
+            .await
+            .expect("a two-window reply with an idle session is served through the poll path");
+        assert!(
+            !reading.session_window_absent,
+            "a present idle session window must not be flagged as absent"
+        );
+        assert!((reading.usage.session - 0.0).abs() < 1e-9);
+    }
+
+    /// Issue #1613: a reply with no `five_hour` key at all, through the poll path. The flag
+    /// the parse tests pin must reach the `PolledReading` for this shape exactly as it does
+    /// for the captured `null` body
+    /// (`a_weekly_only_reply_through_the_poll_path_carries_the_absent_session_flag`).
+    #[tokio::test]
+    async fn a_reply_with_no_five_hour_key_through_the_poll_path_carries_the_absent_session_flag() {
+        let no_five_hour = r#"{"seven_day":{"utilization":40.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"},"limits":[{"kind":"weekly_all","group":"weekly","percent":40,"severity":"normal","resets_at":"2026-11-06T22:59:59.916061+00:00","is_active":true}]}"#;
+        let src = source(vec![FakeUsageTransport::ok(200, no_five_hour)]);
+        let reading = src
+            .usage()
+            .await
+            .expect("a reply with no five_hour key is served through the poll path");
+        assert!(
+            reading.session_window_absent,
+            "the poll path must flag a reply whose five_hour key is missing"
+        );
+        assert!((reading.usage.session - 0.0).abs() < 1e-9);
+        assert!((reading.usage.weekly - 0.40).abs() < 1e-9);
     }
 
     #[tokio::test]

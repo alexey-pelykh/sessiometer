@@ -949,6 +949,7 @@ mod tests {
                         session_resets_at: None,
                     },
                     severity: None,
+                    session_window_absent: false,
                 }),
                 Err(err) => Err(err),
             }

@@ -725,10 +725,12 @@ pub(crate) fn swap_lock() -> Result<PathBuf> {
 
 /// The raw usage-sample log: `<support_dir>/usage-samples.jsonl` (`0600`).
 ///
-/// The append-only rolling window the daemon writes one JSON line per poll to, and
-/// read-only tools read (issue #155, via [`crate::usage_store`]). Native-local (via
-/// [`support_dir`]) alongside the lock/socket/config, so a single machine has one
-/// store regardless of a per-shell `XDG_CONFIG_HOME`.
+/// The append-only rolling window the daemon writes at most one JSON line per poll to
+/// (none for a failed poll, nor, while the issue #1613 hot-fix serves, for a reading with
+/// no readable session window), and read-only tools read (issue #155, via
+/// [`crate::usage_store`]). Native-local (via [`support_dir`]) alongside the
+/// lock/socket/config, so a single machine has one store regardless of a per-shell
+/// `XDG_CONFIG_HOME`.
 ///
 /// Consumed in production by the daemon's per-poll collector (issue #156) and the
 /// read-only reporting tools (issue #157); until they land the store is a

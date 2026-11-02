@@ -60,9 +60,10 @@ pub(crate) trait RosterPoller {
     /// Poll `account`'s usage. `active` selects the token source: the canonical
     /// keychain item for the active account (whose token is the freshest), or the
     /// account's stash for any other. Returns the full [`PolledReading`] — the
-    /// swap-decision [`Usage`] plus the sample-only `severity` — from a single API
-    /// call; the caller projects to `Usage` for the decision and records the sample
-    /// from the same reading (issue #156, no extra call).
+    /// swap-decision [`Usage`], the sample-only `severity` and, while the issue #1613
+    /// hot-fix serves, the [`session_window_absent`](PolledReading::session_window_absent)
+    /// flag — from a single API call; the caller projects to `Usage` for the decision
+    /// and records the sample from the same reading (issue #156, no extra call).
     async fn poll(&self, account: &Account, active: bool) -> Result<PolledReading>;
 }
 

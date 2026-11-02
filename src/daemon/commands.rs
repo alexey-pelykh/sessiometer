@@ -842,6 +842,15 @@ where
         if active.is_none() {
             self.state.last_good = None;
         }
+        // Issue #1613 hot-fix: the absent-session-line latch keys on `account_uuid`, not on roster
+        // position, so the re-key above does not carry it. Drop a removed account's entry here with
+        // the rest of its state: a re-added account whose replies are still weekly-only then opens
+        // a new episode, and its line is written again. Issue #1596 removes the latch and this
+        // with it.
+        let roster = &self.roster;
+        self.state
+            .absent_session_line_noted
+            .retain(|uuid| roster.iter().any(|account| account.account_uuid == *uuid));
         // The schedule held OLD roster indices; clear it so `next_poll_index` rebuilds a
         // fresh one (the active interleaved before each enabled non-quarantined peer,
         // #366) at the next cycle start. This site's reason is INDEX VALIDITY and reaches

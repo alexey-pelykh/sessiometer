@@ -644,7 +644,10 @@ struct AccountStatusLine: Decodable, Equatable {
     let quarantined: Bool
     /// Whether a quarantined account is mid-recovery (issue #109). Defaults `false`.
     let recovering: Bool
-    /// Last-polled session-window usage percent (`0…100`); `nil` if the last poll failed.
+    /// Last-polled session-window usage percent (`0…100`); `nil` if the last poll failed. One
+    /// exception while the issue #1613 hot-fix serves: a reply that carried no readable session
+    /// window beside a readable weekly one reads `0` here, the idle value the daemon substitutes,
+    /// not a measurement. Issue #1597 sends `nil` for that case.
     let sessionPct: UInt8?
     /// Last-polled weekly-window usage percent (`0…100`).
     let weeklyPct: UInt8?

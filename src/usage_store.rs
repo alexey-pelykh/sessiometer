@@ -9,7 +9,9 @@
 //!
 //! ```text
 //! usage-samples.jsonl : the raw rolling window — one JSON [`Sample`] per line,
-//!                       append-only (the daemon writes one line per poll).
+//!                       append-only (the daemon writes at most one line per poll:
+//!                       none for a failed poll, nor, while the issue #1613 hot-fix
+//!                       serves, for a reading with no readable session window).
 //! usage-rollup.json   : hourly + daily aggregates + a `rolled_through_ts`
 //!                       watermark, a single atomically-rewritten [`Rollup`].
 //! ```

@@ -14,7 +14,7 @@
 //   * `src/cli.rs` `legacy_health_tags`→ `legacyHealthTags` (the pre-#119 auth-nil fallback)
 //   * `src/cli.rs` `reset_cell`        → `resetCell`        (one window's "resets in", or `n/a`)
 //   * `src/cli.rs` `humanize_until`    → `humanizeUntil`    (two-largest-unit compact duration)
-//   * `src/cli.rs` `pct`               → `pct`              (`N%` or `n/a`, never a fabricated 0)
+//   * `src/cli.rs` `pct`               → `pct`              (`N%` or `n/a`, never a fabricated 0 except #1613's stand-in)
 //
 // The panel's SINGLE per-row reset-in pick (weekly-exhausted → weekly, else session), the honest-state
 // banners, and the `next_swap` footer wording are #326's OWN panel spec (the issue AC), not a
@@ -860,7 +860,10 @@ enum StatusPanelFormat {
     // MARK: - Percentage cell (mirror `src/cli.rs` `pct`)
 
     /// A `0...100` percent as `N%`, or `n/a` when the last poll failed — never a fabricated `0`
-    /// (mirrors `src/cli.rs` `pct`).
+    /// (mirrors `src/cli.rs` `pct`). One exception while the issue #1613 hot-fix serves: a session
+    /// percent read from a reply with no readable session window beside a readable weekly one is the
+    /// idle `0` the daemon substitutes, not a measurement, so it renders `0%`. Issue #1597 sends `nil`
+    /// for that case, which renders `n/a`.
     static func pct(_ percent: UInt8?) -> String {
         percent.map { "\($0)%" } ?? "n/a"
     }
