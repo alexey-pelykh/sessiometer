@@ -172,8 +172,9 @@ pub(crate) struct BlindActive {
     /// VELOCITY-projection arm (the anchor, projected forward over the blind window at its retained #539
     /// rate, could plausibly reach the trigger — a below-band burn the anchor arm cannot see). `false` =
     /// OK: blind, but not yet past the gate threshold and with no arm tripped — auto-protection is
-    /// nominally intact. The first two arms front a swap the daemon fires; the velocity arm is
-    /// report-only (issue #584), so DEGRADED here means "compromised", not always "a swap is acting".
+    /// nominally intact. All three arms front a swap the daemon can fire (the velocity arm since
+    /// the 2026-09-26 ADR-0017 amendment, issue #584), so DEGRADED here means "compromised" — a swap
+    /// may be acting or about to act, not necessarily one already fired.
     pub(crate) auto_protection_degraded: bool,
 }
 

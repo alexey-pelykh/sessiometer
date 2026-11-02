@@ -39,8 +39,8 @@
 //!    samples — the two-source recipe spike #596 used; it neither adds an event nor changes the
 //!    swap mechanism it measures (the #449 → #452 precedent: expose the SLI before the fix).
 //! 6. **blind-arm projection error** (issue #636) — `projected − session_at_recovery` for the
-//!    REPORT-ONLY blind velocity-projection arm ([`crate::daemon`]'s
-//!    `blind_velocity_projected_armed`, issues #584/#600). That arm fires no swap and emits no
+//!    blind velocity-projection arm ([`crate::daemon`]'s
+//!    `blind_velocity_projected_armed`, issues #584/#600). That arm emits no
 //!    event of its own, so its forecast was unfalsifiable until #634 stamped its ingredients onto
 //!    `blind_window`; `projected` is RECOMPUTED here from those tokens and reconciled against the
 //!    durable actual already on the same line. BLIND-ARM ONLY: the velocity arm's actual is a
@@ -422,7 +422,7 @@ struct Reactivation {
     acct: String,
 }
 
-/// One reconciled blind-arm projection (issue #636): what the REPORT-ONLY blind velocity-projection
+/// One reconciled blind-arm projection (issue #636): what the blind velocity-projection
 /// arm would have forecast for this `blind_window`, beside what the account actually arrived at.
 ///
 /// Recomputed OFFLINE from the line's own tokens — the house log-the-ingredients / derive-the-views
@@ -1210,7 +1210,7 @@ fn record_reactivation_edge(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>, 
 
 /// Fold one `blind_window` line into the blind-arm projection-error input (issue #636).
 ///
-/// Recomputes the REPORT-ONLY arm's forecast from the line's OWN tokens — `anchor + rate ×
+/// Recomputes the arm's forecast from the line's OWN tokens — `anchor + rate ×
 /// inflation × duration_secs`, the [`crate::daemon`] `blind_velocity_projected_armed` formula — and
 /// pairs it with the durable `session_at_recovery` beside it. Every term is stamped on the line
 /// (issue #634), so no daemon constant is imported and an old window is never read through a
@@ -2243,7 +2243,7 @@ struct FalseProjection {
 }
 
 /// The blind-arm projection-error SLI (issue #636): `projected − session_at_recovery` percentiles
-/// for the REPORT-ONLY blind velocity-projection arm ([`crate::daemon`]'s
+/// for the blind velocity-projection arm ([`crate::daemon`]'s
 /// `blind_velocity_projected_armed`, issues #584/#600), in percentage points.
 ///
 /// POSITIVE = the arm over-projected (it would have cried DEGRADED further ahead of the real burn
@@ -3044,7 +3044,7 @@ fn render_human(r: &Report) -> String {
         r.false_projection.velocity_preempt_swaps_observed
     ));
 
-    // SLI 6 — blind-arm projection error (issue #636): the REPORT-ONLY blind velocity-projection
+    // SLI 6 — blind-arm projection error (issue #636): the blind velocity-projection
     // arm's forecast, recomputed from #634's stamped ingredients, against the durable actual on the
     // same line. The percentiles are ALWAYS preceded by their cardinality line and ALWAYS followed
     // by the censoring disclosure — the #484 survivorship guard: this population is recovered-only,

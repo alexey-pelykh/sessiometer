@@ -104,6 +104,23 @@ reading, outcome-identical to doing nothing, and would invert #453's ratified ab
 wait," RFC 6585 §4 lets a `429` carry it). The core **#452** decision and its constants are
 unchanged.
 
+**Amended 2026-09-26**: the **#584** velocity-projection arm — REPORT-ONLY since 2026-07-17 — now
+also **arms the swap** as a third disjunct in `blind_swap`'s gate. The 2026-09-26 episode made the
+report-only stance untenable: the active account went blind (usage poll `429`d, 14 consecutive
+`rate_limited` back-offs) with a retained anchor of `0.58` — below the `0.60` band, so the anchor
+arm could not see the climb — and **no** `Retry-After`, so the **#582** arm was silent too. 83
+ticks logged `skip_active_unavailable` while the account burned 58→100% in 34 min (~1.1 %/min) and
+the fleet hit the usage limit. As the original #584 amendment argued for the *report*, a
+level-vs-level gate cannot be re-tuned to cover this: there is no band low enough to stay safe at
+long blind windows without burning the band's ratified meaning — the predicate *shape* is wrong,
+and the velocity arm already computed the right predicate. The arm reuses the bias-HIGH
+`BLIND_VELOCITY_RATE_INFLATION` bound **deliberately**: the **#484** swap-timing asymmetry
+(fire-early-is-cheaper) holds *a fortiori* for a fleet running unattended, where an unswapped
+exhaustion costs the whole roster and an early swap costs one account switch. A velocity-armed
+swap is evidence of near-limit usage, not a speculative directive read, so it is **not** subject
+to the **#582** walk/reserve circuit-breaker; `session_blind_swap_secs` remains the kill-switch
+for all three arms, and the `status` report role is unchanged.
+
 ## Context
 
 sessiometer keeps **one** live Claude Code credential active by rotating across a
