@@ -25,6 +25,53 @@ this ADR records a **shipped** behavior change, now enforced in `src/daemon.rs` 
 > `target_max_usage` still parse as deprecated aliases, so existing `config.toml` files keep
 > loading.
 
+**Amended 2026-11-02 (#1593) — "both windows hard-reset" becomes "every window the account has
+hard-resets": a quota window is independently optional, and an account with no session window has no
+session floor to reserve against.** Since 2026-10-30 Anthropic has been removing the five-hour
+session window from verified Ultra accounts, per account and automatically, so such an account's
+usage reply carries `"five_hour": null` beside a present weekly window; Pro and Max accounts keep
+their session window, so a fleet holds both shapes at once (the dated sources are replicated in
+`docs/requirements/optional-quota-windows.md` § 2.2). The #665 paragraph under Decision 4 justifies
+its inner `max` with "Sound because **both** windows hard-reset", and this record's session gates
+(`usage.session < floor`, and the always-on session gate it layers on) assume every account has a
+session usage to gate on. That premise is falsified on the wire; the decision stands and its premise
+is rewritten.
+
+**The decision in force.** The relief computation is sound because every window the account has
+hard-resets: the inner `max` of `fleet_relief` runs over the dimensions the spare actually has, so
+`all_exhausted_relief` (`src/daemon.rs`) is unchanged in form, and a spare blocked only on its
+weekly window returns at its weekly reset with `cause=weekly`. An account with no session window has
+no session floor to reserve against: `pick_target`'s session gates — the always-on
+`session < session_ceiling` filter and the `target_max_session_usage` reserve
+(`src/daemon/selection.rs`) — pass it vacuously, and its weekly gate is unchanged. A window the
+reply does not carry is "not applicable" (`None` in the model), never a fabricated `0`, so nothing
+here is ever gated on an invented reading. The same rule reads symmetrically for the operator's
+explicit future case, an account with no weekly window, which `pick_target`'s weekly-exhaustion
+exclusion then passes (`docs/design/optional-quota-windows-solution-design.md` § 12 AD-4b,
+author-chosen and surfaced for ratification, with no observable instance today). Decisions 1–5 stand
+as written; only the universal "both" moves.
+
+**What the code does at this amendment's merge, and where the decision lands.** The tree does not
+yet behave this way. The hot-fix #1613 (on `main` since 2026-11-02) serves a weekly-only reply with
+the session fraction read as `0.0` on the decision path and no session reset stamp, so `pick_target`
+and `all_exhausted_relief` see an idle session rather than an absent one; for that interim "never a
+fabricated `0`" is the decision, not the code. The parser item #1596 replaces that read with `None`,
+the reading-model item #1597 lifts `Usage` (`src/usage.rs`) so the compiler enumerates every
+consumer, and the decision-arms item #1602 names each arm's move on an absent window — all under
+umbrella #1590. This record lands before them deliberately: requirement `REQ-REC-C-001`
+(`docs/requirements/optional-quota-windows.md` § 10.10, pipeline-authored and ratification-pending)
+asks that no commit reverse a pinned behaviour without its record.
+
+**Provenance.** The operator's direction of 2026-11-01, quoted verbatim in
+`docs/requirements/optional-quota-windows.md` § 2.1: "we need to make the parser more robust and
+flexible, maybe eventually they will make some account w/o weekly limits e.g." — each quota window
+independently optional, a weekly-less account the explicit future case; the request that opened the
+work, from the same day, is quoted beside it. The corrected-premise sentence recorded above is the
+solution design's draft (`docs/design/optional-quota-windows-solution-design.md` § 5 B-10); the rest
+of this amendment was written for #1593 against that design and the requirements document. All of it
+is pipeline-authored and ratification-pending under umbrella #1590; the operator has reworded
+nothing and ratified no sentence here.
+
 ## Context
 
 sessiometer keeps **one** live Claude Code credential active, rotating across a roster
@@ -133,7 +180,8 @@ the proactive path and is DROPPED entirely on the emergency path — shipped ato
    implied. The `cause` enum is unchanged (still the closed two-value `SwapReason`), so this
    is a computation fix with no wire bump. Sound because **both** windows hard-reset: weekly
    is a fixed 7-day window (verified against 22,261 usage samples, #665) and session is
-   monotonic-within-window (#614). The operator-facing prose that reads `cause` is the
+   monotonic-within-window (#614) — **but see Amended 2026-11-02 (#1593)**: every window the
+   account has, not both. The operator-facing prose that reads `cause` is the
    sibling concern, **#666**.
 
 5. **Atomicity is mandatory.** (3) MUST ship with (1), test-gated, or the default stays
