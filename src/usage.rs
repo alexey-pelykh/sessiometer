@@ -771,6 +771,246 @@ mod tests {
 
     // --- parse_usage (tolerant, both shapes) ---
 
+    // --- fixtures (frozen captures; never re-baselined) ---
+
+    /// `CAPTURED_NULL_SESSION_QUOTA_FIELDS` (#1591's constant) with the
+    /// `"five_hour":null` member removed and nothing else changed — the "absent
+    /// key" half of the null-versus-absent pair.
+    const CAPTURED_NULL_SESSION_QUOTA_FIELDS_WITHOUT_FIVE_HOUR_KEY: &str = r#"{"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":12,"severity":"normal","resets_at":"2026-11-06T22:59:59.916182+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]}"#;
+
+    /// The captured two-entry `limits[]` alone — no top-level window objects — so a
+    /// weekly lookup has to take the `limits[]` scan rather than the top-level
+    /// short-circuit. The entries are the captured bytes, verbatim.
+    const CAPTURED_WEEKLY_LIMITS_ONLY: &str = r#"{"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":12,"severity":"normal","resets_at":"2026-11-06T22:59:59.916182+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]}"#;
+
+    /// `parse_usage`'s session lookup at the `dimension` seam, the alias list copied
+    /// byte for byte from its call site.
+    fn session_lookup(body: &str) -> Option<(f64, Option<String>, Option<String>)> {
+        let root: Value = serde_json::from_str(body).unwrap();
+        dimension(&root, "five_hour", &["session", "five_hour"])
+    }
+
+    /// `parse_usage`'s weekly lookup at the `dimension` seam, the alias list copied
+    /// byte for byte from its call site.
+    fn weekly_lookup(body: &str) -> Option<(f64, Option<String>, Option<String>)> {
+        let root: Value = serde_json::from_str(body).unwrap();
+        dimension(&root, "seven_day", &["weekly_all", "seven_day", "weekly"])
+    }
+
+    #[test]
+    fn the_captured_null_session_reply_is_frozen_with_its_three_quota_fields() {
+        let root: Value = serde_json::from_str(CAPTURED_NULL_SESSION_QUOTA_FIELDS).unwrap();
+        let mut keys: Vec<&str> = root
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["five_hour", "limits", "seven_day"]);
+        assert_eq!(root["five_hour"], Value::Null);
+        let seven_day = &root["seven_day"];
+        assert_eq!(seven_day["utilization"].as_f64(), Some(90.0));
+        assert_eq!(
+            seven_day["resets_at"].as_str(),
+            Some("2026-11-06T22:59:59.916061+00:00")
+        );
+        assert!(seven_day.get("severity").is_none());
+        let limits = root["limits"].as_array().unwrap();
+        assert_eq!(limits.len(), 2);
+        let kinds: Vec<&str> = limits
+            .iter()
+            .map(|entry| entry["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["weekly_all", "weekly_scoped"]);
+        let actives: Vec<bool> = limits
+            .iter()
+            .map(|entry| entry["is_active"].as_bool().unwrap())
+            .collect();
+        assert_eq!(actives, [true, false]);
+        let percents: Vec<u64> = limits
+            .iter()
+            .map(|entry| entry["percent"].as_u64().unwrap())
+            .collect();
+        assert_eq!(percents, [90, 12]);
+        let severities: Vec<&str> = limits
+            .iter()
+            .map(|entry| entry["severity"].as_str().unwrap())
+            .collect();
+        assert_eq!(severities, ["critical", "normal"]);
+        assert_eq!(
+            limits[1]["resets_at"].as_str(),
+            Some("2026-11-06T22:59:59.916182+00:00")
+        );
+        assert_eq!(CAPTURED_NULL_SESSION_QUOTA_FIELDS.len(), 555);
+        assert_eq!(SESSION_ONLY_QUOTA_FIELDS.len(), 80);
+        assert_eq!(WINDOWLESS_QUOTA_FIELDS.len(), 47);
+        assert_eq!(
+            CAPTURED_NULL_SESSION_QUOTA_FIELDS_WITHOUT_FIVE_HOUR_KEY,
+            CAPTURED_NULL_SESSION_QUOTA_FIELDS.replacen("\"five_hour\":null,", "", 1)
+        );
+        assert!(CAPTURED_NULL_SESSION_QUOTA_FIELDS.ends_with(&CAPTURED_WEEKLY_LIMITS_ONLY[1..]));
+    }
+
+    #[test]
+    fn the_issue_66_live_capture_is_frozen_with_its_byte_length_and_key_set() {
+        fn sorted_keys(value: &Value) -> Vec<&str> {
+            let mut keys: Vec<&str> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys
+        }
+        let source = include_str!("usage.rs");
+        // Assembled from pieces: this test sits before the one it reads, so a whole-string
+        // needle would match its own text first.
+        let anchor = [
+            "fn ",
+            "parses_the_live_response_shape_utilization_on_a_0_to_100_scale",
+            "() {",
+        ]
+        .concat();
+        assert_eq!(source.matches(anchor.as_str()).count(), 1);
+        let after_anchor = &source[source.find(anchor.as_str()).unwrap() + anchor.len()..];
+        let open = after_anchor.find("r#\"").unwrap() + 3;
+        let close = open + after_anchor[open..].find("\"#").unwrap();
+        let body = &after_anchor[open..close];
+        assert_eq!(body.len(), 399);
+        let root: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(sorted_keys(&root), ["five_hour", "limits", "seven_day"]);
+        assert_eq!(
+            sorted_keys(&root["five_hour"]),
+            ["resets_at", "utilization"]
+        );
+        assert_eq!(
+            sorted_keys(&root["seven_day"]),
+            ["resets_at", "utilization"]
+        );
+        let limits = root["limits"].as_array().unwrap();
+        assert_eq!(limits.len(), 2);
+        for entry in limits {
+            assert_eq!(sorted_keys(entry), ["is_active", "kind", "percent"]);
+        }
+        assert_eq!(
+            root,
+            serde_json::json!({
+                "five_hour": {"utilization": 82.0, "resets_at": "2026-06-29T13:40:00.475727+00:00"},
+                "seven_day": {"utilization": 15.0, "resets_at": "2026-07-06T00:00:00.475752+00:00"},
+                "limits": [
+                    {"kind": "session", "percent": 82, "is_active": true},
+                    {"kind": "weekly_all", "percent": 15, "is_active": false}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn no_fixture_body_carries_an_identity_field() {
+        for body in [
+            CAPTURED_NULL_SESSION_QUOTA_FIELDS,
+            CAPTURED_NULL_SESSION_QUOTA_FIELDS_WITHOUT_FIVE_HOUR_KEY,
+            CAPTURED_WEEKLY_LIMITS_ONLY,
+            SESSION_ONLY_QUOTA_FIELDS,
+            WINDOWLESS_QUOTA_FIELDS,
+        ] {
+            assert!(!body.contains('@'), "an `@` in {body}");
+            let lowered = body.to_ascii_lowercase();
+            for needle in ["email", "uuid", "label", "token", "organization", "account"] {
+                assert!(!lowered.contains(needle), "`{needle}` in {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_captured_null_session_reply_has_no_session_window_at_the_dimension_seam() {
+        assert_eq!(session_lookup(CAPTURED_NULL_SESSION_QUOTA_FIELDS), None);
+        assert_eq!(
+            session_lookup(CAPTURED_NULL_SESSION_QUOTA_FIELDS_WITHOUT_FIVE_HOUR_KEY),
+            None
+        );
+        assert_eq!(session_lookup(CAPTURED_WEEKLY_LIMITS_ONLY), None);
+    }
+
+    #[test]
+    fn the_captured_null_session_reply_reads_its_weekly_window_from_the_top_level_object() {
+        for body in [
+            CAPTURED_NULL_SESSION_QUOTA_FIELDS,
+            CAPTURED_NULL_SESSION_QUOTA_FIELDS_WITHOUT_FIVE_HOUR_KEY,
+        ] {
+            let (fraction, resets_at, severity) = weekly_lookup(body).expect("a weekly window");
+            assert!(
+                (fraction - 0.90).abs() < 1e-9,
+                "weekly fraction was {fraction}"
+            );
+            assert_eq!(
+                resets_at.as_deref(),
+                Some("2026-11-06T22:59:59.916061+00:00")
+            );
+            // `None` deliberately (issue #1606): `dimension` returns the top-level `seven_day`
+            // object, which carries no `severity`, before it would reach the `weekly_all`
+            // entry's "critical". Whoever closes that provenance gap moves this one assertion.
+            assert_eq!(severity, None);
+        }
+    }
+
+    #[test]
+    fn the_captured_weekly_limits_read_weekly_all_and_skip_weekly_scoped() {
+        let (fraction, resets_at, severity) =
+            weekly_lookup(CAPTURED_WEEKLY_LIMITS_ONLY).expect("a weekly window from limits[]");
+        assert!(
+            (fraction - 0.90).abs() < 1e-9,
+            "weekly fraction was {fraction}"
+        );
+        assert!(
+            (fraction - 0.12).abs() >= 1e-9,
+            "weekly_scoped's percent was read: {fraction}"
+        );
+        assert_eq!(
+            resets_at.as_deref(),
+            Some("2026-11-06T22:59:59.916061+00:00")
+        );
+        assert_ne!(
+            resets_at.as_deref(),
+            Some("2026-11-06T22:59:59.916182+00:00")
+        );
+        assert_eq!(severity.as_deref(), Some("critical"));
+        assert_ne!(severity.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn a_null_five_hour_and_an_absent_five_hour_key_read_identically() {
+        let a = CAPTURED_NULL_SESSION_QUOTA_FIELDS;
+        let b = CAPTURED_NULL_SESSION_QUOTA_FIELDS_WITHOUT_FIVE_HOUR_KEY;
+        assert_eq!(session_lookup(a), session_lookup(b));
+        assert_eq!(session_lookup(a), None);
+        assert_eq!(weekly_lookup(a), weekly_lookup(b));
+        match (parse_usage(a), parse_usage(b)) {
+            (Ok(x), Ok(y)) => assert_eq!(x, y),
+            (Err(x), Err(y)) => assert_eq!(x.to_string(), y.to_string()),
+            _ => panic!("the two bodies parsed differently"),
+        }
+    }
+
+    #[test]
+    fn the_session_only_and_windowless_bodies_read_their_absent_windows_as_none_at_the_dimension_seam(
+    ) {
+        let (fraction, resets_at, severity) =
+            session_lookup(SESSION_ONLY_QUOTA_FIELDS).expect("a session window");
+        assert!(
+            (fraction - 0.42).abs() < 1e-9,
+            "session fraction was {fraction}"
+        );
+        // A `null` `resets_at` reads as no stamp, and the window carries no severity.
+        assert_eq!(resets_at, None);
+        assert_eq!(severity, None);
+        assert_eq!(weekly_lookup(SESSION_ONLY_QUOTA_FIELDS), None);
+        assert_eq!(session_lookup(WINDOWLESS_QUOTA_FIELDS), None);
+        assert_eq!(weekly_lookup(WINDOWLESS_QUOTA_FIELDS), None);
+    }
+
     #[test]
     fn parses_the_limits_array_shape_with_percent() {
         let body = r#"{
