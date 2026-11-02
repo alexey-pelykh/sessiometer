@@ -46,9 +46,9 @@ Example Mapping: 🟦 6 rules · 🟩 34 examples · 🟥 0 open
 > conditions C1 to C5 and C7 take their scenarios under Rule 6, with C1's committed-fixture arm in
 > Rule 4's T10 scenario; C6, the operator text, is the module doc's under Rule 5 and the runbook item
 > #1603's; the per-axis `samples` count takes its scenarios under Rule 4, with its module-doc clause
-> under Rule 5 and its pins in Rule 6's T17; and `CLAUDE.md`'s naming of the store's generation sits
-> under Rule 5. Every scenario holds under both rulings, and a scenario added or amended under a ruling
-> carries that ruling in its name. D12
+> and its count-posture sweep (AC-27) under Rule 5 and its pins in Rule 6's T17; and `CLAUDE.md`'s
+> naming of the store's generation sits under Rule 5. Every scenario holds under both rulings, and a
+> scenario added or amended under a ruling carries that ruling in its name. D12
 > (`Sample.weekly` optional), the omitted-key reader (design AD-10 against PRD § 11.4) and the
 > serialization refusal of a non-finite `Some` are open, each built for its recorded default with the
 > alternative stated in #1598; a scenario that depends on one says so in its name. Every rule, tier
@@ -384,8 +384,8 @@ Scenario: an hour and a day holding only session-less samples fold to a finite, 
         so the compaction WRITE succeeds and the NEXT `read_rollup` fails: `compact_and_roll`
         (`read_rollup` at `src/usage_store.rs:536`) and `stats`
         (`StoreData::read`, `src/stats.rs:212-218`)
-        both run it first, and every later compaction and every `stats` run fails until the file is
-        repaired by hand
+        both run it before anything is written — `compact_and_roll` before it rewrites either file —
+        and every later compaction and every `stats` run fails until the file is repaired by hand
     But NOT a test that expects the compaction to "fail the write" — the failure is read-side, and the
         test must catch that shape
     # The PRD's and the design's earlier text said the write itself would fail; #1598 corrects the
@@ -450,7 +450,7 @@ Scenario: a mixed bucket folds each axis over exactly the readings that carried 
     # non-empty (#1598 Specification § 5), so `max_of`'s "non-empty slice" doc becomes true by
     # construction and `mean_of`'s and `p95_of`'s `0.0`-for-empty arms stay as dead defence.
 
-Scenario: a rollup written at fd8640b reads back unchanged (D13 as ruled)
+Scenario: a rollup written at fd8640b reads back unchanged (D6 and D13 as ruled)
   # Tier A — graded by
   # usage_store::tests::a_rollup_written_before_the_lift_reads_back_with_both_axes_present (#1598 T10,
   # beside rollup_rewrite_leaves_no_temp_and_round_trips at `src/usage_store.rs:920`), with the mutant
@@ -486,22 +486,26 @@ Scenario Outline: a defensive same-key merge never fabricates an absent axis (D1
   # `upsert_day` on a duplicate key) · covers AC-5, AC-26 (the not-recorded arm)
   Given an existing bucket whose session statistic is <existing> and an incoming same-key bucket
         whose session statistic is <incoming>
-   When the two are merged
+   When the two are merged by <helper>
    Then the merged session statistic is <merged>
     And the merged statistic's `samples` is `None` — neither operand recorded one
     But NOT a `None` side weighted in as a mean of `0.0`
 
 Examples:
-  | existing                                 | incoming                                 | merged                                                          |
-  | None                                     | None                                     | None                                                            |
-  | Some(max 0.5, mean 0.4), bucket count 2  | None                                     | Some(max 0.5, mean 0.4) — the Some side, unchanged              |
-  | Some(max 0.5, mean 0.4), bucket count 2  | Some(max 0.7, mean 0.6), bucket count 2  | Some(max 0.7, mean 0.5) — today's merge, weighted by the counts |
+  | helper            | existing                                                     | incoming                                                     | merged                                                                               |
+  | `merge_hour_stat` | None                                                         | None                                                         | None                                                                                 |
+  | `merge_hour_stat` | Some(max 0.5, mean 0.4), bucket count 2                      | None                                                         | Some(max 0.5, mean 0.4) — the Some side, unchanged                                   |
+  | `merge_hour_stat` | None                                                         | Some(max 0.5, mean 0.4), bucket count 2                      | Some(max 0.5, mean 0.4) — the Some side, unchanged                                   |
+  | `merge_hour_stat` | Some(max 0.5, mean 0.4), bucket count 2                      | Some(max 0.7, mean 0.6), bucket count 2                      | Some(max 0.7, mean 0.5) — today's merge, weighted by the counts                      |
+  | `merge_day_stat`  | None                                                         | None                                                         | None                                                                                 |
+  | `merge_day_stat`  | Some(max 0.5, mean 0.4, p95 0.5, cap_hits 0), bucket count 2 | None                                                         | Some(max 0.5, mean 0.4, p95 0.5, cap_hits 0) — the Some side, unchanged              |
+  | `merge_day_stat`  | None                                                         | Some(max 0.5, mean 0.4, p95 0.5, cap_hits 0), bucket count 2 | Some(max 0.5, mean 0.4, p95 0.5, cap_hits 0) — the Some side, unchanged              |
+  | `merge_day_stat`  | Some(max 0.5, mean 0.4, p95 0.5, cap_hits 0), bucket count 2 | Some(max 1.2, mean 0.6, p95 1.2, cap_hits 1), bucket count 2 | Some(max 1.2, mean 0.5, p95 1.2, cap_hits 1) — today's merge, weighted by the counts |
   # Every operand here records no count (`samples: None`), so the merge takes the arm that weights by
   # the two bucket counts, as `fd8640b` does, and the merged statistic records no count. When both
   # operands record a count the merge weights by those instead ("a same-key merge weights each axis
-  # by its recorded counts…" below). The `total == 0.0` arm of
-  # `weighted_mean` (`src/usage_store.rs:779-787`) stays as dead defence: both weights are at least 1
-  # here.
+  # by its recorded counts…" below). Both weights are at least 1 here, so the `total == 0.0` arm
+  # of `weighted_mean` (`src/usage_store.rs:779-787`) stays as dead defence.
   # `merge_day_stat` (`src/usage_store.rs:770-777`) takes the same arms, with `p95` the max of the
   # two and `cap_hits` additive.
 
@@ -605,8 +609,9 @@ Scenario Outline: a same-key merge weights each axis by its recorded counts when
         of `count` 4 whose session statistic is <b>
    When the two are merged by <helper>
    Then the merged session statistic is <merged>
-    And through `upsert_hour` / `upsert_day` the merged bucket's `count` is the sum of the two and its
-        `coverage` is recomputed from it
+    And through `upsert_hour` / `upsert_day` over two hand-built same-key buckets — the seam this step
+        is graded at, since the two helpers take no bucket — the merged bucket's `count` is the sum of
+        the two, and a day bucket's `coverage` is recomputed from it; an `HourBucket` has no `coverage`
     But NOT the bucket counts used as weights when both operands recorded a count — 0.6 where the
         pooled mean over 6 is 2/3
 
@@ -874,7 +879,8 @@ Scenario: a legacy rollup survives its first fenced compaction bucket for bucket
         the `hourly` and `daily` tiers bucket for bucket
     And the file, parsed as a `Value`, now has `format` `2`
     But NOT a bucket dropped or altered by the rewrite — that first pass rewrites the lifetime daily tier
-        (`write_rollup(rollup_path, &rollup)` in `compact_and_roll`, `src/usage_store.rs:543`)
+        (`write_rollup(rollup_path, &rollup)` in `compact_and_roll`, `src/usage_store.rs:543` at
+        `40d0e81`)
     # The literal is T10's: Rule 4's "a rollup written at fd8640b reads back unchanged" reads it through
     # `read_rollup` alone, and here it goes through one fenced pass. The criterion exists because that
     # pass rewrites the lifetime daily tier, which cannot be rebuilt once its raw samples have aged out.
@@ -900,10 +906,10 @@ Scenario: a store a newer generation wrote is refused with its own error, and bo
     But NOT a newer store reset or rewritten — the newer build's data would be lost; the refusal
         leaves both files for that build
     # The variant's home and shape: `UsageRollupNewerFormat { found, supported }`, declared right after
-    # `UsageRollupMalformed` (`src/error.rs:1136`), its `Display` carrying two integers and nothing else
-    # (the redaction meter renders it), its exit code the generic `1`, as `UsageRollupMalformed`'s is.
-    # Its text may be reworded; T16 reads `newer sessiometer` and `must not be deleted` in it, so both
-    # phrases stay (#1598 Specification § 9).
+    # `UsageRollupMalformed` (`src/error.rs:1136` at `40d0e81`), its `Display` carrying two integers
+    # and nothing else (the redaction meter renders it), its exit code the generic `1`, as
+    # `UsageRollupMalformed`'s is. Its text may be reworded; T16 reads `newer sessiometer` and
+    # `must not be deleted` in it, so both phrases stay (#1598 Specification § 9).
 
 Scenario: the written store shape is pinned to its generation, and a shape change without a bump turns the pin red (D6 and D13 as ruled)
   # Tier A — graded by usage_store::tests::the_written_store_shape_is_pinned_to_its_generation (#1598
@@ -936,7 +942,8 @@ Scenario: the written store shape is pinned to its generation, and a shape chang
 
 Scenario: only compaction rewrites the raw file, and it reads the generation first (D6 as ruled)
   # Tier B — pending: a property of the source's shape, graded by AC-21's grep compared base to head,
-  # and the doc sentence by review; no test binds it · covers AC-21
+  # by the two greps keyed on the raw file's path, compared the same way, and the doc sentence by
+  # review; no test binds it · covers AC-21
   Given `src` on the pull request's head
    When `git grep -n 'write_samples(' -- src` runs
    Then it prints the same three call sites as on `origin/main`: at `40d0e81`, the definition
@@ -946,15 +953,28 @@ Scenario: only compaction rewrites the raw file, and it reads the generation fir
     And `write_samples`' doc states the rule: its one caller is `compact_and_roll`, after `read_rollup`
         has checked the generation, and any new caller checks it first, or it rewrites a store that a
         newer generation wrote
+    And the raw file's routes and writers are listed by its path, not by one function's name:
+        `git grep -n -E 'paths::usage_samples\(\)|samples_path: &' -- src` prints every route to the
+        raw file's path and every function that takes it — sixteen lines at `40d0e81`, doc comments
+        included, among them `append_sample`, `read_samples`, `compact_and_roll` and `write_samples` —
+        and `git grep -n -E '(write_private_file|create_private_file|fs::write|File::create)\(&?samples_path' -- src`
+        prints every write primitive handed it by that name — four lines at `40d0e81`:
+        `append_sample`'s append, `write_samples`' rewrite and two tests that append a torn line
+    And on the head each prints the lines it prints on `origin/main`, line numbers aside, and every
+        line it adds is a reader, an append, or a rewrite that review shows to run after `read_rollup`
     But NOT a new caller of `write_samples` that has not read the rollup — it would rewrite a raw file
         that a newer generation wrote, with no generation check before it
+    But NOT a rewrite of the raw file that bypasses `write_samples` — `paths::write_private_file` on the
+        raw path from a new function leaves the `write_samples(` grep at three lines and passes T12 to
+        T17; only the path-keyed greps list it
     # `compact_and_roll` already reads the rollup, and so checks the generation, before it rewrites
     # either file; the ruling's C5 is that order, kept by the doc sentence and the grep (#1598
     # Specification § 9).
 
 Scenario: a daemon whose compaction fails says so on its stderr, and emits no event for it (D6 as ruled)
   # Tier B — pending: libtest captures stderr, so no test reads the line; graded by AC-22's grep pair,
-  # the green existing `stats_events_for_poll` tests and the diff · covers AC-22
+  # the positive grep for the line #1598 § 9 writes out beside its canary, the green existing
+  # `stats_events_for_poll` tests and the diff · covers AC-22
   Given `stats_events_for_poll` at a due roll, its `compact_and_roll` returning `Err`
    When the poll's store maintenance runs
    Then one line goes to the daemon's stderr in the form of `append_sample_for_poll`'s
@@ -965,6 +985,11 @@ Scenario: a daemon whose compaction fails says so on its stderr, and emits no ev
     And `git grep -n 'if let Ok(summary) = compact_and_roll' -- src` prints one line on `origin/main` —
         the `if let Ok(summary) = compact_and_roll(…)` at `src/daemon.rs:894` at `40d0e81` — and nothing,
         exit status 1, on the head
+    And `git grep -n 'usage-store compaction skipped' -- src/daemon.rs` prints one line on the head, the
+        `Err` arm's `eprintln!`, and nothing, exit status 1, on `origin/main`; its canary through the
+        same command, `git grep -c 'usage-sample write skipped' -- src/daemon.rs`, prints a non-zero
+        count on both trees (three at `40d0e81`), so the empty result on `origin/main` is an absence,
+        never a broken query
     And the existing `stats_events_for_poll` tests in `src/daemon.rs` stay green — the error arm adds no
         event
     But NOT a new event kind for the stall — the event log is outside #1598
@@ -1003,8 +1028,8 @@ is named as such, with what grades it instead.
 | AC-18 — a ratchet holds the fence against every older build | Rule 6 "a rollup this build writes is refused by frozen copies of the fd8640b tier types…" | T14 with its AC-13 RED run and AC-18's mutant record |
 | AC-19 — the first fenced compaction preserves a legacy rollup | Rule 6 "a legacy rollup survives its first fenced compaction…" | T15 (its `format` half RED per AC-13); AC-19's mutant record on T15 and T10 |
 | AC-20 — a newer store is refused with its own error and left untouched | Rule 6 "a store a newer generation wrote is refused…" | T16 with its AC-13 RED run; `every_error_variant_enumerates_every_declared_variant` green with the new variant |
-| AC-21 — one gate checks the generation before any rewrite, and the written shape is pinned to it | Rule 6 "the written store shape is pinned to its generation…"; Rule 6 "only compaction rewrites the raw file…" (Tier B) | T17 with AC-21's mutant record; the `write_samples(` grep, base against head; review of `write_samples`' doc |
-| AC-22 — a stalled daemon says so | Rule 6 "a daemon whose compaction fails says so on its stderr…" (Tier B) | the `if let Ok(summary) = compact_and_roll` grep pair; the existing `stats_events_for_poll` tests green; the diff |
+| AC-21 — one gate checks the generation before any rewrite, and the written shape is pinned to it | Rule 6 "the written store shape is pinned to its generation…"; Rule 6 "only compaction rewrites the raw file…" (Tier B) | T17 with AC-21's mutant record; the `write_samples(` grep, base against head; the two greps keyed on the raw file's path, base against head; review of `write_samples`' doc |
+| AC-22 — a stalled daemon says so | Rule 6 "a daemon whose compaction fails says so on its stderr…" (Tier B) | the `if let Ok(summary) = compact_and_roll` grep pair; the `usage-store compaction skipped` grep beside its `usage-sample write skipped` canary; the existing `stats_events_for_poll` tests green; the diff |
 | AC-23 (from #1610) `fold-records-each-axis-count` | Rule 4 "each present statistic records how many of its bucket's readings it is over…" | T8b's `samples` assertions with AC-23's two mutant records |
 | AC-24 (from #1610) `count-invariants-hold-for-every-folded-bucket` | Rule 4 "the count invariant holds at both tiers for both axes…" | `count_invariants_hold_for_every_folded_bucket` with AC-24's mutant record |
 | AC-25 (from #1610) `buckets-written-before-the-field-read-as-not-recorded` | Rule 4 "a rollup written at fd8640b reads back unchanged" (shape one); Rule 4 "a rollup written without the count…" (shape two) | T10; `a_rollup_without_the_count_reads_every_statistic_as_not_recorded`; AC-25's two mutant records |
