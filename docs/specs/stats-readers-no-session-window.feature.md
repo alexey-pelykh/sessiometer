@@ -42,7 +42,7 @@ Example Mapping: 🟦 5 rules · 🟩 17 examples · 🟥 0 open
 > so on the unchanged tree a `null` line fails to deserialise inside the test's helper and the test
 > fails at setup — run by exact name against `origin/main` with only the test additions applied,
 > printing `running 1 test` and a `FAILED` line that comes from its setup; that reading comes from
-> the derive of `Sample` (`src/usage_store.rs:132-148`) and has not been run, so the executor's
+> the derive of `Sample` (`src/usage_store.rs:134-150`) and has not been run, so the executor's
 > record is what confirms it. The mutant record: the reader's `filter_map` / `is_some_and` replaced
 > by the fabricating `unwrap_or(0.0)` (or the mutant the scenario names), the test run by name on
 > the final tree, the red recorded. The two answer different questions: the setup failure shows the
@@ -415,7 +415,7 @@ Scenario Outline: the four two-window-premise comments say "every dimension the 
    Then it states the posture "every dimension the account has" — <becomes>
     And the pull-request body carries #1600 § 8's query verbatim with its cardinality (7 lines, 6 sites
         at fd8640b; re-run at the branch head), the per-site disposition (4 corrected, 2 do not restate)
-        and the canary hit `src/usage_store.rs:39` at `fd8640b` (#1598's commit corrects that hit, so at
+        and the canary hit `src/usage_store.rs:41` at `fd8640b` (#1598's commit corrects that hit, so at
         the branch head the three remaining hits are their own canary)
     # Two of these spell "both quota dimensions", which #1593's ADR sweep regex
     # (`both dimensions|both windows`) does not match — the reason they are routed here rather than left

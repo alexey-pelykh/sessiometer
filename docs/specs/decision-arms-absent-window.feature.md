@@ -28,7 +28,7 @@ Example Mapping: 🟦 5 rules · 🟩 30 examples · 🟥 0 open
 > the old literal in `Some(0.0)` asserts nothing about the absent state. The tree's values the arms
 > compare against, read at `fd8640b`: session ceiling 0.95 (`DEFAULT_SESSION_CEILING`,
 > `src/config.rs:152`), weekly ceiling 0.98 (`src/config.rs:166`) whose effective rotation line is
-> 0.97 (`weekly_rotation_line`, `src/daemon.rs:4105-4107`), the operator's floor read as `floor` in
+> 0.97 (`weekly_rotation_line`, `src/daemon.rs:4290-4292`), the operator's floor read as `floor` in
 > selection, `BLIND_GATE_SECS = 300` (`src/daemon.rs:370`), `BLIND_GATE_RISK_BAND = 0.60`
 > (`src/daemon.rs`). The item lands in one pull request with #1596 and #1597 — the crate compiles
 > only with all three — and is graded at its own seams: each arm's pure function or tested method.
@@ -212,10 +212,10 @@ Scenario Outline: `decide` swaps a weekly-only active on its weekly threshold al
 Scenario: a weekly-only active at weekly 0.99 swaps with reason weekly, logs no session percent and arms no parked landing
   # Tier A — graded by `a_weekly_only_active_swaps_with_reason_weekly_and_arms_no_parked_landing` (#1602
   # § 6 test 5, `src/daemon.rs`; mutant-proven by § 7 M-a:
-  # `session_pct: Some(to_pct(active_usage.session.unwrap_or(0.0)))` at `src/daemon.rs:4412` makes it FAIL, `running 1 test` then `FAILED`), beside test 28, `a_parked_landing_watch_releases_with_no_record_when_the_departed_account_reads_weekly_only` (mutant-proven by § 7 M-ac: the resolution at `src/daemon.rs:3326-3327`
+  # `session_pct: Some(to_pct(active_usage.session.unwrap_or(0.0)))` at `src/daemon.rs:4597` makes it FAIL, `running 1 test` then `FAILED`), beside test 28, `a_parked_landing_watch_releases_with_no_record_when_the_departed_account_reads_weekly_only` (mutant-proven by § 7 M-ac: the resolution at `src/daemon.rs:3511-3512`
   # skipping an absent session keeps the watch armed), and test 29,
   # `a_weekly_only_active_within_cooldown_gets_no_raw_ceiling_bypass` (mutant-proven by § 7 M-ad:
-  # `at_raw_ceiling` read as `is_none_or` at `src/daemon.rs:4323` bypasses the cooldown), bound by name
+  # `at_raw_ceiling` read as `is_none_or` at `src/daemon.rs:4508` bypasses the cooldown), bound by name
   # · covers AC-2, AC-14
   Given a warmed-up fleet whose active's served reading is weekly-only at weekly 0.99, outside
         cooldown, with a viable two-window spare
@@ -227,12 +227,12 @@ Scenario: a weekly-only active at weekly 0.99 swaps with reason weekly, logs no 
         token unchanged
     And no `ParkedLanding` is armed on the departed account
     And within cooldown of a prior swap the same active gets `TickAction::SkippedCooldown`, never
-        the raw-ceiling bypass (`at_raw_ceiling`, `src/daemon.rs:4323`), which needs a `Some` session
+        the raw-ceiling bypass (`at_raw_ceiling`, `src/daemon.rs:4508`), which needs a `Some` session
         at the ceiling — test 29
     And the departed account's parked-landing watch, had one been armed by a `reason=session` swap,
         releases with no landing record when that account's next reading inside the landing window is
         weekly-only — test 28
-    # The reason (`src/daemon.rs:4403-4407`) reads `Session` only from a `Some` session at or over its
+    # The reason (`src/daemon.rs:4588-4592`) reads `Session` only from a `Some` session at or over its
     # threshold, else `Weekly`; the landing watch (`:4425-4429`) is armed only on reason `Session`,
     # so its `decision_pct` is always read from the `Some` the reason came from; the parked-landing
     # resolution (`landing_pct`, `:3327`) reads a landing from a `Some` session only and releases the
@@ -244,7 +244,7 @@ Scenario: a weekly-only active at weekly 0.99 swaps with reason weekly, logs no 
 Scenario: the velocity projection holds when the active's session window is absent
   # Tier A — graded by `velocity_swap_holds_when_the_active_session_window_is_absent` (#1602 § 6 test 6,
   # `src/daemon.rs`; mutant-proven by § 7 M-h: the early return removed and the projection run on
-  # `active_usage.session.unwrap_or(1.0)` at `src/daemon.rs:5317-5331` makes it FAIL — it swaps — over a
+  # `active_usage.session.unwrap_or(1.0)` at `src/daemon.rs:5502-5516` makes it FAIL — it swaps — over a
   # warmed-up fleet with a viable spare) · covers AC-3
   Given a warmed-up fleet with a viable two-window spare, whose active's served reading is
         weekly-only, with a sustained, climbing retained session-velocity EMA and a non-zero horizon
@@ -253,19 +253,19 @@ Scenario: the velocity projection holds when the active's session window is abse
         without a viable spare the arm holds under the mutant as well
     And no `swap` event is emitted from it
     # `let Some(session) = active_usage.session else { return TickAction::Held };` at the top of
-    # `velocity_swap` (`src/daemon.rs:5280`), so the projection (`:5317-5331`) and its `swap` line's
+    # `velocity_swap` (`src/daemon.rs:5465`), so the projection (`:5317-5331`) and its `swap` line's
     # `session_pct` (`:5390`) read a bound `Some` by construction. REQ-ARM-B-003 BUT NOT a velocity
     # projection over an absent session.
 
 Scenario: exhaustion bookkeeping keys a weekly-only peer on its weekly line only
   # Tier A — graded by `out_of_rotation_for_a_weekly_only_peer_keys_on_its_weekly_line_only` (#1602 § 6
   # test 7, `src/daemon.rs`; mutant-proven by § 7 M-i:
-  # `reading.session.is_none_or(|s| s >= ceiling)` in `out_of_rotation` at `src/daemon.rs:5928` makes
+  # `reading.session.is_none_or(|s| s >= ceiling)` in `out_of_rotation` at `src/daemon.rs:6113` makes
   # its `0.90` arm FAIL — the window is armed), beside test 8,
   # `exhausted_poll_window_ignores_an_absent_session_axis` (mutant-proven by § 7 M-aa:
   # `exhausted_poll_window` bailing to `exhausted_poll_secs` whenever the session is absent makes its
   # 0.98 half FAIL; it discriminates only because test 8 places the weekly reset strictly inside
-  # `poll_secs..exhausted_poll_secs` of `now_secs`, so the clamp at `src/daemon.rs:6036-6038` does not
+  # `poll_secs..exhausted_poll_secs` of `now_secs`, so the clamp at `src/daemon.rs:6221-6223` does not
   # decide the answer; M-i's substitution inside `exhausted_poll_window`, `:6028-6030`, is
   # unobservable), bound by name · covers AC-4
   Given a non-active, enabled peer whose served reading is weekly-only
@@ -273,7 +273,7 @@ Scenario: exhaustion bookkeeping keys a weekly-only peer on its weekly line only
    Then at weekly 0.98 the peer is out of rotation and the slow-poll window is armed, keyed off its
         weekly reset
     And at weekly 0.90 it is not out of rotation and no window is armed
-    And the pure window (`exhausted_poll_window`, `src/daemon.rs:6008`) over the 0.98 reading
+    And the pure window (`exhausted_poll_window`, `src/daemon.rs:6193`) over the 0.98 reading
         returns exactly the seconds to the weekly reset, placed strictly inside
         `poll_secs..exhausted_poll_secs` of now; over a weekly-only reading at 0.50 no exhausted
         dimension
@@ -287,14 +287,14 @@ Scenario: exhaustion bookkeeping keys a weekly-only peer on its weekly line only
 Scenario: a weekly-only blocked spare names a weekly hold, never the nameless fallthrough
   # Tier A — graded by `all_exhausted_relief_names_a_weekly_hold_for_a_weekly_only_blocked_spare` (#1602
   # § 6 test 9, `src/daemon.rs`; mutant-proven by § 7 M-j:
-  # `session_blocked = usage.session.is_none_or(|s| s >= line)` at `src/daemon.rs:6128` makes it FAIL —
+  # `session_blocked = usage.session.is_none_or(|s| s >= line)` at `src/daemon.rs:6313` makes it FAIL —
   # `spare_relief` returns `None` and the relief falls to the hold with its timestamp omitted) · covers
   # AC-5
   Given no viable target and a single enabled spare whose served reading is weekly-only at weekly
         0.98 with a weekly reset
    When the all-exhausted relief is computed against the block lines session 0.95 and weekly 0.97
    Then it returns `(SwapReason::Weekly, that spare, Some(its weekly reset))`
-    And never the `(None, None)` fallthrough at `src/daemon.rs:6154`, which names nothing
+    And never the `(None, None)` fallthrough at `src/daemon.rs:6339`, which names nothing
     # `session_blocked = usage.session.is_some_and(|s| s >= session_block_line)`, `weekly_blocked`
     # likewise (`:6128-6129`); `spare_relief`'s signature — two `bool`s — is unchanged (`:6056`).
     # REQ-ARM-B-005 BUT NOT `cause: session`; the existing relief tests bind two-window spares only.
@@ -307,7 +307,7 @@ Scenario: the fleet is not out of capacity while a weekly-only spare has headroo
         has a served weekly-only reading at weekly 0.50
    When the `status` reply is built
    Then `next_swap` names that spare as the target
-    And it is never `no_viable_target` and never `AwaitingData` — `src/daemon.rs:5481-5494` is
+    And it is never `no_viable_target` and never `AwaitingData` — `src/daemon.rs:5666-5679` is
         unchanged: a served reading is not an unpolled one
     # REQ-ARM-B-006, origin the operator's "crippled": the fleet of 17 accounts, 15 weekly-only since
     # the lift, reported out of capacity because their readings failed to parse. BUT NOT
@@ -316,7 +316,7 @@ Scenario: the fleet is not out of capacity while a weekly-only spare has headroo
 Scenario: the near-limit fast poll reads false for a weekly-only active, stated and pinned (D4 default)
   # Tier A — graded by `active_near_limit_reads_false_for_a_weekly_only_active` (#1602 § 6 test 16,
   # `src/daemon.rs`; mutant-proven by § 7 M-o: the floor comparison read as
-  # `active_usage.session.unwrap_or(1.0) >= floor` at `src/daemon.rs:5617` makes it FAIL — the band
+  # `active_usage.session.unwrap_or(1.0) >= floor` at `src/daemon.rs:5802` makes it FAIL — the band
   # engages); under D4's alternative the expectation moves and the band gains a weekly predicate in a
   # separate item · covers AC-7
   Given a warmed-up daemon with the near-limit path enabled, whose active's served reading is
@@ -325,7 +325,7 @@ Scenario: the near-limit fast poll reads false for a weekly-only active, stated 
    Then `active_near_limit` is false on both branches — the in-band floor comparison and the
         sustained-EMA projection
     And `near_limit_fast_poll_engaged` stays false
-    # The band is session-only (`src/daemon.rs:5605-5641`); `plausible_active_usage` (`:5614-5619`)
+    # The band is session-only (`src/daemon.rs:5790-5826`); `plausible_active_usage` (`:5614-5619`)
     # corrects the session through `plausible_session`, whose signature stays
     # `(Option<SessionHighWater>, &Usage) -> Usage` (`src/swap.rs:703`) and which still window-matches
     # (`:1755`); the `session` field of the passed and returned `Usage` is `Option` in, `Option` out;
@@ -392,12 +392,12 @@ Scenario: the pure gate predicates and the anchor correction read false, and `No
         0.95)` is false
     And `plausible_anchor_session(Some(mark), None)` is None, while with `Some(0.40)` and a higher
         mark in the same window it is the mark, as today
-    And `blind_anchor_high_water` (`src/daemon.rs:5236-5241`) yields no high-water percent for a
+    And `blind_anchor_high_water` (`src/daemon.rs:5421-5426`) yields no high-water percent for a
         `None` anchor
     # The predicates take `anchor_session: Option<f64>` (design AD-5). `blind_gate_armed` has two
     # production callers at fd8640b — the eligibility SLI (`note_blind_gate_eligibility`,
     # `src/daemon.rs`) and `blind_active_view` (`src/daemon/records.rs`) — which cannot drift from
-    # it; `blind_swap`'s anchor arm compares `plausible_anchor_session` (`src/daemon.rs:4924-4927`)
+    # it; `blind_swap`'s anchor arm compares `plausible_anchor_session` (`src/daemon.rs:5109-5112`)
     # against the config thresholds `session_blind_risk_band` and `session_blind_swap_secs` in its
     # own expression, and reads false on a `None` anchor by the same move. ADR-0017's "Never fires
     # on a `None`/missing reading"
@@ -409,7 +409,7 @@ Scenario: a weekly-only active blind past the gate fires no blind swap and no el
   # Tier A — graded by
   # `a_weekly_only_blind_active_past_the_gate_fires_no_blind_swap_and_no_eligibility_event` (#1602 § 6
   # test 13, `src/daemon.rs`; mutant-proven by § 7 M-n: `blind_swap`'s anchor arm read as
-  # `is_none_or(|s| s >= self.session_blind_risk_band)` at `src/daemon.rs:4924-4927` makes it FAIL — a
+  # `is_none_or(|s| s >= self.session_blind_risk_band)` at `src/daemon.rs:5109-5112` makes it FAIL — a
   # blind swap fires — over a warmed-up fleet with a viable spare; test 11's mutant cannot stand in,
   # since this arm never calls `blind_gate_armed`) · covers AC-6
   Given a warmed-up daemon whose active is blind for `BLIND_GATE_SECS + 1` seconds behind a
@@ -452,7 +452,7 @@ Scenario: no `blind_active` block is emitted for a weekly-only blind active unti
 Scenario: the server-directed arm still swaps a weekly-only active away, and its swap line omits the session percent
   # Tier A — graded by `the_swap_line_omits_session_pct_for_a_blind_preempt_from_a_weekly_only_anchor`
   # (#1602 § 6 test 27, `src/daemon.rs`; mutant-proven by § 7 M-e:
-  # `to_pct(anchor.session.unwrap_or(0.0))` at `src/daemon.rs:5044` makes it FAIL) · covers AC-6, AC-14
+  # `to_pct(anchor.session.unwrap_or(0.0))` at `src/daemon.rs:5229` makes it FAIL) · covers AC-6, AC-14
   Given a warmed-up daemon whose active is blind behind a weekly-only anchor, held by a
         `Retry-After` past `session_blind_swap_secs`, outside cooldown, with two viable spares
   # Two, not one: a session-less `Retry-After` swap is speculative (`src/daemon.rs`), and the
@@ -475,9 +475,9 @@ Scenario: a `Retry-After` swap off a session-less anchor retains no `status` not
   # Tier A — graded by `a_retry_after_blind_preempt_from_a_weekly_only_anchor_retains_no_status_notice`
   # (#1602 § 6 test 30, `src/daemon.rs`; mutant-proven by § 7 M-ae: the record built whatever the anchor
   # carries, with
-  # `last_known_session_pct: last_known_session_pct.unwrap_or(0)` at `src/daemon.rs:5063-5068`, makes it
+  # `last_known_session_pct: last_known_session_pct.unwrap_or(0)` at `src/daemon.rs:5248-5253`, makes it
   # FAIL — the notice is retained and the wire serves `"last_known_session_pct":0`), beside the
-  # committed `blind_swap_fires_past_t_with_a_viable_target` (`src/daemon.rs:9919`), which keeps a
+  # committed `blind_swap_fires_past_t_with_a_viable_target` (`src/daemon.rs:10140`), which keeps a
   # two-window anchor's notice with its `68` · covers AC-6
   Given a warmed-up daemon whose active is blind behind a weekly-only anchor, held by a
         `Retry-After` past `session_blind_swap_secs`, outside cooldown, with two viable spares
@@ -490,7 +490,7 @@ Scenario: a `Retry-After` swap off a session-less anchor retains no `status` not
     # (`src/daemon/records.rs`) that `recent_blind_preempt_swap_view` (`src/daemon.rs:597-614`)
     # copies onto the wire's `BlindPreemptSwap.last_known_session_pct: u8`
     # (`src/daemon/snapshot.rs:204`); a `0` there would print "last-known 0%" in the CLI narration
-    # (`src/cli.rs:3259-3270`). So the record is built as `last_known_session_pct.map(…)`, None here,
+    # (`src/cli.rs:3261-3272`). So the record is built as `last_known_session_pct.map(…)`, None here,
     # and `record_swap` (`src/daemon.rs`) has already cleared any earlier notice. The cost
     # (design B-6t): until #1599 lands, the CLI prints no narration and no `use <from>` undo hint
     # for such a swap; the menu-bar app does not decode the notice; the swap and its log line are
@@ -506,14 +506,14 @@ Scenario: a weekly-only active entering blindness logs `near_limit=false` and no
   # Tier A — graded by
   # `a_weekly_only_active_entering_blindness_logs_near_limit_false_and_no_session_percent` (#1602 § 6
   # test 14, `src/daemon.rs`; mutant-proven by § 7 M-b:
-  # `session_pct: Some(to_pct(prev.session.unwrap_or(0.0)))` at `src/daemon.rs:3406` makes it FAIL) ·
+  # `session_pct: Some(to_pct(prev.session.unwrap_or(0.0)))` at `src/daemon.rs:3591` makes it FAIL) ·
   # covers AC-6, AC-14
   Given an active account whose last live reading was weekly-only
    When its next poll fails — the live-to-blind entry edge
    Then the `BlindEnter` event carries `near_limit: false`, `session_pct: None` and
         `weekly_pct: Some(_)`
     And its line carries `near_limit=false` and `weekly_pct=` and no `session_pct=` token
-    # `near_limit` at `src/daemon.rs:3396` reads `prev.session.is_some_and(|s| s >= ceiling)` — the
+    # `near_limit` at `src/daemon.rs:3581` reads `prev.session.is_some_and(|s| s >= ceiling)` — the
     # anchor's tag for the whole episode, so the exit line agrees by construction; the `BlindWindow`
     # site at `:2864` reads the same way, and `near_limit` stays `bool` on all three events. The
     # anchor's own copy-through (`:3397-3402`) is #1597's. Rendered by the `session_high_water_pct`
@@ -523,7 +523,7 @@ Scenario: a served weekly-only reading ends a blind episode, and the exit line c
   # Tier A — graded by
   # `a_weekly_only_reading_ends_a_blind_episode_and_the_exit_event_carries_no_session_percent` (#1602 §
   # 6 test 22, `src/daemon.rs`; mutant-proven by § 7 M-s:
-  # `session_at_recovery: Some(to_pct(fresh.session.unwrap_or(0.0)))` at `src/daemon.rs:3419` makes it
+  # `session_at_recovery: Some(to_pct(fresh.session.unwrap_or(0.0)))` at `src/daemon.rs:3604` makes it
   # FAIL) · covers AC-10, AC-14
   Given an episode opened on a two-window anchor — session Some, weekly Some — for the active
         account
@@ -552,7 +552,7 @@ Scenario: the velocity event skips an absent axis and the session EMA is untouch
         `session_delta_pct=` — `reliability` reads only the second (`src/reliability.rs:1722`)
     And the retained session-velocity EMA is not folded — `note_session_velocity` runs only when both
         endpoints carry a session, and the retained EMA is untouched
-    # The `usage_velocity` call and the `UsageVelocity` push at `src/daemon.rs:2805-2816`; the
+    # The `usage_velocity` call and the `UsageVelocity` push at `src/daemon.rs:2990-3001`; the
     # stale-low gate (`is_stale_low`) and the `note_session_velocity` fold at `:2835-2840`;
     # `UsageVelocity`'s deltas
     # (`src/observability.rs:2039`) become `Option<i16>`. REQ-ARM-B-011: a window that disappears
@@ -602,7 +602,7 @@ Scenario: a `blind_window` line without a session axis is censused as "no sessio
 Scenario: the two event percents that never meet the absent state keep their shape
   # Tier B — pending: no test in #1602 § 6 is named for this; the manual swap's sentinel is pinned by
   # the committed tests at
-  # `src/daemon/commands.rs:1408`, `:1499`, `src/observability.rs:8526` and `src/use_account.rs:5617-5620` — the last pins the standalone `use` swap's emitter, `session_pct: 0` inside `run_use` at `src/use_account.rs:938`
+  # `src/daemon/commands.rs:1417`, `:1499`, `src/observability.rs:8526` and `src/use_account.rs:5618-5621` — the last pins the standalone `use` swap's emitter, `session_pct: 0` inside `run_use` at `src/use_account.rs:938`
   # — which the executor adapts (`session_pct: 0` → `Some(0)`), and `BlindGateEligible.session_pct` by
   # the second scenario of Rule 3; the merge judge reads both adaptations · covers AC-14
   Given the manual / forced swap at `src/daemon/commands.rs:224`, whose `session_pct=0` is a
@@ -630,12 +630,12 @@ Scenario Outline: each fabrication on a name surface is caught by its recorded m
 
   Examples:
     | id  | site                           | mutant                                                                          | test                                                                                           |
-    | M-a | `src/daemon.rs:4412`           | `session_pct: Some(to_pct(active_usage.session.unwrap_or(0.0)))`                 | test 5 `a_weekly_only_active_swaps_with_reason_weekly_and_arms_no_parked_landing`               |
-    | M-b | `src/daemon.rs:3406`           | `session_pct: Some(to_pct(prev.session.unwrap_or(0.0)))`                         | test 14 `a_weekly_only_active_entering_blindness_logs_near_limit_false_and_no_session_percent` |
+    | M-a | `src/daemon.rs:4597`           | `session_pct: Some(to_pct(active_usage.session.unwrap_or(0.0)))`                 | test 5 `a_weekly_only_active_swaps_with_reason_weekly_and_arms_no_parked_landing`               |
+    | M-b | `src/daemon.rs:3591`           | `session_pct: Some(to_pct(prev.session.unwrap_or(0.0)))`                         | test 14 `a_weekly_only_active_entering_blindness_logs_near_limit_false_and_no_session_percent` |
     | M-c | `src/daemon/records.rs:515`    | the block emitted with `last_known_session_pct: to_pct(anchor.session.unwrap_or(0.0))` | test 15 `blind_active_view_emits_no_block_for_a_weekly_only_blind_active_until_the_wire_can_say_so` (D10 default) |
     | M-d | `src/daemon/classify.rs:121-125` | the session delta computed from `unwrap_or(0.0)` on each side                  | test 23 `usage_velocity_skips_an_absent_axis`                                                   |
-    | M-e | `src/daemon.rs:5044`           | `to_pct(anchor.session.unwrap_or(0.0))`                                          | test 27 `the_swap_line_omits_session_pct_for_a_blind_preempt_from_a_weekly_only_anchor`         |
-    | M-ae | `src/daemon.rs:5063-5068`     | the record built whatever the anchor carries, with `last_known_session_pct: last_known_session_pct.unwrap_or(0)` | test 30 `a_retry_after_blind_preempt_from_a_weekly_only_anchor_retains_no_status_notice` |
+    | M-e | `src/daemon.rs:5229`           | `to_pct(anchor.session.unwrap_or(0.0))`                                          | test 27 `the_swap_line_omits_session_pct_for_a_blind_preempt_from_a_weekly_only_anchor`         |
+    | M-ae | `src/daemon.rs:5248-5253`     | the record built whatever the anchor carries, with `last_known_session_pct: last_known_session_pct.unwrap_or(0)` | test 30 `a_retry_after_blind_preempt_from_a_weekly_only_anchor_retains_no_status_notice` |
     # A `None` test over a skip or pass arm is observationally identical under `unwrap_or(0.0)` (an
     # absent session reading as `0.0` passes every below-the-line gate as `None` does), so those
     # tests pin the opposite error, and the fabrication there is caught by the enumeration below,
@@ -647,13 +647,13 @@ Scenario: the twelve production files carry no numeric default over a window fra
   # names, the AC-16 float grep prints exactly the twelve lines it prints at fd8640b, compared by
   # content and count and never by line number because this item's own edits shift the numbers (at
   # fd8640b): ten
-  # `unwrap_or_default()` lines over text, collection or config values (`src/daemon/commands.rs:5586`, `src/daemon/snapshot_build.rs:83`, `src/use_account.rs:1637`, `:4955`, `:6903`, `:7101`, `:7274`, `:7678`, `src/cli.rs:5127`,
+  # `unwrap_or_default()` lines over text, collection or config values (`src/daemon/commands.rs:5595`, `src/daemon/snapshot_build.rs:83`, `src/use_account.rs:1638`, `:4955`, `:6903`, `:7101`, `:7274`, `:7678`, `src/cli.rs:5132`,
   # `:5744`) and two
-  # `map_or(0.0, |v| v.rate)` lines over the velocity EMA rate (`src/daemon.rs:4204` and `src/daemon/selection.rs:148`,
+  # `map_or(0.0, |v| v.rate)` lines over the velocity EMA rate (`src/daemon.rs:4389` and `src/daemon/selection.rs:148`,
   # row 12's D7 default), none over a window fraction, and nothing else; AC-16's integer grep
   # (`unwrap_or\(0\)|map_or\(0,|unwrap_or\(100\)|map_or\(100,`) prints exactly its 17 lines at fd8640b
   # (six wall-clock fallbacks, five column widths, a hash seed, two bearer counts, two comments, and
-  # `src/cli.rs:4112`'s `weekly_pct.unwrap_or(100)`, unreachable behind `weekly_exhausted`; 7 of them
+  # `src/cli.rs:4114`'s `weekly_pct.unwrap_or(100)`, unreachable behind `weekly_exhausted`; 7 of them
   # over the earlier eleven-file pathspec, none over a window percent); design AD-4 rejected a source
   # lint for its false positives, so the per-arm `None` tests and the six mutants are the instrument and
   # the review of each `Some(` wrapper the signal (`git grep -nE 'Some\(0\.0\)' -- src` is 10 lines at

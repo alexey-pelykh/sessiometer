@@ -5,7 +5,7 @@ Issue #1596 · PRD REQ-RPL-B-001 / REQ-QW-B-001 / REQ-RPL-C-001 / REQ-RPL-B-002 
 Example Mapping: 🟦 5 rules · 🟩 15 examples · 🟥 0 open
 
 > Since 2026-10-30 a verified Ultra account's `GET /api/oauth/usage` reply carries `"five_hour":null`
-> beside a present `seven_day` window. `parse_usage` (`src/usage.rs:446-465`) ends each of its two
+> beside a present `seven_day` window. `parse_usage` (`src/usage.rs:503-537`) ends each of its two
 > `dimension` lookups in `?`, so the session miss is `Error::UsageParse("no session (five_hour)
 > dimension")` before the weekly window is read; every poll of such an account is a failed poll, no
 > sample is written, selection drops the account, and `next_swap` reports a healthy fleet out of
@@ -97,9 +97,9 @@ Scenario: the parser's contract states the rule
   # `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` (named here, not
   # authored), the wording by the fresh-context merge judge · covers AC-10, AC-15
   Given the sentence "A window that cannot be found is a hard
-        [`Error::UsageParse`]" at `src/usage.rs:444-445`
+        [`Error::UsageParse`]" at `src/usage.rs:473-474`
     And the two "tolerant of" bullets above it, naming `utilization` and
-        `percent` (`src/usage.rs:438-442`)
+        `percent` (`src/usage.rs:467-471`)
    When the item lands
    Then that sentence is gone, the bullets stay, and the comment states that each window is
         independently optional, that a window the reply does not carry is reported as `None` (not
@@ -107,9 +107,9 @@ Scenario: the parser's contract states the rule
         recorded answer
     And the intra-doc link to `Error::UsageParse` still resolves under the doc gate
     And the neighbouring "both dimensions" comments are corrected in the same commit:
-        `UsageReport`'s (`src/usage.rs:129-137`), `to_usage`'s (`src/usage.rs:159-165`),
-        `PolledReading`'s `usage` field (`src/usage.rs:118-120`) and
-        `UsageParse`'s (`src/error.rs:552-556`)
+        `UsageReport`'s (`src/usage.rs:149-157`), `to_usage`'s (`src/usage.rs:185-191`),
+        `PolledReading`'s `usage` field (`src/usage.rs:124-126`) and
+        `UsageParse`'s (`src/error.rs:556-560`)
     And the comment lands in the commit that moves the test of Rule 2, never before it
     # REQ-REC-B-003, routed here from #1593 (design block B-10). The ADR half is #1593's and merges
     # first — REQ-REC-C-001: no commit reverses a pinned behaviour without its record (AC-15).
@@ -138,7 +138,7 @@ Scenario: the session-only limits[] body moves from "parse error" to "served", a
   # Tier A — graded by usage::tests::a_session_only_limits_body_is_served_with_its_weekly_window_absent
   # (the moved test, #1596 § 4c; RED at fd8640b: the body is Err(UsageParse)) · covers AC-4, AC-9, AC-15
   Given the committed test
-        `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:887-893`)
+        `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:959-965`)
     And its body `{"limits": [{"kind": "session", "percent": 10}]}`, which it asserts is
         `Err(UsageParse)` today
     And #1593's amendments to ADR-0013, ADR-0017, ADR-0025 and ADR-0033 are merged to `main`
@@ -217,8 +217,8 @@ Examples:
   | CAPTURED_NULL_SESSION_QUOTA_FIELDS                       |
   | CAPTURED_NULL_SESSION_QUOTA_FIELDS_WITHOUT_FIVE_HOUR_KEY |
   | CAPTURED_WEEKLY_LIMITS_ONLY                       |
-  # The filter is the `is_some_and` … `continue` at `src/usage.rs:491-494`. The lookup itself is
-  # unchanged by this item — `dimension` at `src/usage.rs:476-510` — which is what lets #1592's pins
+  # The filter is the `is_some_and` … `continue` at `src/usage.rs:563-566`. The lookup itself is
+  # unchanged by this item — `dimension` at `src/usage.rs:548-582` — which is what lets #1592's pins
   # hold on both sides of the fix.
 
 Scenario: at the lookup seam, the weekly reading is weekly_all's, never weekly_scoped's
@@ -294,7 +294,7 @@ Scenario: the empty object through the poll path stays a failed poll (D1 default
    When the usage source polls
    Then the outcome is `Err(Error::UsageParse(_))` — no window applies, so D1's answer
     But NOT a served reading with both windows `None`, which is D1 (b), under which this test moves
-    # `a_200_with_an_unparseable_body_is_a_parse_error` is at `src/usage.rs:1195`. It is a committed
+    # `a_200_with_an_unparseable_body_is_a_parse_error` is at `src/usage.rs:1472`. It is a committed
     # grader the executor may not edit under the default, and the one that would fail if the
     # neither-window guard were dropped.
 

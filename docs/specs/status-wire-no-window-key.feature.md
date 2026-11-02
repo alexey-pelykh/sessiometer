@@ -8,7 +8,7 @@ Example Mapping: 🟦 6 rules · 🟩 25 examples · 🟥 0 open
 > beside a present `seven_day` window. Once the parser (#1596) and the reading model (#1597) serve
 > that reply with its session window absent, the `status` reply and both `watch` frames carry
 > `session_pct: null` for a healthy weekly-only account — the same bytes a failed poll produces,
-> because the field's contract (`src/daemon/snapshot.rs:758-760`) defines `null` as "the last poll
+> because the field's contract (`src/daemon/snapshot.rs:758-763`) defines `null` as "the last poll
 > for this account failed (never a fabricated `0`)". And a weekly-only active that goes blind gets no
 > `blind_active` block at all under schema `1.14`, because `BlindActive.last_known_session_pct` is a
 > `u8` (`src/daemon/snapshot.rs:167`) and the only value available would be a fabricated `0`. This
@@ -223,7 +223,7 @@ Scenario: a Retry-After swap off a session-less anchor is narrated with its labe
         (the swap lands on one of them; the lines below call it `spare`). A session-less `Retry-After`
         swap is
         speculative, and the #582 reserve breaker holds it when one viable target remains
-        (`NextSwapReason::OnlyCandidate`, `src/daemon.rs:5019-5030`),
+        (`NextSwapReason::OnlyCandidate`, `src/daemon.rs:5204-5215`),
         so a single spare would fail this scenario for a reason unrelated to the change
     And, as the contrast fixture, the same swap off an anchor that carries session 0.68
    When the daemon ticks and the status response is serialised
@@ -303,7 +303,7 @@ Scenario: the CLI's blind SESSION% cell falls back to n/a, uncoloured, when the 
   Given a blind active whose block is `BlindActive { blind_secs: 480, last_known_session_pct: None,
         auto_protection_degraded: true }` (the fixture shape at `src/cli.rs`)
     And, as the contrast fixture, the same block with `last_known_session_pct: Some(87)`
-   When the `status` table row is built (`src/cli.rs:3858-3890`)
+   When the `status` table row is built (`src/cli.rs:3860-3892`)
    Then the SESSION% cell is `n/a` — `pct(account.session_pct)`, the live reading being cleared during
         blindness
     And the cell's severity is `None` (uncoloured), as every other `None` cell
@@ -318,7 +318,7 @@ Scenario Outline: the blind prose lines name the duration and the verdict and dr
   # `last-known`; for `render_blind_active`, the percent-less DEGRADED parenthetical left as
   # `acting on a stale anchor` → RT-4 FAILS on `stale anchor`). The present-percent half is graded by
   # the committed
-  # cli::tests::render_status_narrates_a_blind_active_account_instead_of_bare_n_a (`src/cli.rs:7330`),
+  # cli::tests::render_status_narrates_a_blind_active_account_instead_of_bare_n_a (`src/cli.rs:7335`),
   # whose literal is executor-adapted (`87` → `Some(87)`) · covers AC-4, AC-16
   Given a blind active whose block has `last_known_session_pct: None`, `blind_secs: 480` and
         `auto_protection_degraded: true`
@@ -338,8 +338,8 @@ Scenario Outline: the blind prose lines name the duration and the verdict and dr
 
   Examples:
     | renderer                                  | test                                                                             | with                                                                                                                                   |
-    | `render_blind_active` (`src/cli.rs:3234`) | `render_status_blind_active_without_a_percent_states_the_duration_and_verdict_only` (RT-4) | `active work: blind for 8m — last-known session 87% — auto-protection DEGRADED (acting on a stale anchor)`                              |
-    | `render_cornered` (`src/cli.rs:3203`)     | `render_cornered_without_a_percent_omits_the_last_known_clause` (RT-5)            | `CORNERED: active work blind for 8m at last-known session 87% and auto-protection cannot act — <blocked>; add or free an account`      |
+    | `render_blind_active` (`src/cli.rs:3236`) | `render_status_blind_active_without_a_percent_states_the_duration_and_verdict_only` (RT-4) | `active work: blind for 8m — last-known session 87% — auto-protection DEGRADED (acting on a stale anchor)`                              |
+    | `render_cornered` (`src/cli.rs:3205`)     | `render_cornered_without_a_percent_omits_the_last_known_clause` (RT-5)            | `CORNERED: active work blind for 8m at last-known session 87% and auto-protection cannot act — <blocked>; add or free an account`      |
   # The exact wording of the percent-less line is the executor's; the suggested forms are "active
   # work: blind for 8m — auto-protection DEGRADED (no session window to guard)" and "CORNERED: active
   # work blind for 8m and auto-protection cannot act — <blocked>; add or free an account". No
@@ -546,7 +546,7 @@ Scenario: the session_pct contract reverts to its steady-state sentence, and the
   # (`apps/menubar/Sources/WireModel.swift:1` at fd8640b; nothing, exit status 1, on the pull request —
   # `git grep -c` never prints a `0`); the wording is the merge judge's · covers AC-6, AC-12, AC-16,
   # AC-18
-  Given the doc comment at `src/daemon/snapshot.rs:758-760` — "Last-polled session-window usage
+  Given the doc comment at `src/daemon/snapshot.rs:758-763` — "Last-polled session-window usage
         percent (`0..=100`); `null` if the last poll for this account failed (never a fabricated
         `0`)." — plus the transitional sentence #1597 appended under D10's default
    When this item lands
@@ -605,13 +605,13 @@ Scenario: ADR-0017 records the fourth report arm in an in-place paragraph (#1599
 
 Scenario: the CLI's n/a cells and the eleven status render goldens are untouched
   # Tier A — graded by the committed
-  # `the_committed_status_goldens_still_match_the_render` (`src/cli.rs:17139`, over the eleven
+  # `the_committed_status_goldens_still_match_the_render` (`src/cli.rs:17144`, over the eleven
   # `status-*` goldens including `status-all-na`, none of which carries a blind row — no
   # `CLI-Goldens-Rebaselined:` trailer is owed, and `scripts/check-cli-golden-rebaseline.sh` fails the
   # commit if a golden moved without one) and the committed
-  # `reset_cell_renders_each_window_directly_or_n_a` (`src/cli.rs:11237`); `pct(None)` has no direct
+  # `reset_cell_renders_each_window_directly_or_n_a` (`src/cli.rs:11242`); `pct(None)` has no direct
   # unit test and is pinned through the goldens' `n/a` cells · covers AC-6
-  Given `pct` (`src/cli.rs:4590-4593`) and `reset_cell` (`src/cli.rs:4363-4366`)
+  Given `pct` (`src/cli.rs:4595-4598`) and `reset_cell` (`src/cli.rs:4365-4368`)
    When this item lands
    Then `pct(None)` is still `n/a` and `reset_cell(None, _)` is still `n/a`
     And the eleven `build/fixtures/cli-renders/status-*.txt` goldens are byte-identical to `origin/main`

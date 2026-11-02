@@ -6,20 +6,20 @@ Example Mapping: 🟦 5 rules · 🟩 18 examples · 🟥 0 open
 
 > Since 2026-10-30 a verified Ultra account's usage reply carries `"five_hour":null` beside a present
 > weekly window. Once the parser (#1596) and the reading model (#1597) serve such a reading with its
-> session window `None`, the daemon's sample writer `append_sample_for_poll` (`src/daemon.rs:709-734`)
+> session window `None`, the daemon's sample writer `append_sample_for_poll` (`src/daemon.rs:718-754`)
 > must decide what it writes for that axis, and the store at `fd8640b` cannot write the truth:
-> `Sample.session` is `f64` (`src/usage_store.rs:146`), a line carrying `"session":null` is skipped
-> by `read_samples` (`src/usage_store.rs:447-465`) and erased by the next `compact_and_roll`
-> (`read_samples` … `write_samples` at `src/usage_store.rs:533-542`), and an hour holding only such
-> samples would fold `max_of(&[])` to `f64::NEG_INFINITY` (`src/usage_store.rs:805-807`), which
+> `Sample.session` is `f64` (`src/usage_store.rs:148`), a line carrying `"session":null` is skipped
+> by `read_samples` (`src/usage_store.rs:449-467`) and erased by the next `compact_and_roll`
+> (`read_samples` … `write_samples` at `src/usage_store.rs:535-544`), and an hour holding only such
+> samples would fold `max_of(&[])` to `f64::NEG_INFINITY` (`src/usage_store.rs:807-809`), which
 > `serde_json` 1.0.150 writes to the rollup as `null`, after which every `read_rollup`
-> (`src/usage_store.rs:473-484`) hard-errors with `UsageRollupMalformed` and both compaction and
+> (`src/usage_store.rs:475-486`) hard-errors with `UsageRollupMalformed` and both compaction and
 > `stats` fail until the file is repaired by hand. This item makes `Sample.session` and
 > `Sample.weekly` `Option<f64>`, written as JSON `null` with the key always present, read and retained
 > as such, and folded into per-axis `Option` statistics that are omitted when no reading in the
 > bucket carried the axis. It lands in tranche 1's pull request right after the compile unit, by the
 > scoping pipeline's choice (design § 4.4): `append_sample_for_poll` passes `reading.usage.session` into
-> `Sample::new` at `src/daemon.rs:722-723` (`reading.usage.session`, `reading.usage.weekly`), so #1597's
+> `Sample::new` at `src/daemon.rs:742-743` (`reading.usage.session`, `reading.usage.weekly`), so #1597's
 > lift forces a choice at the writer; the compile unit makes it by keeping #1613's sample skip, re-keyed
 > on either fraction being `None`, and this item replaces that skip with the `null` line. Its
 > acceptance is graded at the store's own seams: `serde_json` on `Sample`, `compact_and_roll` over a
@@ -66,14 +66,14 @@ Scenario: a weekly-only line re-encodes with its session key written as null (D6
     But NOT `"session":0` or `"session":0.0` — byte-identical to an idle window the tree already holds
     But NOT the `session` key omitted — #1580's planned exact-key-set oracle (outside #1590, unlanded
         at `fd8640b`) REDs on omission, and `Sample`'s four optional siblings are the only fields that
-        skip their key (`skip_serializing_if`, `src/usage_store.rs:149-163`)
+        skip their key (`skip_serializing_if`, `src/usage_store.rs:151-165`)
     # No `skip_serializing_if` on either fraction field (#1598 Specification § 1). #1562 adds
     # `account_uuid` to `Sample` concurrently; whichever lands second rebases, and this item asserts
     # the five keys it knows.
 
 Scenario: a successful poll of a weekly-only account appends one line carrying "session":null beside its weekly reading
   # Tier A — graded by daemon::tests::a_weekly_only_reading_is_sampled_with_its_session_written_as_null
-  # (#1598 T9, beside collector_writes_one_redacted_sample_per_successful_poll at `src/daemon.rs:19674`;
+  # (#1598 T9, beside collector_writes_one_redacted_sample_per_successful_poll at `src/daemon.rs:19897`;
   # no RED at fd8640b, where it does not compile (`Usage.session` is `f64`); RED at dispatch: against
   # the post-compile-unit origin/main it compiles and fails the one-sample assertion, because the
   # re-keyed #1613 skip writes no line, recorded per #1598 AC-13; mutant, AC-1's record: an early
@@ -88,9 +88,9 @@ Scenario: a successful poll of a weekly-only account appends one line carrying "
     And the line's text carries `"session":null` with the key present
     But NOT `"session":0.0`
     But NOT no line at all — gap honesty reserves "nothing" for a failed poll
-        (`let Ok(reading) = polled else { return }`, `src/daemon.rs:715-717`), and a failed poll still
+        (`let Ok(reading) = polled else { return }`, `src/daemon.rs:724-726`), and a failed poll still
         writes nothing
-    # The `Option` copies through from `reading.usage.session` at `src/daemon.rs:722-723` once
+    # The `Option` copies through from `reading.usage.session` at `src/daemon.rs:742-743` once
     # `Sample::new` takes `Option<f64>`; a served reading carries at least one window under D1's
     # default (a), so a line with both axes `null` never arises there.
 
@@ -132,7 +132,7 @@ Examples:
   | a positive infinity | f64::INFINITY     |
   | a NaN               | f64::NAN          |
   | a negative infinity | f64::NEG_INFINITY |
-  # The hint is `serialize_err()`'s (`src/usage_store.rs:839-841`), whose doc "reachable only for a
+  # The hint is `serialize_err()`'s (`src/usage_store.rs:841-843`), whose doc "reachable only for a
   # non-finite float" becomes true as written: `serde_json` 1.0.150's `serialize_f64` writes `null`
   # for `Nan | Infinite` rather than erroring, so the refusal has to live in the field serializer
   # `serialize_finite_fraction` (#1598 Specification § 1). The alternative the item states —
@@ -153,7 +153,7 @@ Scenario: a weekly-only line decodes with its session reading absent
     And the session reading, read as `Option<f64>`, is `None`
     And the weekly reading, read as `Option<f64>`, is `Some(0.1)`
     But NOT `Some(0.0)` for the session axis
-    But NOT the line skipped — `read_samples` (`src/usage_store.rs:447-465`) keeps every record
+    But NOT the line skipped — `read_samples` (`src/usage_store.rs:449-467`) keeps every record
         `from_slice` accepts and skips the rest in silence, which is how a healthy poll's line is lost
         today
     # The type-stable read is `optional_fraction(decoded.session)`, #1598 § 6's verbatim copy of
@@ -258,12 +258,12 @@ Examples:
   | None      | Some(0.2) | "session":null  |
   | Some(0.1) | None      | "weekly":null   |
   # The four `sample` test helpers —
-  # `fn sample` at `src/usage_store.rs:853` and `src/reliability.rs:3858`,
+  # `fn sample` at `src/usage_store.rs:855` and `src/reliability.rs:3858`,
   # `fn sample` at `src/stats.rs:5539` and `src/usage_stats.rs:1279` — wrap a present fraction in
   # `Some(..)`
   # at the helper, never an absent one as `Some(0.0)`. The other test sites the lift stops compiling
   # follow the
-  # same rule: `golden_samples()` in `src/reliability.rs`, the literal at `src/usage_store.rs:1256`, the
+  # same rule: `golden_samples()` in `src/reliability.rs`, the literal at `src/usage_store.rs:1258`, the
   # `dated`
   # helper, a literal and the corpus loader in `src/usage_stats.rs` (`:2662`, `:2924`, `:3201`), and the
   # raw reads
@@ -297,7 +297,7 @@ Scenario: compaction keeps every in-window weekly-only line, rewritten with its 
     """
     And `now` is `200 * DAY_SECS` and the policy is `RetentionPolicy::default()` — raw window 14 d,
         hourly 90 d, daily lifetime, poll cadence 300 s
-        (`RetentionPolicy`, `src/usage_store.rs:305-315`)
+        (`RetentionPolicy`, `src/usage_store.rs:307-317`)
    When `compact_and_roll` runs once
    Then the raw file holds exactly three lines, `ts` 17107200, 17107800 and 17108400 in that order
     And each, parsed as a JSON object, has `session` equal to JSON `null` with the key present,
@@ -305,11 +305,11 @@ Scenario: compaction keeps every in-window weekly-only line, rewritten with its 
     And `read_samples` returns those three
     But NOT a line rewritten without its `session` key
     But NOT retention proven only on a line with a numeric session
-    # `plan_roll` (`src/usage_store.rs:555-614`) partitions by `ts` alone — a sample rolls only once
+    # `plan_roll` (`src/usage_store.rs:557-616`) partitions by `ts` alone — a sample rolls only once
     # its whole day is older than `now - 14 d` — and `write_samples` (`:620-627`) re-serializes every
     # retained `Sample` through the field serializer. 14695200 is `170 * DAY_SECS + 2 * HOUR_SECS` and
     # 17107200 is `now - 2 * DAY_SECS`, two of the three cohorts
-    # `retention_bounds_raw_window_and_rolls_into_tiers_lifetime_reads_daily` (`src/usage_store.rs:1095`)
+    # `retention_bounds_raw_window_and_rolls_into_tiers_lifetime_reads_daily` (`src/usage_store.rs:1097`)
     # already uses (its third is `80 * DAY_SECS + 5 * HOUR_SECS`); 14781600 is
     # `171 * DAY_SECS + 2 * HOUR_SECS`, a second aged day this scenario adds so that a day with numeric
     # samples sits beside a day without. This is REQ-SMP-Q-001 `SampleStoreContinuity` on the shipped
@@ -329,10 +329,10 @@ Scenario: the version-skew asymmetry, as an fd8640b build meets a store this bin
   Given a store written by this item's binary: raw lines carrying `"session":null`, and the fenced
         rollup `{"format":2,"rollup":{…}}` its first compaction wrote
    When the build at `fd8640b` runs against that store
-   Then its `compact_and_roll` fails at `read_rollup` (`src/usage_store.rs:473-484`: a present-but-
+   Then its `compact_and_roll` fails at `read_rollup` (`src/usage_store.rs:475-486`: a present-but-
         unparseable rollup is a hard error, never a silent reset) before it reads or rewrites the raw
         file — the stall; the fd8640b daemon discards that error (`if let Ok(summary) =
-        compact_and_roll(…)` in `stats_events_for_poll`, `src/daemon.rs:871`) and stops compacting
+        compact_and_roll(…)` in `stats_events_for_poll`, `src/daemon.rs:894`) and stops compacting
         without a word, while its `stats` fails loudly with `UsageRollupMalformed`
     And its `reliability` reads the raw file through `read_samples`, which skips every `null` line in
         silence, so its report leaves them out — it deletes nothing
@@ -372,9 +372,9 @@ Scenario: an hour and a day holding only session-less samples fold to a finite, 
     And the daily tier holds `day_start` 14688000 and 14774400, the hourly tier holds `hour_start`
         14695200 and 14781600, and `rolled_through_ts` is 14783400
     But NOT `-∞` or `NaN` folded for the session axis — `max_of(&[])` is
-        `f64::NEG_INFINITY` (`src/usage_store.rs:805-807`), which `serde_json` 1.0.150 writes as `null`,
+        `f64::NEG_INFINITY` (`src/usage_store.rs:807-809`), which `serde_json` 1.0.150 writes as `null`,
         so the compaction WRITE succeeds and the NEXT `read_rollup` fails: `compact_and_roll`
-        (`read_rollup` at `src/usage_store.rs:534`) and `stats`
+        (`read_rollup` at `src/usage_store.rs:536`) and `stats`
         (`StoreData::read`, `src/stats.rs:212-218`)
         both run it first, and every later compaction and every `stats` run fails until the file is
         repaired by hand
@@ -408,7 +408,7 @@ Scenario: a bucket whose readings carried no session reading omits its session s
     # Fractions compare within 1e-9, as the neighbouring tests do. `p95` by nearest rank is the
     # largest value for n ≤ 19 at p = 0.95 (`ceil(0.95·4) = 4`; at n = 20 the rank is 19 —
     # `percentile` at `src/percentile.rs:21-31`); 288 is
-    # `DAY_SECS / 300`, `expected_per_day` at `src/usage_store.rs:789-792`. D13 (design AD-11) was
+    # `DAY_SECS / 300`, `expected_per_day` at `src/usage_store.rs:791-794`. D13 (design AD-11) was
     # ratified by the council ruling of 2026-11-02 with one amendment: every present `HourStat` /
     # `DayStat` also records `samples: Option<u32>`, the readings it covers, set at fold time (#1610
     # absorbed into #1598). That field's scenarios are #1598's and land in the records change the
@@ -443,7 +443,7 @@ Scenario: a mixed bucket folds each axis over exactly the readings that carried 
 Scenario: a rollup written at fd8640b reads back unchanged (D13 as ruled)
   # Tier A — graded by
   # usage_store::tests::a_rollup_written_before_the_lift_reads_back_with_both_axes_present (#1598 T10,
-  # beside rollup_rewrite_leaves_no_temp_and_round_trips at `src/usage_store.rs:918`), with the mutant
+  # beside rollup_rewrite_leaves_no_temp_and_round_trips at `src/usage_store.rs:920`), with the mutant
   # record #1598 AC-13 owes for it: serialize the lifted per-axis field under a new key, so a rollup
   # written at `origin/main` no longer reads its `session` statistic and T10 FAILS; green at fd8640b by
   # construction; it guards the first read every upgraded machine performs, which a shape slip would
@@ -459,7 +459,7 @@ Scenario: a rollup written at fd8640b reads back unchanged (D13 as ruled)
 
 Scenario Outline: a defensive same-key merge never fabricates an absent axis (D13 as ruled)
   # Tier A — graded by usage_store::tests::a_same_key_merge_keeps_an_absent_axis_absent (#1598 T11,
-  # beside weighted_mean_pools_by_count at `src/usage_store.rs:1358`), with the mutant record #1598
+  # beside weighted_mean_pools_by_count at `src/usage_store.rs:1360`), with the mutant record #1598
   # AC-13 owes for it: the same-key merge fills an absent axis with a zero statistic, and T11 FAILS; it
   # does not compile against origin/main, where the helpers take `&HourStat` / `&DayStat`; low priority:
   # the path is unreachable under roll-once-per-whole-day and reached only through `upsert_hour` /
@@ -477,8 +477,8 @@ Examples:
   | Some(max 0.5, mean 0.4), bucket count 2  | Some(max 0.7, mean 0.6), bucket count 2  | Some(max 0.7, mean 0.5) — today's merge, weighted by the counts |
   # Weighting by the two BUCKET counts is exact only when every sample in both buckets carried the
   # axis, which is the case on the only path that reaches it; the `total == 0.0` arm of
-  # `weighted_mean` (`src/usage_store.rs:777-785`) stays as dead defence, its doc saying so.
-  # `merge_day_stat` (`src/usage_store.rs:768-775`) takes the same arms, with `p95` the max of the
+  # `weighted_mean` (`src/usage_store.rs:779-787`) stays as dead defence, its doc saying so.
+  # `merge_day_stat` (`src/usage_store.rs:770-777`) takes the same arms, with `p95` the max of the
   # two and `cap_hits` additive.
 ```
 
@@ -495,7 +495,7 @@ Scenario: the module doc stops asserting both quota dimensions and states the ve
   # `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` for the intra-doc links;
   # the wording is the merge judge's. Nothing further is owed · covers AC-10, AC-14
   Given the module doc at
-        `src/usage_store.rs:39-44`, heading `# Both quota dimensions, never one worst-case scalar`,
+        `src/usage_store.rs:41-46`, heading `# Both quota dimensions, never one worst-case scalar`,
         whose paragraph says the store "projects neither window to a single blended number, because the
         two limits are independent and a reader may care about either"
    When this item lands

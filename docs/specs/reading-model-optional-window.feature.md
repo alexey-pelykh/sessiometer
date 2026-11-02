@@ -7,15 +7,15 @@ Example Mapping: 🟦 5 rules · 🟩 19 examples · 🟥 0 open
 > Since 2026-10-30 a verified Ultra account's `GET /api/oauth/usage` reply carries `"five_hour":null`
 > beside a present `seven_day` window. The parser item (#1596, block B-1) serves that reply with its
 > session window absent; this item is where "absent" lands. At `fd8640b` the daemon's reading model
-> has nowhere to put it: `Usage.session` and `Usage.weekly` are `f64` (`src/usage.rs:87-110`), and so
+> has nowhere to put it: `Usage.session` and `Usage.weekly` are `f64` (`src/usage.rs:87-116`), and so
 > are the retained pre-blind anchor `LastGood.session` / `.weekly` (`src/daemon/records.rs:194-198`)
 > and the per-slot `BlindAnchor.session` / `.weekly` (`src/daemon/records.rs:222-226`). Every way to
 > land the parser fix on an `f64` model fabricates a number, and `0.0` is byte-identical to a measured
 > idle window the tree already holds. The six fields become `Option<f64>`; `None` is "does not apply to
 > this account", never a fabricated `0`; `#[derive(Debug, Clone, Copy, PartialEq)]` stays on all three
-> types; `to_usage` (`src/usage.rs:165-178`), the `LastGood` construction (`src/daemon.rs:2934-2938`)
-> and the `BlindAnchor` construction (`src/daemon.rs:3397-3402`) copy each `Option` through; the
-> status/watch wire's `session_pct` / `weekly_pct` mapping (`src/daemon/snapshot.rs:996-997`) applies
+> types; `to_usage` (`src/usage.rs:191-204`), the `LastGood` construction (`src/daemon.rs:3119-3123`)
+> and the `BlindAnchor` construction (`src/daemon.rs:3582-3587`) copy each `Option` through; the
+> status/watch wire's `session_pct` / `weekly_pct` mapping (`src/daemon/snapshot.rs:999-1000`) applies
 > the unchanged `to_pct` through `Option::map`, so an absent window rides as `null` under
 > the `STATUS_SCHEMA_VERSION` on `origin/main` (`1.14` at fd8640b) with no key added and no golden
 > moved. The compiler enumerates every
@@ -57,7 +57,7 @@ Scenario: the captured null-session reply projects to a reading whose session wi
     And its weekly fraction is within 1e-9 of 0.90
     And its session reset is None and its weekly reset is present
     # `to_usage` copies each `Option` through (`session: self.session, weekly: self.weekly`,
-    # `src/usage.rs:165-168`). The parser said "no session window"; nothing between the parser and the
+    # `src/usage.rs:191-194`). The parser said "no session window"; nothing between the parser and the
     # reading may turn that into a number. REQ-RDG-B-001: distinguishable from (i) a measured `0 %`.
 
 Scenario: a session-only reply projects to a reading whose weekly window is absent
@@ -77,7 +77,7 @@ Scenario: a session-only reply projects to a reading whose weekly window is abse
 Scenario: no reading at all and an absent window are two different absences
   # Tier B — pending: the inner half is M3 (mutant-proven by AC-7 (iii), see Rule 2) and the outer half
   # is the committed
-  # daemon::tests::last_good_retains_the_pre_blind_reading_across_an_active_429 (`src/daemon.rs:8336`),
+  # daemon::tests::last_good_retains_the_pre_blind_reading_across_an_active_429 (`src/daemon.rs:8557`),
   # whose reads the executor adapts under AC-9; nothing executor-uneditable grades the pair together —
   # the merge judge reads M3 beside that test · covers AC-2
   Given the active account's poll failed with a 429, so its latest-reading slot holds no reading
@@ -85,7 +85,7 @@ Scenario: no reading at all and an absent window are two different absences
         is None
    When the two slots are read
    Then the first is the outer None — no reading at all (`last_reading` is `Option<Usage>`,
-        `src/daemon.rs:1305`; `DecisionState.last_good` is `Option<LastGood>`, `src/daemon.rs:1607`)
+        `src/daemon.rs:1328`; `DecisionState.last_good` is `Option<LastGood>`, `src/daemon.rs:1630`)
     And the second is Some reading carrying an inner None — a window the account does not have
     And neither absence is a `0.0`
     # REQ-RDG-B-001: distinguishable from (ii) no reading at all (a failed poll, a blind account). The
@@ -104,7 +104,7 @@ Scenario: the three reading types stay `Copy`, and `UsageReport` gains no derive
     And `UsageReport` (`src/usage.rs`; never `Copy`, it holds four `Option<String>`) keeps its
         derives unchanged
     # `Option<f64>` is `Copy` and `PartialEq`, so the derives need no edit. The by-value copy-outs
-    # keep working: `let (prev_usage, next_usage) = (*prev, *next)` (`src/daemon.rs:2809`) and every
+    # keep working: `let (prev_usage, next_usage) = (*prev, *next)` (`src/daemon.rs:2994`) and every
     # `if let Some(anchor) = self.state.last_good`. AC-1 BUT NOT: a sentinel, a flag beside an `f64`,
     # or a per-window struct (`Option<Window>` is design § 12b's recorded follow-up).
 
@@ -144,7 +144,7 @@ Scenario: the three types' doc comments say what `None` means and no longer say 
 Scenario: a weekly-only active retains a pre-blind anchor whose session is absent, and a 429 leaves it standing
   # Tier A — graded by daemon::tests::last_good_retains_a_weekly_only_reading_with_its_session_absent
   # (M3, #1597 § 6; mutant-proven by AC-7 (iii): `session: reading.session.or(Some(0.0))` at the
-  # `LastGood` construction (`src/daemon.rs:2934-2938`) makes it FAIL) · covers AC-2
+  # `LastGood` construction (`src/daemon.rs:3119-3123`) makes it FAIL) · covers AC-2
   Given the active account's served reading is session None, weekly 0.90, weekly reset present
    When the tick retains it as the account's last good reading
    Then `last_good` is Some(LastGood { session: None, weekly: Some(0.90), .. })
@@ -158,15 +158,15 @@ Scenario: a weekly-only account's live-to-blind entry anchors its reading with t
   # Tier A — graded by
   # daemon::tests::a_blind_entry_anchor_for_a_weekly_only_account_carries_no_session_fraction (M4, #1597
   # § 6; mutant-proven by AC-7 (iv): `session: prev.session.or(Some(0.0))` at the
-  # `BlindAnchor` construction (`src/daemon.rs:3397-3402`) makes it FAIL) · covers AC-3
+  # `BlindAnchor` construction (`src/daemon.rs:3582-3587`) makes it FAIL) · covers AC-3
   Given an account whose last live reading was session None, weekly Some(w)
-   When its next poll fails — the entry edge of `note_blind_episode` (`src/daemon.rs:3372`): a prior
+   When its next poll fails — the entry edge of `note_blind_episode` (`src/daemon.rs:3557`): a prior
         live reading, then an Err
    Then `blind_anchor` is Some(BlindAnchor { session: None, weekly: Some(w), .. })
     And the anchor's `near_limit` tag for a None session is asserted by the decision-arms item's
         row-7 test, not here
     # The construction copies the reading (`session: prev.session, weekly: prev.weekly`,
-    # `src/daemon.rs:3397-3402`). The line above it, `prev.session >= self.session_ceiling_base`
+    # `src/daemon.rs:3582-3587`). The line above it, `prev.session >= self.session_ceiling_base`
     # (`src/daemon.rs`), decides something and so belongs to B-3 row 7, in the same pull request.
 ```
 
@@ -185,7 +185,7 @@ Scenario: a served weekly-only reading rides the wire as session null beside wee
         "weekly_resets_at"
     And the frame's schema minor is unchanged from `origin/main` (`1.14` at fd8640b) — no key is added
     # `session_pct: account.usage.and_then(|u| u.session.map(to_pct))` and its weekly twin
-    # (`src/daemon/snapshot.rs:996-997`); `to_pct` stays `f64 -> u8` (`src/daemon/snapshot.rs:1072`).
+    # (`src/daemon/snapshot.rs:999-1000`); `to_pct` stays `f64 -> u8` (`src/daemon/snapshot.rs:1075`).
     # The no-window key is the status-wire item's (block B-6), at the next free minor, never here.
 
 Scenario: a served session-only reading rides the wire as weekly null beside session 42 (D10 default)
@@ -201,7 +201,7 @@ Scenario: a served session-only reading rides the wire as weekly null beside ses
         "weekly_resets_at":null
     And the frame's schema minor is unchanged from `origin/main` (`1.14` at fd8640b) — no key is added
     # M5's weekly-axis sibling: `weekly_pct: account.usage.and_then(|u| u.weekly.map(to_pct))`
-    # (`src/daemon/snapshot.rs:997`). Without it, weekly absence is graded at `to_usage` only (M6), and
+    # (`src/daemon/snapshot.rs:1000`). Without it, weekly absence is graded at `to_usage` only (M6), and
     # a fabricating weekly mapping passes M5, whose weekly is present.
 
 Scenario: a failed poll still rides as null on both percents — the steady-state meaning of null is not redefined
@@ -249,7 +249,7 @@ Scenario: the session_pct doc comment names the transitional meaning and the ite
   # `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` decides that it builds,
   # the merge judge the wording; under D10's alternative the sentence is not written and B-6's key lands
   # in the same pull request · covers AC-4
-  Given the doc comment at `src/daemon/snapshot.rs:758-760`: "Last-polled session-window usage
+  Given the doc comment at `src/daemon/snapshot.rs:758-763`: "Last-polled session-window usage
         percent (`0..=100`); `null` if the last poll for this account failed (never a fabricated `0`)."
    When this item lands under D10's default
    Then the comment gains, after "(never a fabricated `0`)", one sentence: "Transitionally, until the
@@ -347,9 +347,9 @@ Scenario: this item's only production resolutions are copy-throughs and one `.ma
   # Tier B — pending: compile plus review (AC-6, AC-11); the three copy-through sites type-check
   # unedited once both sides are `Option<f64>` — a compiler flag on one of them means a sibling type was
   # not lifted yet, so the order is wrong, not the site · covers AC-6, AC-11
-  Given `to_usage` (`src/usage.rs:165-168`), the `LastGood` construction (`src/daemon.rs:2934-2938`),
-        the `BlindAnchor` construction (`src/daemon.rs:3397-3402`) and the two `to_pct` lines
-        (`src/daemon/snapshot.rs:996-997`)
+  Given `to_usage` (`src/usage.rs:191-194`), the `LastGood` construction (`src/daemon.rs:3119-3123`),
+        the `BlindAnchor` construction (`src/daemon.rs:3582-3587`) and the two `to_pct` lines
+        (`src/daemon/snapshot.rs:999-1000`)
    When this item's commit lands
    Then the three copy-throughs carry no textual change
     And the two wire lines read `account.usage.and_then(|u| u.session.map(to_pct))` and the weekly twin
@@ -374,13 +374,13 @@ Scenario Outline: an existing reader of the anchors or the reading stays green w
 
   Examples:
     | test                                                                   | where                                                                  |
-    | last_good_retains_the_pre_blind_reading_across_an_active_429           | src/daemon.rs:8336                                                     |
-    | last_good_refreshes_on_each_successful_active_poll                     | src/daemon.rs:8385                                                     |
-    | a_swap_away_clears_last_good_so_it_never_describes_the_departed_active | src/daemon.rs:8425                                                     |
-    | blind_anchor_high_water_stamps_only_a_stale_low_anchor                 | src/daemon.rs:9408                                                     |
-    | reconcile_roster_preserves_an_in_flight_blind_anchor_in_lockstep       | src/daemon.rs:12078                                                    |
+    | last_good_retains_the_pre_blind_reading_across_an_active_429           | src/daemon.rs:8557                                                     |
+    | last_good_refreshes_on_each_successful_active_poll                     | src/daemon.rs:8606                                                     |
+    | a_swap_away_clears_last_good_so_it_never_describes_the_departed_active | src/daemon.rs:8646                                                     |
+    | blind_anchor_high_water_stamps_only_a_stale_low_anchor                 | src/daemon.rs:9629                                                     |
+    | reconcile_roster_preserves_an_in_flight_blind_anchor_in_lockstep       | src/daemon.rs:12299                                                    |
     | the LastGood fixture tests of src/daemon/records.rs mod tests          | src/daemon/records.rs:581, :635, :702, :735, :826, :901                |
-    | a_success_yields_the_reading                                           | src/usage.rs:1183 (its two fraction reads are assigned here by #1596)  |
+    | a_success_yields_the_reading                                           | src/usage.rs:1386 (its two fraction reads are assigned here by #1596)  |
 ```
 
 ## Coverage

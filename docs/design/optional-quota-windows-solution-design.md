@@ -92,7 +92,7 @@ Carried from PRD § 3.3 and binding on this design:
     ADR-0033: that ADR governs the `stats` census, and the hot-fix stores no sample, so the census never
     sees its `0.0`.
 - No read of `/api/oauth/profile`; the sole-egress oracle
-  `the_sole_egress_endpoint_is_the_documented_usage_url` (`src/usage.rs:1316`) stays green.
+  `the_sole_egress_endpoint_is_the_documented_usage_url` (`src/usage.rs:1593`) stays green.
 - No keep-warm, `reliability`-rule, polling-cadence (C3, tracked as #1612) or `usage_gap`-cause (C2, tracked as #1609) change.
 - No absorption of PR #1537's `weekly_scoped` binding-cap claim (D9); no re-scoping of PRs #1537,
   #1588 or #1538 (§ 4.6).
@@ -103,13 +103,13 @@ Carried from PRD § 3.3 and binding on this design:
 
 | Constraint | Source | Consequence for the design |
 |---|---|---|
-| "A window that cannot be found is a hard `Error::UsageParse` (never a fabricated `0`)" is rewritten, not weakened: the value for an absent window is **`None`**, never `0.0` | parser doc at `src/usage.rs:444-445` (`UsageParse`); HQ `REQ-PCY-B-002` "never swap on missing data" (quoted PRD § 2.4) | The model gains a third per-window state; every consumer decides what it does with it (§ 5 B-3) |
-| `session_pct: null` already means "the last poll for this account failed" | `session_pct` at `src/daemon/snapshot.rs:758-760`; Swift `sessionPct` at `apps/menubar/Sources/WireModel.swift:648` | A new omittable key carries "no window" (B-6); the transitional state is documented as transitional and retired (B-6t) |
+| "A window that cannot be found is a hard `Error::UsageParse` (never a fabricated `0`)" is rewritten, not weakened: the value for an absent window is **`None`**, never `0.0` | parser doc at `src/usage.rs:473-474` (`UsageParse`); HQ `REQ-PCY-B-002` "never swap on missing data" (quoted PRD § 2.4) | The model gains a third per-window state; every consumer decides what it does with it (§ 5 B-3) |
+| `session_pct: null` already means "the last poll for this account failed" | `session_pct` at `src/daemon/snapshot.rs:758-763`; Swift `sessionPct` at `apps/menubar/Sources/WireModel.swift:648` | A new omittable key carries "no window" (B-6); the transitional state is documented as transitional and retired (B-6t) |
 | Four independent wires; "additive means no bump" holds only for an omittable key (`CLAUDE.md` § Schema versions), and this design adds that an existing key changing meaning is a bump; minor 15 is claimed by #1457, #1586, #1587 and PR #1588 under "whichever lands second takes the next minor" | `CLAUDE.md` § Schema versions; `STATUS_SCHEMA_VERSION` at `src/daemon/snapshot.rs:538-541` | S6 takes the next free minor at landing; the reshape of `last_known_session_pct` follows the `rotated` precedent (`src/daemon/snapshot.rs:141-142`); `stats` bumps its own `JSON_SCHEMA_VERSION` (`src/stats.rs:80`) |
 | Oracles A–D are executor-uneditable; a RED test cannot merge (`ci-ok` only, `--admin` impossible), so they land `#[ignore]`d; `cargo test -- --include-ignored` rewrites a frozen migration fixture and is forbidden | PRD § 10.5; `CLAUDE.md` § Schema versions | S5 is the first item; RED is proven with a filtered `--ignored` run (§ 11 Master Test Plan) |
 | The panel's register forbids building against an unclassified axis; the mock authors no no-window row | `apps/menubar/design/README.md:1289-1291`; `apps/menubar/design/menubar-preview.html:1121-1126` | S11 waits on D0 and is designed as an item carrying its options and gates (§ 9) |
-| Sample lines are versionless; an older daemon skips a line it cannot parse and its compaction erases it (an older `stats` or `reliability` only reads) | `read_samples` at `src/usage_store.rs:447-465`; `read_samples` … `write_samples` at `src/usage_store.rs:533-542`; the one production caller of `compact_and_roll` is the daemon's `stats_events_for_poll` (`src/daemon.rs:816`) | No pre-#1598 build runs as the daemon against a store that carries a `null` line (D6 as the council ruled it on 2026-11-02, `REQ-DEP-C-001`); the rollup fence #1598 builds stalls an older daemon's compaction before it rewrites, and an older `stats` fails loudly on it (§ 5 B-7) |
-| Open PRs on the same seam: #1537 (the `dimension` lookups at `src/usage.rs:450-455`), #1588 (minor 15, the five goldens, `src/usage.rs`), #1538 (the blind seam, ADR-0017) | PRD R1; live `gh` read 2026-11-01 (§ 4.6) | Composition stated per PR; none re-scoped |
+| Sample lines are versionless; an older daemon skips a line it cannot parse and its compaction erases it (an older `stats` or `reliability` only reads) | `read_samples` at `src/usage_store.rs:449-467`; `read_samples` … `write_samples` at `src/usage_store.rs:535-544`; the one production caller of `compact_and_roll` is the daemon's `stats_events_for_poll` (`src/daemon.rs:839`) | No pre-#1598 build runs as the daemon against a store that carries a `null` line (D6 as the council ruled it on 2026-11-02, `REQ-DEP-C-001`); the rollup fence #1598 builds stalls an older daemon's compaction before it rewrites, and an older `stats` fails loudly on it (§ 5 B-7) |
+| Open PRs on the same seam: #1537 (the `dimension` lookups at `src/usage.rs:507-508`), #1588 (minor 15, the five goldens, `src/usage.rs`), #1538 (the blind seam, ADR-0017) | PRD R1; live `gh` read 2026-11-01 (§ 4.6) | Composition stated per PR; none re-scoped |
 | Gates every code item owes: the five `test` steps, `msrv`, both `deny` checks, `swift`, an **armed** `panel-goldens` run where the panel changes, and the three golden/gate trailers where they apply | `CLAUDE.md` § Before you push | § 11 Quality gates |
 | Platform-neutral; Linux is landed but un-gated in CI | `CLAUDE.md` § What this repo is | § 4.7 states the assumption |
 | `cargo build` deploys nothing; the serving daemon is whatever bundle was last launched — built 2026-09-05 when the scope began, the #1613 emergency build since 2026-11-01 | `docs/runbooks/replacing-the-running-daemon.md` § Why `cargo build` deploys nothing (the mechanism); the build dates are the investigation's and the scope brief's readings of the serving bundle, not the runbook's | S12 amends that runbook (B-12) |
@@ -152,8 +152,8 @@ seams, not a proposal to split anything.
 
 ### 4.1 The keystone: an absent window is `None`, carried by the type, and the compiler enumerates the consumers
 
-`Usage.session: f64` and `Usage.weekly: f64` (`src/usage.rs:87-110`) become `Option<f64>`, and so do
-the raw mirror `UsageReport` (`src/usage.rs:137-156`), the retained pre-blind anchor `LastGood` (`src/daemon/records.rs:194-198`) and the per-slot `BlindAnchor` (`src/daemon/records.rs:222-226`).
+`Usage.session: f64` and `Usage.weekly: f64` (`src/usage.rs:87-116`) become `Option<f64>`, and so do
+the raw mirror `UsageReport` (`src/usage.rs:157-182`), the retained pre-blind anchor `LastGood` (`src/daemon/records.rs:194-198`) and the per-slot `BlindAnchor` (`src/daemon/records.rs:222-226`).
 `Copy` is kept on `Usage`, `LastGood` and `BlindAnchor`; `UsageReport` holds four `Option<String>` fields and is `Clone`, never `Copy`, today and after. The parser reports `None` for a window it cannot find instead of
 returning early with `?`.
 
@@ -249,11 +249,11 @@ could regress the #963 port.
 
 ### B-1 — the parser serves every window it finds (S1, S2)
 
-`dimension` (`src/usage.rs:476-510`) is unchanged: it already reads the top-level object first
-(`fraction_of` at `src/usage.rs:481-485`) and then scans `limits[]`, skipping any entry whose `kind`
-is outside the window's alias list (`is_some_and` … `continue` at `src/usage.rs:491-494`), which is
+`dimension` (`src/usage.rs:548-582`) is unchanged: it already reads the top-level object first
+(`fraction_of` at `src/usage.rs:553-557`) and then scans `limits[]`, skipping any entry whose `kind`
+is outside the window's alias list (`is_some_and` … `continue` at `src/usage.rs:563-566`), which is
 why `weekly_scoped` and the 25 null top-level keys are already inert (`REQ-QW-B-001`). `parse_usage`
-(`src/usage.rs:446-465`) stops using `?` on the two `dimension` lookups at `src/usage.rs:450-455` and composes:
+(`src/usage.rs:503-537`) stops using `?` on the two `dimension` lookups at `src/usage.rs:507-508` and composes:
 
 ```rust
 let session = dimension(&root, "five_hour", &["session", "five_hour"]);
@@ -272,10 +272,10 @@ Ok(UsageReport { session: session.map(|w| w.0), session_resets_at: session.and_t
 - **D2 (identical)**: `"five_hour":null` and an absent `five_hour` key both fall through to the
   `limits[]` scan today, and no code distinguishes them; one test over both bodies pins the relation.
 - `UsageReport` keeps its two `Option<String>` resets and two `Option<String>` severities;
-  `to_usage` (`src/usage.rs:165-178`) maps per window. Invariant **I-1**: a `*_resets_at` is `Some`
+  `to_usage` (`src/usage.rs:191-204`) maps per window. Invariant **I-1**: a `*_resets_at` is `Some`
   only when its fraction is `Some`, because `dimension` returns the tuple together — pinned by a
   test, so no consumer ever meets a stamp without a fraction.
-- The doc comment at `src/usage.rs:444-445` (`UsageParse`) is rewritten by B-10.
+- The doc comment at `src/usage.rs:473-474` (`UsageParse`) is rewritten by B-10.
 - Tranche 0 meets this block first (§ 1b): the hot-fix's weekly-only branch in `parse_usage` and the flag
   `UsageReport.session_absent` (carried as `PolledReading.session_window_absent`) exist when #1596
   starts, and #1596 removes the branch and both flags (its § 7, AC-17). The composition above is the end
@@ -284,8 +284,8 @@ Ok(UsageReport { session: session.map(|w| w.0), session_resets_at: session.and_t
 ### B-2 — the reading model expresses "does not apply" per window (S3)
 
 `Usage { session: Option<f64>, weekly: Option<f64>, weekly_resets_at, session_resets_at }` with
-`Copy`; `LastGood` and `BlindAnchor` likewise. `to_pct` (`src/daemon/snapshot.rs:1072`) is unchanged
-and applied through `Option::map`. The retained anchor at `src/daemon.rs:2934` (`LastGood`) copies the
+`Copy`; `LastGood` and `BlindAnchor` likewise. `to_pct` (`src/daemon/snapshot.rs:1075`) is unchanged
+and applied through `Option::map`. The retained anchor at `src/daemon.rs:3119` (`LastGood`) copies the
 `Option` through; a weekly-only active therefore retains an anchor whose session is `None`, which is
 what makes the blind gate's "nothing to protect" reading honest rather than absent (B-3 row 7).
 
@@ -295,12 +295,12 @@ what makes the blind gate's "nothing to protect" reading honest rather than abse
 |---|---|---|---|---|---|
 | 1 | Target selection, session gates | `session_ceiling` … `is_none_or` at `src/daemon/selection.rs:252-253` | pass | `usage.session.is_none_or(\|s\| s < session_ceiling)` and the floor likewise; the weekly line at `src/daemon/selection.rs:247` (`weekly_ceiling`) becomes `usage.weekly.is_none_or(…)` — a weekly-less account is never weekly-blocked | a weekly-only spare at weekly 0.90 is viable; at 0.98 it is excluded exactly as a two-window peer (`REQ-ARM-B-001/002`) |
 | 2 | Target selection, missing reading | `filter_map` at `src/daemon/selection.rs:246` | — (unchanged) | a served reading is `Some(usage)`; only a failed poll is dropped here | covered by row 1 |
-| 3 | Reactive swap | `decide` at `src/swap.rs:129-134` | skip (per axis) | `usage.session.is_some_and(\|s\| s >= session_threshold) \|\| usage.weekly.is_some_and(…)`; reason attribution (`SwapReason` at `src/daemon.rs:4403-4407`) reads `Session` only from a `Some` session at/over its threshold | a weekly-only active at weekly 0.99 swaps with `reason=Weekly`; no `ParkedLanding` (`src/daemon.rs:4425-4429`) is armed (`REQ-ARM-B-003`) |
-| 4 | Velocity projection | `velocity_swap` at `src/daemon.rs:5280`; `active_usage.session` at `src/daemon.rs:5317-5331` | skip | returns `TickAction::Held` when the session fraction is `None` — nothing to project | held with an absent session at any EMA |
-| 5 | Exhaustion bookkeeping | `note_exhausted_poll` at `src/daemon.rs:5907-5930`, `out_of_rotation` | skip (per axis) | `out_of_rotation = weekly.is_some_and(>= line) \|\| session.is_some_and(>= ceiling)`; `exhausted_poll_window` (`src/daemon.rs:6008`) reads only the blocking axis | a weekly-only peer arms the slow-poll window on its weekly line only |
-| 6 | All-exhausted relief | `all_exhausted_relief` at `src/daemon.rs:6112-6156`; `spare_relief` at `src/daemon.rs:6056` | name | `session_blocked = usage.session.is_some_and(…)`; a weekly-only blocked spare yields `cause: weekly`, `hold` = that spare, `resets_at` = its weekly reset — a positive case, never the `(None, None)` default at `src/daemon.rs:6154` (`SwapReason::Weekly`) | `REQ-ARM-B-005`; `next_swap` is not `no_viable_target` while a spare whose reply was rejected before this change for its missing session window now has a served reading with weekly headroom (`REQ-ARM-B-006`; `AwaitingData` at `src/daemon.rs:5481-5494` unchanged) |
-| 7 | Blind gate (ADR-0017), surfacing half | `blind_gate_armed` at `src/daemon.rs:470-472`; `blind_velocity_projected_armed` at `src/daemon.rs:503`; `plausible_anchor_session` at `src/swap.rs:745`; `blind_active_view` at `src/daemon/records.rs:487` | skip + name | the pure predicate takes `anchor_session: Option<f64>` and reads **false** on `None`, so its two production callers — `note_blind_gate_eligibility` (`src/daemon.rs:3762`) and the report arm `blind_active_view` — cannot drift (the single-source rule the gate already states); `blind_swap` (`src/daemon.rs:4896`) does not call the predicate: its anchor arm compares `plausible_anchor_session(…)` against the config thresholds `session_blind_risk_band` and `session_blind_swap_secs`, which the code keeps deliberately distinct from the interim constants, and under the `Option<f64>` signature that comparison reads false on `None` too; `plausible_anchor_session` becomes `Option<f64> -> Option<f64>`; `blind_active_view` emits `last_known_session_pct: None` (B-6) and never `0`. The **arming** half — whether a weekly anchor should arm a preemptive swap — is **OAD-2** (D3), outside this fix | a weekly-only active blind past `BLIND_GATE_SECS` (`src/daemon.rs:370`): no swap, no "auto-protection OK" (`REQ-ARM-B-007`) |
-| 8 | Near-limit fast poll (D4) | `plausible_active_usage` at `src/daemon.rs:5614-5619`; `near_limit_fast_poll_engaged` at `src/daemon.rs:5641` | skip | the band is session-only and reads false for an absent session — stated, with a test, not accidental | `REQ-ARM-B-008` |
+| 3 | Reactive swap | `decide` at `src/swap.rs:129-134` | skip (per axis) | `usage.session.is_some_and(\|s\| s >= session_threshold) \|\| usage.weekly.is_some_and(…)`; reason attribution (`SwapReason` at `src/daemon.rs:4588-4592`) reads `Session` only from a `Some` session at/over its threshold | a weekly-only active at weekly 0.99 swaps with `reason=Weekly`; no `ParkedLanding` (`src/daemon.rs:4610-4614`) is armed (`REQ-ARM-B-003`) |
+| 4 | Velocity projection | `velocity_swap` at `src/daemon.rs:5465`; `active_usage.session` at `src/daemon.rs:5502-5516` | skip | returns `TickAction::Held` when the session fraction is `None` — nothing to project | held with an absent session at any EMA |
+| 5 | Exhaustion bookkeeping | `note_exhausted_poll` at `src/daemon.rs:6092-6115`, `out_of_rotation` | skip (per axis) | `out_of_rotation = weekly.is_some_and(>= line) \|\| session.is_some_and(>= ceiling)`; `exhausted_poll_window` (`src/daemon.rs:6193`) reads only the blocking axis | a weekly-only peer arms the slow-poll window on its weekly line only |
+| 6 | All-exhausted relief | `all_exhausted_relief` at `src/daemon.rs:6297-6341`; `spare_relief` at `src/daemon.rs:6241` | name | `session_blocked = usage.session.is_some_and(…)`; a weekly-only blocked spare yields `cause: weekly`, `hold` = that spare, `resets_at` = its weekly reset — a positive case, never the `(None, None)` default at `src/daemon.rs:6339` (`SwapReason::Weekly`) | `REQ-ARM-B-005`; `next_swap` is not `no_viable_target` while a spare whose reply was rejected before this change for its missing session window now has a served reading with weekly headroom (`REQ-ARM-B-006`; `AwaitingData` at `src/daemon.rs:5666-5679` unchanged) |
+| 7 | Blind gate (ADR-0017), surfacing half | `blind_gate_armed` at `src/daemon.rs:470-472`; `blind_velocity_projected_armed` at `src/daemon.rs:503`; `plausible_anchor_session` at `src/swap.rs:745`; `blind_active_view` at `src/daemon/records.rs:487` | skip + name | the pure predicate takes `anchor_session: Option<f64>` and reads **false** on `None`, so its two production callers — `note_blind_gate_eligibility` (`src/daemon.rs:3947`) and the report arm `blind_active_view` — cannot drift (the single-source rule the gate already states); `blind_swap` (`src/daemon.rs:5081`) does not call the predicate: its anchor arm compares `plausible_anchor_session(…)` against the config thresholds `session_blind_risk_band` and `session_blind_swap_secs`, which the code keeps deliberately distinct from the interim constants, and under the `Option<f64>` signature that comparison reads false on `None` too; `plausible_anchor_session` becomes `Option<f64> -> Option<f64>`; `blind_active_view` emits `last_known_session_pct: None` (B-6) and never `0`. The **arming** half — whether a weekly anchor should arm a preemptive swap — is **OAD-2** (D3), outside this fix | a weekly-only active blind past `BLIND_GATE_SECS` (`src/daemon.rs:370`): no swap, no "auto-protection OK" (`REQ-ARM-B-007`) |
+| 8 | Near-limit fast poll (D4) | `plausible_active_usage` at `src/daemon.rs:5799-5804`; `near_limit_fast_poll_engaged` at `src/daemon.rs:5826` | skip | the band is session-only and reads false for an absent session — stated, with a test, not accidental | `REQ-ARM-B-008` |
 | 9 | Session high-water mark | `fold` at `src/swap.rs:651-665` | skip / re-seed | `let window = usage.session_resets_at?; let session = usage.session?;` — I-1 makes the second `?` unreachable alone; a vanished stamp releases the mark as today; the next `Some` reading seeds a fresh mark | `REQ-ARM-B-004`, both directions of `REQ-ARM-B-011`; `session_high_water_needs_a_window_stamp` (`src/swap.rs:1603`) stays green |
 | 10 | `use` verb gate | `poll_viability` at `src/use_account.rs:407-424`; fallback `cached_viability` … `poll_viability` at `src/use_account.rs:451-462`; daemon-routed `weekly_exhausted` at `src/daemon/commands.rs:146-148` | name / pass | `reading.usage.weekly.is_some_and(\|w\| w >= weekly_ceiling)` → `WeeklyExhausted`, else `Viable`; a weekly-less reading is `Viable` (no line to exhaust) | `REQ-ARM-B-009`: `use` without `--force` serves the weekly verdict instead of aborting |
 | 11 | Liveness | `classify_poll` at `src/daemon/classify.rs:55-62` | — (unchanged) | `Ok(_)` is `Live`; gap and blind streaks end; sampling resumes | `REQ-ARM-B-010` |
@@ -381,8 +381,8 @@ parse error. The oracles stay `#[ignore]`d, and each RED record names the tree i
 
 **The panel interim, and its cost.** The one non-inventing option `REQ-CEL-C-001` leaves: while D0 is open, the panel renders a decoded percent-less block **as no block**, today's two-meter `n/a` row, the mock-authored state B-6t already ships, until D0 classifies the held block. On the panel the blind duration and verdict the wire now carries stay invisible until D0 (the CLI footer shows them), so if D0 stalls, DP-1's days become "until D0" on the panel alone (R-D9).
 
-**CLI**: the `~N%` cell at `src/cli.rs:3865` (`last_known_session_pct`) falls back to
-`pct(account.session_pct)` on `None`, and the blind sentence in `render_blind_active` (`src/cli.rs:3234`) states the duration without a percent — prose in the footer, not a token in the
+**CLI**: the `~N%` cell at `src/cli.rs:3867` (`last_known_session_pct`) falls back to
+`pct(account.session_pct)` on `None`, and the blind sentence in `render_blind_active` (`src/cli.rs:3236`) states the duration without a percent — prose in the footer, not a token in the
 SESSION% cell, which stays B-11's.
 
 **The minor and the lockstep** (`REQ-STL-C-001`): `STATUS_SCHEMA_VERSION` (`src/daemon/snapshot.rs:538-541`)
@@ -410,11 +410,11 @@ Pipeline default, ratification-pending, with one author-chosen sub-default:
 | Element | Transitional behaviour under `1.14` | Retired by B-6 |
 |---|---|---|
 | A served weekly-only reading | `session_pct: null`, `session_resets_at: null`, `weekly_pct` and `weekly_resets_at` present, `weekly_exhausted` from the weekly line | the same line gains `absent_windows` |
-| `session_pct` doc comment (`src/daemon/snapshot.rs:758-760`) | amended: "`null` if the last poll failed — or, transitionally until `absent_windows` lands (S6), if the served reading carried no session window" | reverted to the steady-state meaning (`REQ-STL-B-001`) |
-| CLI SESSION%/RESET cells (`pct` at `src/cli.rs:4590-4593`, `reset_cell` at `src/cli.rs:4363-4366`) | `n/a` / `n/a`, exactly as today — the failed-poll token, which the mock calls a misreport for an observed absence; accepted for days, documented | B-11 under D0 |
+| `session_pct` doc comment (`src/daemon/snapshot.rs:758-763`) | amended: "`null` if the last poll failed — or, transitionally until `absent_windows` lands (S6), if the served reading carried no session window" | reverted to the steady-state meaning (`REQ-STL-B-001`) |
+| CLI SESSION%/RESET cells (`pct` at `src/cli.rs:4595-4598`, `reset_cell` at `src/cli.rs:4365-4368`) | `n/a` / `n/a`, exactly as today — the failed-poll token, which the mock calls a misreport for an observed absence; accepted for days, documented | B-11 under D0 |
 | 1.14 Swift app | decodes without edit; the Session meter is uncoloured `n/a` (`sessionSeverity` at `apps/menubar/Sources/StatusPanelFormat.swift:1755`) beside a normal Weekly meter; each meter carries its own reset label (`UsageMeter` … `reset:` at `apps/menubar/Sources/StatusPanelRoster.swift:443-446`), so the session slot shows the failed-poll `n/a` and the weekly slot its real reset | B-11 under D0 |
-| **A weekly-only active that goes blind** (author-chosen sub-default) | **no `blind_active` block is emitted**: `blind_active_view` returns `None` when the anchor's session is `None`, because under `1.14` the block cannot be emitted without a `u8` and a `0` would be the fabrication this design forbids. Cost, stated precisely: blindness reaches both surfaces only through that block — the CLI `health_cell` (`src/cli.rs:3935`) carries the auth rollup alone, and the panel's blind treatment keys solely on `blindActive` (`apps/menubar/Sources/HonestStateMachine.swift:386`) — so for those days such an account is indistinguishable from an ordinary failed-poll row, duration lost as well as percent (the pre-#479/#485 presentation), PRD § 11.1's Stale "Required" cell is unmet, the footer makes no auto-protection claim (`REQ-ARM-B-007`, D3's surfacing half), and the Retry-After and velocity report arms are silent for it. Two bounds: it is no regression against the bundle that ran before tranche 0, because no weekly-only account had ever been read, so none had ever held a `last_good` and the view emitted no block for it (the tranche-0 bundle holds such an anchor's session as `0.0`, § 1b, so a block it emitted would carry a 0 percent — the fabrication this design declines to carry); and the captured reply is the operator's active account (PRD § 2.2), so the interim cost lands on the active account. Signpost: S6 lands by the end of tranche 1's budget (AD-23), or is pulled into tranche 1 under the extend-with-justification breaker, or D10 is re-ratified (R-D5) | the block returns with `last_known_session_pct` omitted; the blind row, its duration and its verdict return with it |
-| **A `Retry-After` swap off a session-less anchor** (D10's analogue; decided by the scoping party, ratification-pending; #1602 Specification § 4) | the swap still fires and its `swap` event-log line records it with `session_pct=` omitted, but **no `BlindPreemptSwapRecord` is built**, so no `recent_blind_preempt_swap` notice is served. The #582 `Retry-After` arm fires whatever the anchor's session (the `server_retry_after_holding` arm of the blind gate in `src/daemon.rs`), and every link of the notice is a `u8` under `1.14`: the record's field (`src/daemon/records.rs:322`), `recent_blind_preempt_swap_view` (`src/daemon.rs:597-614`), which copies it unconditionally, and the always-present wire key (`src/daemon/snapshot.rs:204`). A `0` there would be the fabrication this design forbids. Cost, stated precisely: for such a swap the CLI `status` prints no `swapped off {from} (blind @ last-known {pct}%) → {to}` narration and no `use <from>` undo hint (`src/cli.rs:3259-3270`); the menu-bar app does not decode the notice, so the panel loses nothing; the swap, its log line and the #582 walk record are unchanged, and a two-window anchor's notice is unchanged. Rejected: lifting the record to `Option<u8>` in tranche 1, which would make the wire key omittable under `1.14`, a reshape that belongs to B-6's minor | the record and `BlindPreemptSwap.last_known_session_pct` become `Option<u8>`, the key is omitted for a session-less anchor, and the notice returns with its labels and its undo hint (#1599 § 2b) |
+| **A weekly-only active that goes blind** (author-chosen sub-default) | **no `blind_active` block is emitted**: `blind_active_view` returns `None` when the anchor's session is `None`, because under `1.14` the block cannot be emitted without a `u8` and a `0` would be the fabrication this design forbids. Cost, stated precisely: blindness reaches both surfaces only through that block — the CLI `health_cell` (`src/cli.rs:3937`) carries the auth rollup alone, and the panel's blind treatment keys solely on `blindActive` (`apps/menubar/Sources/HonestStateMachine.swift:386`) — so for those days such an account is indistinguishable from an ordinary failed-poll row, duration lost as well as percent (the pre-#479/#485 presentation), PRD § 11.1's Stale "Required" cell is unmet, the footer makes no auto-protection claim (`REQ-ARM-B-007`, D3's surfacing half), and the Retry-After and velocity report arms are silent for it. Two bounds: it is no regression against the bundle that ran before tranche 0, because no weekly-only account had ever been read, so none had ever held a `last_good` and the view emitted no block for it (the tranche-0 bundle holds such an anchor's session as `0.0`, § 1b, so a block it emitted would carry a 0 percent — the fabrication this design declines to carry); and the captured reply is the operator's active account (PRD § 2.2), so the interim cost lands on the active account. Signpost: S6 lands by the end of tranche 1's budget (AD-23), or is pulled into tranche 1 under the extend-with-justification breaker, or D10 is re-ratified (R-D5) | the block returns with `last_known_session_pct` omitted; the blind row, its duration and its verdict return with it |
+| **A `Retry-After` swap off a session-less anchor** (D10's analogue; decided by the scoping party, ratification-pending; #1602 Specification § 4) | the swap still fires and its `swap` event-log line records it with `session_pct=` omitted, but **no `BlindPreemptSwapRecord` is built**, so no `recent_blind_preempt_swap` notice is served. The #582 `Retry-After` arm fires whatever the anchor's session (the `server_retry_after_holding` arm of the blind gate in `src/daemon.rs`), and every link of the notice is a `u8` under `1.14`: the record's field (`src/daemon/records.rs:322`), `recent_blind_preempt_swap_view` (`src/daemon.rs:597-614`), which copies it unconditionally, and the always-present wire key (`src/daemon/snapshot.rs:204`). A `0` there would be the fabrication this design forbids. Cost, stated precisely: for such a swap the CLI `status` prints no `swapped off {from} (blind @ last-known {pct}%) → {to}` narration and no `use <from>` undo hint (`src/cli.rs:3261-3272`); the menu-bar app does not decode the notice, so the panel loses nothing; the swap, its log line and the #582 walk record are unchanged, and a two-window anchor's notice is unchanged. Rejected: lifting the record to `Option<u8>` in tranche 1, which would make the wire key omittable under `1.14`, a reshape that belongs to B-6's minor | the record and `BlindPreemptSwap.last_known_session_pct` become `Option<u8>`, the key is omitted for a session-less anchor, and the notice returns with its labels and its undo hint (#1599 § 2b) |
 
 What the transitional state is not: a redefinition of `null`. The steady-state contract stays "the
 last poll failed"; the transitional meaning is named, dated and tied to the item that retires it.
@@ -425,20 +425,20 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   (`src/daemon.rs`) when `session_window_absent` is set, so no sample line exists for such a
   reading. #1598 replaces that skip with the `"session":null` line below (its § 8, AC-16). The first `null`
   line is written at tranche 1's deploy, which is when B-12's both-halves rule starts to bind.
-- `Sample.session: f64` (`src/usage_store.rs:133-164`) becomes `Option<f64>` with
+- `Sample.session: f64` (`src/usage_store.rs:135-166`) becomes `Option<f64>` with
   `#[serde(default)]` and **no** `skip_serializing_if`, so the key is always written — `null` for an
   absent window (`REQ-SMP-B-001`; #1580's exact-key-set oracle is green on `null` and RED on
   omission). **D12** (author-chosen, compiler-forced by S2, ratification-pending): `Sample.weekly`
-  takes the same shape, because `append_sample_for_poll` (`src/daemon.rs:709-734`) passes
+  takes the same shape, because `append_sample_for_poll` (`src/daemon.rs:718-754`) passes
   `reading.usage.weekly` into `Sample::new` and a weekly-less served reading (`REQ-RPL-B-002`) leaves
   the writer the same three choices on that axis — a number (forbidden), no line (contradicts gap
   honesty), or `null`.
-- `read_samples` (`src/usage_store.rs:447-465`) decodes such a line; `compact_and_roll` (its `read_samples` … `write_samples` sequence at `src/usage_store.rs:533-542`) retains it (`REQ-SMP-B-002`).
+- `read_samples` (`src/usage_store.rs:449-467`) decodes such a line; `compact_and_roll` (its `read_samples` … `write_samples` sequence at `src/usage_store.rs:535-544`) retains it (`REQ-SMP-B-002`).
 - **The tiers** (D13, author-chosen, ratification-pending): `HourBucket.session` /
-  `HourBucket.weekly` (`src/usage_store.rs:235`, `HourStat` at `src/usage_store.rs:248`) and
-  `DayBucket.session` / `DayBucket.weekly` (`src/usage_store.rs:259`, `DayStat` at `src/usage_store.rs:276`) become `Option<_>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`;
-  the fold at `src/usage_store.rs:667-678` (`HourStat`) folds each axis over the samples that carry
-  it and writes `None` when none does, so `max_of` (`src/usage_store.rs:805-807`, `NEG_INFINITY`) is
+  `HourBucket.weekly` (`src/usage_store.rs:237`, `HourStat` at `src/usage_store.rs:250`) and
+  `DayBucket.session` / `DayBucket.weekly` (`src/usage_store.rs:261`, `DayStat` at `src/usage_store.rs:278`) become `Option<_>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`;
+  the fold at `src/usage_store.rs:669-680` (`HourStat`) folds each axis over the samples that carry
+  it and writes `None` when none does, so `max_of` (`src/usage_store.rs:807-809`, `NEG_INFINITY`) is
   never called on an empty slice and `serde_json` never meets a non-finite float. A bucket's `count`
   stays the hour's sample count; a per-axis stat is over the readings that carried that axis — an
   observation, not a fabrication — and the doc comments say so. The tiers' per-axis stats have no
@@ -446,11 +446,11 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   bounds), so this is a representation change with no consumer to move. **Version-skew asymmetry,
   stated**: an older **daemon** silently drops a raw `"session":null` line and erases it on
   compaction (R4) — `compact_and_roll`'s one production caller is the daemon's store maintenance
-  (`stats_events_for_poll` at `src/daemon.rs:816`) — while an older `stats` or `reliability` only reads and
+  (`stats_events_for_poll` at `src/daemon.rs:839`) — while an older `stats` or `reliability` only reads and
   deletes nothing: `stats` **loudly** refuses a rollup whose bucket omits a dimension (`read_rollup` at
-  `src/usage_store.rs:473-484` hard-errors with `UsageRollupMalformed`), and `reliability` leaves the
+  `src/usage_store.rs:475-486` hard-errors with `UsageRollupMalformed`), and `reliability` leaves the
   `null` lines out of its report in silence. An older daemon over such a rollup discards the compaction
-  error (`if let Ok(summary) = compact_and_roll(…)` at `src/daemon.rs:871`, no `else`), stops compacting
+  error (`if let Ok(summary) = compact_and_roll(…)` at `src/daemon.rs:894`, no `else`), stops compacting
   without a word and rewrites nothing. Loud is the better failure. The D6/D13 council ruling of 2026-11-02
   (a comment on #1598) ratified this representation and amended it with a **rollup fence** #1598 builds —
   `usage-rollup.json` becomes `{"format":2,"rollup":{…}}`, which every pre-#1598 build fails to read, so
@@ -467,7 +467,7 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   non-finite `f64` as `null`, which under `Option<f64>` would decode as `Ok(None)`, so #1598's field
   serializer refuses a non-finite `Some` before it reaches disk and `null` on disk keeps one meaning
   (#1598 Specification § 1; the sample-store stub's Rule 1);
-  `sample_round_trips_with_and_without_optionals` (`src/usage_store.rs:868`) gains the `null` case
+  `sample_round_trips_with_and_without_optionals` (`src/usage_store.rs:870`) gains the `null` case
   for both axes; a compaction test over a store seeded with weekly-only lines asserts retention and a
   finite rollup (`REQ-SMP-Q-001`).
 
@@ -530,11 +530,11 @@ its rows 0006, 0012 and 0020 already use:
 | ADR-0017 | the gate's constants `T=300s` / `risk_band=60%` (`docs/adr/0017-bounded-blindness-preemptive-swap-not-header-observation.md:22`); "Never fires on a `None`/missing reading. It keys off the retained `last_good`" (`docs/adr/0017-bounded-blindness-preemptive-swap-not-header-observation.md:189`) | "…an anchor whose session window does not apply is such a `None`: the gate reads false, `status` claims no auto-protection on its strength, and whether a weekly anchor should arm the swap is an open amendment (OAD-2)." |
 | ADR-0025 | "at least as strict as the negation of the release predicate on BOTH dimensions" (`docs/adr/0025-weekly-trigger-ceiling-semantics.md:48-50`) | "…on every dimension the account has; a dimension the account lacks is neither released nor acquired on." |
 | ADR-0033 | "The census reports what it observed and refuses to interpolate" (`docs/adr/0033-weekly-saturated-session-low-stays-unknown.md:54-58`) | D5: "A structurally absent session window is excluded from the session census — it is not an unobserved reading, and the census is over the accounts that have the window." |
-| Parser doc comment | `UsageParse` at `src/usage.rs:444-445` | "Each window is independently optional: a window the reply does not carry is reported as `None`, never a fabricated `0`; a reply carrying no window at all is a hard `Error::UsageParse` (D1), so the loop skips, not swaps." |
+| Parser doc comment | `UsageParse` at `src/usage.rs:473-474` | "Each window is independently optional: a window the reply does not carry is reported as `None`, never a fabricated `0`; a reply carrying no window at all is a hard `Error::UsageParse` (D1), so the loop skips, not swaps." |
 | Private HQ `REQ-USG-B-001` | "both dimensions" (quoted in PRD § 2.4) | **owed by the operator**, recorded as owed in PRD § 2.4 / § 7 and here (`REQ-REC-B-004`); not reachable from a clone |
 
 Ordering (`REQ-REC-C-001`): the ADR and parser-doc amendments land with or before the commit that
-moves `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:887`).
+moves `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:959`).
 
 ### B-11 — the render cells, as a waiting item (S11; blocked on D0)
 
@@ -636,7 +636,7 @@ inventory, state coverage and options complete.
 |---|---|---|---|
 | Panel account row | the Session meter (`UsageMeter(label: "Session", …)` at `apps/menubar/Sources/StatusPanelRoster.swift:443`; `AccountRow` at `apps/menubar/Sources/HonestStateMachine.swift:361`) | every one of the mock's 98 rows carries one; `nil` percent renders uncoloured `n/a` (a failed poll) | renders the state D0 classifies; until then the transitional `n/a` (B-6t) |
 | Panel account row, blind held block | the `BlindMeter` held bar, band and percent text, which read `lastKnownSessionPct` as a value (`apps/menubar/Sources/StatusPanelRoster.swift:911-924`), and the row's spoken phrase "last-known session N percent" (`apps/menubar/Sources/StatusPanelFormat.swift:2197`) | every mock blind frame carries a percent; the row's blind treatment keys solely on `blindActive` (`apps/menubar/Sources/HonestStateMachine.swift:386`) | S6 makes the percent optional (B-6), so a weekly-only blind active is a panel state the mock never authored — the fifth RenderCell, classified with D0 (D15); S6's panel render half waits on D0 exactly as S8's does, its decode half (`UInt8?`) does not |
-| CLI `status` table | SESSION% and RESET cells (`pct` at `src/cli.rs:4590-4593`; `reset_cell` at `src/cli.rs:4363-4366`) | `n/a` for a failed poll, pinned by the nine `status-*` render goldens under `build/fixtures/cli-renders/` that carry the token | the token D0 names for the same state; `n/a` transitionally |
+| CLI `status` table | SESSION% and RESET cells (`pct` at `src/cli.rs:4595-4598`; `reset_cell` at `src/cli.rs:4365-4368`) | `n/a` for a failed poll, pinned by the nine `status-*` render goldens under `build/fixtures/cli-renders/` that carry the token | the token D0 names for the same state; `n/a` transitionally |
 | Panel Stats tab | the per-account `StatCell(label: "Session m/pk", …)` (`apps/menubar/Sources/StatusPanelStats.swift:197`) and the row's spoken summary "Session mean N percent, peak N percent … cap hits" (`accessibilityLabel` at `apps/menubar/Sources/StatusPanelStats.swift:216-224`) | always a figure | D15 — classified with D0, cell and spoken summary alike |
 | CLI `stats` table | the session columns, and the SIGNAL, velocity, runway and cap columns keyed on the session series (`signal_cell` at `src/stats.rs:2498-2504`; the `cap_hits` and `time_at_cap_secs` columns at `src/stats.rs:3509-3527`) | figures | the surface's own `—` UNKNOWN sentinel (B-8) — reuse, not invention; the table then does not distinguish "no window" from "never observed" (only the wire does; G-4 holds on the wire) |
 
@@ -646,7 +646,7 @@ The state matrices of PRD § 11 are the state coverage for these views. This des
 
 | D0 option | Panel Session meter | CLI SESSION% / RESET | Cost and gates |
 |---|---|---|---|
-| (i) **decided to be nothing** — the expiry line's `—` OBSERVED-ABSENCE token, which the mock already says "is deliberately NOT `n/a`" (`apps/menubar/design/menubar-preview.html:1121-1126`), and which the CLI `status` table already spends on the same meaning as `EXPIRY_GAP`, "DELIBERATELY not the `n/a`" of a failed poll (`src/cli.rs:4370-4383`) | `—` in the percent slot, the track empty, and the per-meter reset label (`UsageMeter` … `reset:` at `apps/menubar/Sources/StatusPanelRoster.swift:443-446`) empty rather than today's `n/a`; the blind held block likewise — bar empty, `—` in its percent slot, spoken phrase without a percent; register row under *Decided to be nothing* naming this reasoning; row geometry unchanged | `—` / `—` — the same table's own `EXPIRY_GAP` precedent, reuse not invention | one register entry; a new panel fixture + an **armed** `panel-goldens` run (`TEST_RUNNER_SESSIOMETER_PANEL_GOLDEN_GATE=1`) + `Panel-Goldens-Rebaselined:` trailer; a new CLI render fixture + `emit_cli_render_goldens_status` (`src/cli.rs:17134`) + `CLI-Goldens-Rebaselined:` trailer |
+| (i) **decided to be nothing** — the expiry line's `—` OBSERVED-ABSENCE token, which the mock already says "is deliberately NOT `n/a`" (`apps/menubar/design/menubar-preview.html:1121-1126`), and which the CLI `status` table already spends on the same meaning as `EXPIRY_GAP`, "DELIBERATELY not the `n/a`" of a failed poll (`src/cli.rs:4372-4385`) | `—` in the percent slot, the track empty, and the per-meter reset label (`UsageMeter` … `reset:` at `apps/menubar/Sources/StatusPanelRoster.swift:443-446`) empty rather than today's `n/a`; the blind held block likewise — bar empty, `—` in its percent slot, spoken phrase without a percent; register row under *Decided to be nothing* naming this reasoning; row geometry unchanged | `—` / `—` — the same table's own `EXPIRY_GAP` precedent, reuse not invention | one register entry; a new panel fixture + an **armed** `panel-goldens` run (`TEST_RUNNER_SESSIOMETER_PANEL_GOLDEN_GATE=1`) + `Panel-Goldens-Rebaselined:` trailer; a new CLI render fixture + `emit_cli_render_goldens_status` (`src/cli.rs:17139`) + `CLI-Goldens-Rebaselined:` trailer |
 | (ii) **as authored** — a mock frame for a weekly-only row | whatever the frame authors (the meter removed, or a one-meter row), the held block included | the token the frame's register row names | a mock edit plus the same gates as (i); a one-meter row changes row height, which feeds the shipped height bound, `PanelRosterGeometryTests` (`apps/menubar/design/README.md` § Genuinely open) and the three-sub-line row grammar — a cost (i) does not carry |
 | (iii) **genuinely open** | the transitional `n/a` stands; S6's panel render half stays parked with S11 while its decode half lands, and a decoded percent-less `blind_active` block renders as no block (today's two-meter `n/a` row) until D0 | `n/a` | nothing is built; S11 stays parked |
 
@@ -763,15 +763,15 @@ no property-based tool.
 with `--include-ignored`), R-D2 (a 1.15 collision), each with an owner.
 
 **Existing oracles the change must keep green or move** (named; run, never re-authored): every
-`usage::tests` parse test except `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:887`), which **moves** to assert Oracle D's reading after B-10 lands;
-`a_200_with_an_unparseable_body_is_a_parse_error` (`src/usage.rs:1195`) stands under D1 (a);
+`usage::tests` parse test except `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:959`), which **moves** to assert Oracle D's reading after B-10 lands;
+`a_200_with_an_unparseable_body_is_a_parse_error` (`src/usage.rs:1472`) stands under D1 (a);
 `the_committed_wire_goldens_still_match_the_daemon_encoders` (`src/daemon/snapshot_build.rs:3929`) —
 RED on the minor bump until the emitter regenerates; the Swift `WireDecoderTests` and `Fixtures`
 sites; `PanelGoldenParityTests` armed (B-11 only); the CLI render goldens (unchanged until a cell
-renders other than `n/a`); `sample_round_trips_with_and_without_optionals` (`src/usage_store.rs:868`)
+renders other than `n/a`); `sample_round_trips_with_and_without_optionals` (`src/usage_store.rs:870`)
 extended; the reliability canary `the_sample_store_cannot_carry_a_non_finite_session_reading` (`src/reliability.rs:7386`) with its `null` arm moved;
 `session_high_water_needs_a_window_stamp` (`src/swap.rs:1603`) green;
-`the_sole_egress_endpoint_is_the_documented_usage_url` (`src/usage.rs:1316`) green.
+`the_sole_egress_endpoint_is_the_documented_usage_url` (`src/usage.rs:1593`) green.
 
 ## 12. Architecture Decisions
 
