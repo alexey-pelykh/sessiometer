@@ -16,21 +16,25 @@ Example Mapping: 🟦 5 rules · 🟩 15 examples · 🟥 0 open
 > graded at `parse_usage` alone.
 >
 > The `# Tier` line under each scenario is this stub's binding line (the `# Binds:` form of
-> `docs/specs/first-sight-readout.feature.md`). Tier A names a grader the executor may not edit and
-> this item set already pins by name: one of #1591's four oracles (landed `#[ignore]`d, RED-proven
-> before any fix), one of #1592's fixture pins T1–T7, a test #1596 names verbatim together with its
-> RED at `fd8640b` or its mutant row in #1596 § 6, or a committed test #1596 forbids editing. Every "RED at `fd8640b`" below is read
+> `docs/specs/first-sight-readout.feature.md`). Tier A names a grader the executor may not
+> reinterpret: a test committed before dispatch and left unedited, or a test the issue names verbatim
+> with its expected values, which the executor writes from that name and those values — here one of
+> #1591's four oracles (landed `#[ignore]`d, RED-proven before any fix), one of #1592's eight tests
+> (T1–T8, T8 the byte pin), a test #1596 names verbatim together with its RED at `fd8640b` or its
+> mutant row in #1596 § 6, or a committed test #1596 forbids editing. Every "RED at `fd8640b`" below is
+> read
 > off `parse_usage` at that revision, never off a run: the runs are #1591's to post at its landing and
 > AC-14's to carry. Tier B names what is still unbound.
 > D1 and D2 are the operator's open decisions; every scenario below is written for the recorded
-> default and says so in its name. Written headless at Stage 3.5: every rule, tier and name here is
-> ratification-pending.
+> default and says so in its name. Every rule, tier and name here is ratification-pending.
 
 ## Rule 1 — a window the reply does not carry is `None` on every one of its fields, never a fabricated `0`
 
 ```gherkin
 Scenario: the captured null-session reply is served from its weekly window
-  # Tier A — graded by usage::tests::oracle_a_the_captured_null_session_reply_parses_with_its_weekly_window (#1591; RED at fd8640b) · covers AC-1, AC-2
+  # Tier A — graded by
+  # usage::tests::oracle_a_the_captured_null_session_reply_parses_with_its_weekly_window (#1591; RED at
+  # fd8640b) · covers AC-1, AC-2
   Given the captured quota fields of a verified Ultra account's reply, the constant
         `CAPTURED_NULL_SESSION_QUOTA_FIELDS`: `"five_hour":null`; a `seven_day` object with
         `"utilization":90.0`, `"resets_at":"2026-11-06T22:59:59.916061+00:00"` and no `severity`;
@@ -52,7 +56,9 @@ Scenario: the captured null-session reply is served from its weekly window
     # `Some("critical")`, as #1592's T4 then expects (#1596 AC-2).
 
 Scenario: the captured reply reports no session window, never a fraction
-  # Tier A — graded by usage::tests::oracle_b_the_captured_reply_reports_no_session_window_never_a_fraction (#1591; RED at fd8640b and against the fabricating mutant) · covers AC-2, AC-8
+  # Tier A — graded by
+  # usage::tests::oracle_b_the_captured_reply_reports_no_session_window_never_a_fraction (#1591; RED at
+  # fd8640b and against the fabricating mutant) · covers AC-2, AC-8
   Given the same captured quota fields
    When `parse_usage` runs over them
    Then the parse is `Ok`
@@ -67,8 +73,13 @@ Scenario: the captured reply reports no session window, never a fraction
     # has none of the three.
 
 Scenario: a reset stamp or a severity is present only with its fraction (invariant I-1)
-  # Tier A — graded by usage::tests::a_window_stamp_or_severity_is_present_only_with_its_fraction (N3, #1596 § 4b; green at fd8640b; its four mutant rows of #1596 § 6 — (i) the weekly stamp routed into the session slot of the composed report, (iii) the session stamp into the weekly slot, (iv) the session severity into the weekly slot, (v) the weekly severity into the session slot — are run on the branch at landing and AC-14 carries each FAILED line) · covers AC-7
-  Given every body in a fixed list: the five fixture bodies of #1591 and #1592, the session-only `limits[]` body of
+  # Tier A — graded by usage::tests::a_window_stamp_or_severity_is_present_only_with_its_fraction (N3,
+  # #1596 § 4b; green at fd8640b; its four mutant rows of #1596 § 6 — (i) the weekly stamp routed into
+  # the session slot of the composed report, (iii) the session stamp into the weekly slot, (iv) the
+  # session severity into the weekly slot, (v) the weekly severity into the session slot — are run on
+  # the branch at landing and AC-14 carries each FAILED line) · covers AC-7
+  Given every body in a fixed list: the five fixture bodies of #1591 and #1592, the session-only
+        `limits[]` body of
         Rule 2, `{}`, and one two-window body such as the one in
         `parses_the_limits_array_shape_with_percent`
     And that list holds `SESSION_LIMITS_ONLY_WITH_STAMP_AND_SEVERITY`, a session-only body whose
@@ -82,9 +93,13 @@ Scenario: a reset stamp or a severity is present only with its fraction (invaria
     # that spreads the lookup tuple over the wrong window's fields.
 
 Scenario: the parser's contract states the rule
-  # Tier B — pending: documentation — no test grades prose; the intra-doc link is decided by `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` (named here, not authored), the wording by the fresh-context merge judge · covers AC-10, AC-15
-  Given the sentence "A window that cannot be found is a hard [`Error::UsageParse`]" at `src/usage.rs:444-445`
-    And the two "tolerant of" bullets above it, naming `utilization` and `percent` (`src/usage.rs:438-442`)
+  # Tier B — pending: documentation — no test grades prose; the intra-doc link is decided by
+  # `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` (named here, not
+  # authored), the wording by the fresh-context merge judge · covers AC-10, AC-15
+  Given the sentence "A window that cannot be found is a hard
+        [`Error::UsageParse`]" at `src/usage.rs:444-445`
+    And the two "tolerant of" bullets above it, naming `utilization` and
+        `percent` (`src/usage.rs:438-442`)
    When the item lands
    Then that sentence is gone, the bullets stay, and the comment states that each window is
         independently optional, that a window the reply does not carry is reported as `None` (not
@@ -93,7 +108,8 @@ Scenario: the parser's contract states the rule
     And the intra-doc link to `Error::UsageParse` still resolves under the doc gate
     And the neighbouring "both dimensions" comments are corrected in the same commit:
         `UsageReport`'s (`src/usage.rs:129-137`), `to_usage`'s (`src/usage.rs:159-165`),
-        `PolledReading`'s `usage` field (`src/usage.rs:118-120`) and `UsageParse`'s (`src/error.rs:552-556`)
+        `PolledReading`'s `usage` field (`src/usage.rs:118-120`) and
+        `UsageParse`'s (`src/error.rs:552-556`)
     And the comment lands in the commit that moves the test of Rule 2, never before it
     # REQ-REC-B-003, routed here from #1593 (design block B-10). The ADR half is #1593's and merges
     # first — REQ-REC-C-001: no commit reverses a pinned behaviour without its record (AC-15).
@@ -103,7 +119,8 @@ Scenario: the parser's contract states the rule
 
 ```gherkin
 Scenario: a session-only reply is served with its weekly window absent
-  # Tier A — graded by usage::tests::oracle_d_a_session_only_reply_parses_with_its_weekly_window_absent (#1591; RED at fd8640b and against both fabricating mutants) · covers AC-4, AC-8
+  # Tier A — graded by usage::tests::oracle_d_a_session_only_reply_parses_with_its_weekly_window_absent
+  # (#1591; RED at fd8640b and against both fabricating mutants) · covers AC-4, AC-8
   Given the body `{"five_hour":{"utilization":42.0,"resets_at":null},"seven_day":null,"limits":[]}`,
         the constant `SESSION_ONLY_QUOTA_FIELDS`
    When `parse_usage` runs over it
@@ -118,8 +135,10 @@ Scenario: a session-only reply is served with its weekly window absent
     # eventually they will make some account w/o weekly limits"); the PRD carries it as ASSUMED.
 
 Scenario: the session-only limits[] body moves from "parse error" to "served", after its record lands
-  # Tier A — graded by usage::tests::a_session_only_limits_body_is_served_with_its_weekly_window_absent (the moved test, #1596 § 4c; RED at fd8640b: the body is Err(UsageParse)) · covers AC-4, AC-9, AC-15
-  Given the committed test `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:887-893`)
+  # Tier A — graded by usage::tests::a_session_only_limits_body_is_served_with_its_weekly_window_absent
+  # (the moved test, #1596 § 4c; RED at fd8640b: the body is Err(UsageParse)) · covers AC-4, AC-9, AC-15
+  Given the committed test
+        `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:887-893`)
     And its body `{"limits": [{"kind": "session", "percent": 10}]}`, which it asserts is
         `Err(UsageParse)` today
     And #1593's amendments to ADR-0013, ADR-0017, ADR-0025 and ADR-0033 are merged to `main`
@@ -133,7 +152,12 @@ Scenario: the session-only limits[] body moves from "parse error" to "served", a
     # form the old test pinned, so both shapes of a session-only reply stay graded.
 
 Scenario Outline: the committed two-window bodies keep parsing, each present window read as its Some value
-  # Tier B — pending: the adapted fraction reads of <test> are executor-written, and of the two-window bodies' bytes only the issue #66 capture `parses_the_live_response_shape_utilization_on_a_0_to_100_scale` is pinned (#1592 T8; #1592's T1 freezes the five fixture bodies, none of them a row here) — the other rows' bytes rest on AC-9's rule that `git diff origin/main -- src/usage.rs` shows no `-` line inside any `r#"…"#` literal outside the one test #1596 § 7 deletes, a review read · covers AC-9
+  # Tier B — pending: the adapted fraction reads of <test> are executor-written, and of the two-window
+  # bodies' bytes only the issue #66 capture
+  # `parses_the_live_response_shape_utilization_on_a_0_to_100_scale` is pinned (#1592 T8; #1592's T1
+  # freezes the five fixture bodies, none of them a row here) — the other rows' bytes rest on AC-9's
+  # rule that `git diff origin/main -- src/usage.rs` shows no `-` line inside any `r#"…"#` literal
+  # outside the one test #1596 § 7 deletes, a review read · covers AC-9
   Given the committed parse test <test> at `src/usage.rs` line <line>, over a body carrying <shape>
    When the lift of `UsageReport.session` and `UsageReport.weekly` to `Option<f64>` lands
    Then the test is green with <adaptation>
@@ -160,7 +184,9 @@ Examples:
 
 ```gherkin
 Scenario: the weekly-limits-only body is served from weekly_all and skips weekly_scoped
-  # Tier A — graded by usage::tests::a_weekly_limits_only_reply_is_served_from_weekly_all_and_skips_weekly_scoped (N2, #1596 § 4b; RED at fd8640b: Err(UsageParse)) · covers AC-3
+  # Tier A — graded by
+  # usage::tests::a_weekly_limits_only_reply_is_served_from_weekly_all_and_skips_weekly_scoped (N2,
+  # #1596 § 4b; RED at fd8640b: Err(UsageParse)) · covers AC-3
   Given the captured two-entry `limits[]` alone, with no top-level window object, the constant
         `CAPTURED_WEEKLY_LIMITS_ONLY`: `weekly_all` active at percent 90, severity "critical",
         `resets_at` "2026-11-06T22:59:59.916061+00:00"; `weekly_scoped` inactive at percent 12,
@@ -178,7 +204,9 @@ Scenario: the weekly-limits-only body is served from weekly_all and skips weekly
     # short-circuits in Rule 1. The weekly severity is therefore "critical" here and `None` there.
 
 Scenario Outline: at the lookup seam, a limits[] holding only weekly kinds yields no session window
-  # Tier A — graded by usage::tests::the_captured_null_session_reply_has_no_session_window_at_the_dimension_seam (#1592 T3; its mutant row, deleting the kind filter, is run at #1592's landing) · covers AC-3
+  # Tier A — graded by
+  # usage::tests::the_captured_null_session_reply_has_no_session_window_at_the_dimension_seam (#1592 T3;
+  # its mutant row, deleting the kind filter, is run at #1592's landing) · covers AC-3
   Given the body <body>
    When `dimension` looks the session window up with the alias list `["session", "five_hour"]`
    Then it returns `None`
@@ -194,9 +222,12 @@ Examples:
   # hold on both sides of the fix.
 
 Scenario: at the lookup seam, the weekly reading is weekly_all's, never weekly_scoped's
-  # Tier A — graded by usage::tests::the_captured_weekly_limits_read_weekly_all_and_skip_weekly_scoped (#1592 T5; its mutant row, inverting the kind filter, is run at #1592's landing — preferring the inactive entry is ledger row 6's detection, not T5's) · covers AC-3
+  # Tier A — graded by usage::tests::the_captured_weekly_limits_read_weekly_all_and_skip_weekly_scoped
+  # (#1592 T5; its mutant row, inverting the kind filter, is run at #1592's landing — preferring the
+  # inactive entry is ledger row 6's detection, not T5's) · covers AC-3
   Given the body `CAPTURED_WEEKLY_LIMITS_ONLY`
-   When `dimension` looks the weekly window up with the alias list `["weekly_all", "seven_day", "weekly"]`
+   When `dimension` looks the weekly window up with the alias list
+        `["weekly_all", "seven_day", "weekly"]`
    Then it returns the fraction within 1e-9 of 0.90, the stamp "2026-11-06T22:59:59.916061+00:00"
         and the severity "critical", as one tuple
     But NOT 0.12, "2026-11-06T22:59:59.916182+00:00" or "normal"
@@ -206,8 +237,10 @@ Scenario: at the lookup seam, the weekly reading is weekly_all's, never weekly_s
 
 ```gherkin
 Scenario: the absent-key reply is served exactly like the null one (D2 default)
-  # Tier A — graded by usage::tests::the_absent_five_hour_key_reply_is_served_exactly_like_the_null_one (N1, #1596 § 4b; RED at fd8640b: both Err(UsageParse), the expect fails) · covers AC-6
-  Given `CAPTURED_NULL_SESSION_QUOTA_FIELDS` and `CAPTURED_NULL_SESSION_QUOTA_FIELDS_WITHOUT_FIVE_HOUR_KEY`, which
+  # Tier A — graded by usage::tests::the_absent_five_hour_key_reply_is_served_exactly_like_the_null_one
+  # (N1, #1596 § 4b; RED at fd8640b: both Err(UsageParse), the expect fails) · covers AC-6
+  Given `CAPTURED_NULL_SESSION_QUOTA_FIELDS` and
+        `CAPTURED_NULL_SESSION_QUOTA_FIELDS_WITHOUT_FIVE_HOUR_KEY`, which
         differ only in the one member `"five_hour":null,`
    When `parse_usage` runs over each
    Then both parses are `Ok` and the two reports are equal (`UsageReport` derives `PartialEq`)
@@ -222,7 +255,9 @@ Scenario: the absent-key reply is served exactly like the null one (D2 default)
     # `parse_usage`; nothing else in this stub changes.
 
 Scenario: the two bodies take the same outcome at both seams (D2 default)
-  # Tier A — graded by usage::tests::a_null_five_hour_and_an_absent_five_hour_key_read_identically (#1592 T6; its mutant row, a null-specific branch before the session lookup, is run at #1592's landing) · covers AC-6
+  # Tier A — graded by usage::tests::a_null_five_hour_and_an_absent_five_hour_key_read_identically
+  # (#1592 T6; its mutant row, a null-specific branch before the session lookup, is run at #1592's
+  # landing) · covers AC-6
   Given the same two bodies
    When `dimension` looks each window up in both, and `parse_usage` runs over both
    Then the two session lookups are equal (both `None`) and the two weekly lookups are equal
@@ -235,8 +270,11 @@ Scenario: the two bodies take the same outcome at both seams (D2 default)
 
 ```gherkin
 Scenario: a windowless reply is a hard parse error, so the loop skips and never swaps (D1 default)
-  # Tier A — graded by usage::tests::oracle_c_a_reply_with_no_window_is_never_two_fabricated_windows (#1591; green at fd8640b by construction under D1 (a), RED against the mutant that serves two 0.0 windows) · covers AC-5
-  Given the body `{"five_hour":null,"seven_day":null,"limits":[]}`, the constant `WINDOWLESS_QUOTA_FIELDS`
+  # Tier A — graded by usage::tests::oracle_c_a_reply_with_no_window_is_never_two_fabricated_windows
+  # (#1591; green at fd8640b by construction under D1 (a), RED against the mutant that serves two 0.0
+  # windows) · covers AC-5
+  Given the body `{"five_hour":null,"seven_day":null,"limits":[]}`, the constant
+        `WINDOWLESS_QUOTA_FIELDS`
    When `parse_usage` runs over it
    Then the outcome is `Err(Error::UsageParse(_))`
     And the error text names both windows and carries no response bytes — "no quota window (neither
@@ -250,7 +288,8 @@ Scenario: a windowless reply is a hard parse error, so the loop skips and never 
     # Under (b) Oracle C takes its (b) form and the pull request body says which option was built.
 
 Scenario: the empty object through the poll path stays a failed poll (D1 default)
-  # Tier A — graded by usage::tests::a_200_with_an_unparseable_body_is_a_parse_error (committed at fd8640b; stands unedited under D1 (a), #1596 § 4d row 13) · covers AC-5, AC-9
+  # Tier A — graded by usage::tests::a_200_with_an_unparseable_body_is_a_parse_error (committed at
+  # fd8640b; stands unedited under D1 (a), #1596 § 4d row 13) · covers AC-5, AC-9
   Given a 200 reply whose body is `{}`, through the fake transport
    When the usage source polls
    Then the outcome is `Err(Error::UsageParse(_))` — no window applies, so D1's answer
@@ -260,12 +299,17 @@ Scenario: the empty object through the poll path stays a failed poll (D1 default
     # neither-window guard were dropped.
 
 Scenario: a served reading carries at least one window — invariant I-2 (D1 default)
-  # Tier A — graded by usage::tests::a_served_reading_carries_at_least_one_window (N4, #1596 § 4b; green at fd8640b; its mutant row, #1596 § 6 (ii) — the neither-window guard deleted, D1 (a) only — is run on the branch at landing and AC-14 carries its FAILED line) · covers AC-7
+  # Tier A — graded by usage::tests::a_served_reading_carries_at_least_one_window (N4, #1596 § 4b; its
+  # invariant half is green at fd8640b vacuously — every `Ok` report there carries both windows — and
+  # its exact-`Err`-set half is RED there, where every body but the two-window one is `Err`; its mutant
+  # row, #1596 § 6 (ii) — the neither-window guard deleted, D1 (a) only — is run on the branch at
+  # landing and AC-14 carries its FAILED line) · covers AC-7
   Given the same fixed list of bodies as Rule 1's invariant scenario
    When `parse_usage` runs over each
    Then every body is either `Err(Error::UsageParse(_))` or `Ok` with a `Some` session fraction or
-        a `Some` weekly fraction
-    And the windowless body and `{}` are the `Err` ones
+        a `Some` weekly fraction — the invariant, which holds at fd8640b as well
+    And exactly the windowless body and `{}` are the `Err` ones — the half that is RED at fd8640b,
+        where every body but the two-window one is `Err`
     # Under D1 (b) this test is not written: the windowless body is then `Ok` with both `None`.
 ```
 

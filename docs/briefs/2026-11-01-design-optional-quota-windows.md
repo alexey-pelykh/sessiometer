@@ -27,7 +27,7 @@ orchestrator on the operator's behalf, and the design is carried as provisional.
 **author-chosen** had no pipeline recommendation in the PRD and are the ones to read first. The exception is decision 16: the maintainer decided its tranche 0, its budget and its runbook-text placement on 2026-11-01.
 
 1. **An absent window is `None`, carried by the type** — `Usage`, `UsageReport`, `LastGood` and
-   `BlindAnchor` take `Option<f64>` per window, `Copy` kept (AD-1). The compiler then enumerates every
+   `BlindAnchor` take `Option<f64>` per window, `Copy` kept on the three that carry it — `UsageReport` is `Clone`, never `Copy` (AD-1). The compiler then enumerates every
    consumer (33 + 17 production errors measured); a flag beside an `f64` must be consulted at all 93
    reads or the fabricated value stands, and a sentinel `0.0` is byte-identical to an idle window. One bounded exception: the tranche-0 hot-fix serves a weekly-only reply with a `0.0` session and stores no sample for it (decision 16).
 2. **The parser composes per-window Options from the unchanged `dimension` lookup**; a 200 reply with
@@ -37,8 +37,8 @@ orchestrator on the operator's behalf, and the design is carried as provisional.
 3. **Every consumer takes one of four named moves — skip, pass, exclude, name — and never a numeric
    default**, in tests as well as production; each decision arm owes one test over a reading whose
    window is `None` (AD-4; B-3 enumerates fifteen arms with their move).
-4. **The blind gate reads false on an absent anchor** through its single pure predicate, so the
-   three callers cannot drift; `status` makes no auto-protection claim for a weekly-only active.
+4. **The blind gate reads false on an absent anchor** through its single pure predicate, so its
+   two callers (`note_blind_gate_eligibility` and the report arm `blind_active_view`) cannot drift, and `blind_swap`'s anchor arm, which compares the same `Option` against the config thresholds, reads false on `None` with them; `status` makes no auto-protection claim for a weekly-only active.
    Whether a *weekly* anchor should arm the swap is left open (AD-5; OAD-2 / D3).
 5. **Transitional wire state before the new key lands (D10)**: under schema `1.14` a served
    weekly-only reading carries `session_pct: null` (in place of the hot-fix's `0`) beside present weekly fields, the `session_pct`
@@ -52,26 +52,24 @@ orchestrator on the operator's behalf, and the design is carried as provisional.
 7. **`BlindActive.last_known_session_pct` becomes optional and is omitted when absent**, exactly the
    `rotated` reshape; Swift `UInt8?`; the CLI `~N%` cell falls back and the blind sentence drops the
    percent (AD-8).
-8. **The minor is chosen at landing under the queue rule** (`1.15` if S6 lands before PR #1588, `1.16`
-   after); the five goldens are regenerated once, two *new* golden rows are added, and the Swift
+8. **The minor is chosen at landing under the queue rule** (read from the queue at landing; `1.15` is the lowest unclaimed today, claimed by #1457, #1586, #1587 and PR #1588); the five goldens are regenerated once, two *new* golden rows are added, and the Swift
    fixture sweep (27 + 14 sites plus the `"minor":15` future frame) moves in lockstep (AD-9).
 9. **The sample line writes `"session": null` — the key never omitted** (#1580's exact-key-set oracle),
    and **author-chosen**: `Sample.weekly` takes the same shape because the writer is compiler-forced
    to decide the weekly axis too (AD-10 / D12).
 10. **Rollup tiers carry per-axis `Option<HourStat>` / `Option<DayStat>`, omitted when no sample in
     the bucket carried that window**, so the fold never reaches `-∞`; counts stay counts. Stated
-    asymmetry: an older binary drops a raw `null` line *silently* but refuses such a rollup *loudly*
-    — **author-chosen** (AD-11 / D13).
-11. **`stats` excludes an absent window from every session figure and from the census (D5)**; on its wire `session`, `band` and the session-cap counts `cap_hits` / `time_at_cap_secs` become omittable under `JSON_SCHEMA_VERSION` 1 → 2, Swift's
+    asymmetry: an older *daemon* drops a raw `null` line silently and erases it on compaction, while an older `stats` refuses such a rollup loudly and deletes nothing — **author-chosen** (AD-11 / D13), settled by council on 2026-11-02: ratified and amended with a per-axis `samples` count (#1610 absorbed into #1598).
+11. **`stats` excludes an absent window from every session figure and from the census (D5)**; on its wire `session`, `band` and the session-cap counts `cap_hits` / `time_at_cap_secs` become omittable under `JSON_SCHEMA_VERSION` 1 → 2 — and in the same bump `weekly` (the weekly symmetry) and a `velocity` object emitted when either axis has a rate, with a nullable session rate — Swift's
     `StatsDim` goes optional, the one golden is regenerated, and the CLI table reuses its own `—` UNKNOWN sentinel for the session, signal, velocity, runway and cap columns (it then does not distinguish no-window from never-observed; only the wire does). Field set **author-chosen** (AD-13); whether the wire half rides in tranche 1
     is OAD-3 / D8 (recommendation: ride first — small cost, no queue contention).
-12. **Event fields carry typed absence as an omitted token**; `reliability`'s parsers tolerate it;
-    no `log`/`reliability` schema move expected, named if a wire field reshapes — **author-chosen**
+12. **Event fields carry typed absence as an omitted token**; `reliability`'s blind parsers give it a disclosed bucket;
+    no `log` schema move; `reliability` moves 13 → 14 in the compile unit for that bucket, named there — **author-chosen**
     (AD-14 / D14).
 13. **Oracles A–D land `#[ignore]`d and RED first**, proven by a filtered `--ignored` run, never
     `--include-ignored`; the scoping party re-proves RED (AD-18).
-14. **The records move before the pinned test does**: four ADRs amended in place (keep `date:`, add
-    an `**Amended**` paragraph, update the README row), the parser doc rewritten, the HQ
+14. **The records move with or before the pinned test**: four ADRs amended in place (keep `date:`, add
+    an `**Amended**` paragraph, update the README row) in their own pull request first, the parser doc rewritten in the commit that moves the test it governs, the HQ
     `REQ-USG-B-001` amendment recorded as owed by the operator (AD-19); the warm-up design's C-1
     reads two states from the fraction and the stamp (AD-20); the daemon-replacement runbook gains
     the both-halves rule and a fleet recovery check (AD-21); that text is #1603, now in tranche 2 and landing after the deploy (AD-23).
@@ -84,9 +82,7 @@ orchestrator on the operator's behalf, and the design is carried as provisional.
     and no sample for such an account — a gap in `stats`, never a zero. Tranche 1 retires all three
     (#1596 removes the flag, #1598 writes `"session":null`), and the hot-fix is invalidated if tranche 1
     deploys first. **Tranche 1** is budgeted at the human effort-day estimate the coverage gate sized (PRD
-    § 3.1), no longer one calendar week: oracles → the one compile unit (parser, model, arms, fixtures,
-    store, records) → transitional wire → deploy (#1604). **Tranche 2**: wire key → stats wire → warm-up
-    amendment ‖ render cells, plus the runbook text (#1603), moved here and landing after the deploy. With
+    § 3.1), no longer one calendar week: oracles (#1591) → fixtures (#1592) ‖ the ADR records (#1593), each its own pull request → the one compile unit (parser, model, arms; #1596 + #1597 + #1602, carrying the parser doc) → the store with the five sample readers (#1598 with #1600, one pull request) → the transitional wire state it ships → deploy (#1604). **Tranche 2**: wire key (#1599) → stats wire (#1601) → warm-up amendment (#1595), plus the runbook text (#1603), moved here and landing after the deploy, and the tranche-2 deploy (#1608); the render cells (#1594) wait outside both tranches on D0. With
     the hot-fix deployed, weekly readings recover at tranche 0; tranche 1's deploy newly turns on the
     `"session":null` sample line and `session_pct: null` in place of the hot-fix's 0.
 17. **S11 is specified as a waiting item with three D0 options and its gates, and the design picks no
@@ -133,8 +129,7 @@ the design applied, so Stage 3 can proceed on the default and the operator can o
   half built); the arming half is OAD-2 for the operator.
 - **D4 — the near-limit band**: default session-only, reads false on an absent session, with a test.
 - **D5 — ADR-0033's census**: default excludes a structurally absent window.
-- **D6 — version skew on the store**: default both halves replace together before the first `null`
-  line (runbook rule); the residual asymmetry (silent raw drop, loud rollup refusal) is stated.
+- **D6 — version skew on the store**: settled by council on 2026-11-02 (a comment on #1598): `null` ratified, amended with a rollup fence #1598 builds and the rule that no pre-#1598 daemon runs against the store after its first `null` line; the residual (an older daemon's silent erasure, an older `stats`' loud refusal) is stated.
 - **D7 — the velocity tie-break on an absent EMA**: default `0.0`, the existing "safest landing"
   rule, watched by `MET-R-001`.
 - **D8 — when the `stats` wire half lands**: OAD-3 recommends tranche 1; the operator decides because it moves the appetite in PRD § 3.1 and puts the first Swift edit and a `stats` schema bump on the urgent path — ratify D8 and OAD-3 as one question.
@@ -143,22 +138,21 @@ the design applied, so Stage 3 can proceed on the default and the operator can o
 - **The weekly-less arms (AD-4b)** and **the #1537 landing order (AD-22)**: author-chosen; surfaced for ratification beside D11–D14.
 - **D11 — the wire key's shape**: author-chosen `absent_windows: [WindowKind]`.
 - **D12 — `Sample.weekly` optional**: author-chosen, compiler-forced by S2.
-- **D13 — the tier representation**: author-chosen per-axis `Option`, omitted.
+- **D13 — the tier representation**: settled by council on 2026-11-02: per-axis `Option` ratified, amended with a per-axis `samples` count (#1610 absorbed into #1598).
 - **D14 — event-field absence**: author-chosen omitted token.
 
 ## Deferred with a tracking destination, not dropped
 
 - **`Option<Window>` per window on `Usage`** — the better end state; a follow-up refactor, never a
   prerequisite (§ 12b). Tracked as #1605.
-- **A per-axis sample count in the rollup tiers** — more honest than a bucket-wide `count`, more shape
-  than the fix needs (AD-11). Tracked as #1610.
+- **A per-axis sample count in the rollup tiers** — more honest than a bucket-wide `count` (AD-11). Was tracked as #1610; the D6/D13 council of 2026-11-02 absorbed it into #1598, so it ships in tranche 1.
 - **The spoken label of an absent Session meter** — handed to D0's register entry, not decided (§ 9b).
   Carried by #1594.
 - **PR #1537's D9** — the `weekly_scoped` binding-cap claim; the design lands first and #1537 rebases.
 - **Follow-ups filed while scoping**, each Related to #1590 and none its child: the `usage_gap` event's
   missing cause (#1609); slow-polling a peer whose polls keep ending in a rejection (#1612); severity from
   `limits[]` beneath a top-level window (#1606); ADR-0013's drifted code pointers (#1607); keeping a viable
-  peer visible to swap-target selection when its usage poll fails (#1611); tranche 2's deploy (#1608).
+  peer visible to swap-target selection when its usage poll fails (#1611); a window the reply carries but cannot read (#1614); the `Tunables.poll_secs` doc comment's sweep cadence (#1615); one identifier per account on every event-log line (#1616). Tranche 2's deploy (#1608) is a child of #1590, not a follow-up.
 
 ## Full Design
 
