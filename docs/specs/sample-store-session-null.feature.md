@@ -529,7 +529,7 @@ Scenario: each present statistic records how many of its bucket's readings it is
     # are AC-23's over the same readings. A recorded count is at least 1 and at most the bucket's
     # `count`; the fold sets it to the length of the per-axis vector it already builds (#1598 § 5).
 
-Scenario Outline: the count invariant holds at both tiers for both axes, whether no reading, one or all four carry the axis (D13 as ruled)
+Scenario Outline: the count invariant holds at both tiers for both axes, whether no reading, one or all four carry the axis (D13 as ruled, D12 default)
   # Tier A — graded by usage_store::tests::count_invariants_hold_for_every_folded_bucket (#1598 AC-24
   # as absorbed, a new test beside T8b; no RED at fd8640b: the field does not exist at the base tree,
   # so the test can only fail to compile there; mutant, AC-24's record: counting a sample whose reading
