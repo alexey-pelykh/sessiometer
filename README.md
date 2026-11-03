@@ -1333,9 +1333,11 @@ This is an architectural guarantee, not just a policy:
 
 `sessiometer` also *drives* the official Claude Code CLI (`claude`) to refresh a
 parked account's token and to log in; that separate program makes its own network
-calls to Anthropic under your credential, exactly as it would if you ran it
-yourself. That is the official client's traffic, not `sessiometer` reporting on
-you.
+calls under that account's credential. `sessiometer` removes the credential and
+endpoint variables listed in `SPAWN_ENV_REMOVE` (`src/isolated_spawn.rs`) from the
+environment it builds for those children, so they do not inherit a credential or
+a gateway that your shell sets through those variables. That is the official
+client's traffic, not `sessiometer` reporting on you.
 
 ## What it stores
 
