@@ -31,7 +31,7 @@ investigation found that a label is the only handle most surfaces use, that the 
 `login`, the socket `capture` and `config-set` can each make a label name two accounts without saying
 so, and that nothing downstream can tell those two accounts apart. This design makes every such write
 audible at the moment it happens, and gives every downstream surface an identity that a relabel does not
-change. It does both without enforcing label uniqueness, which ratified R-6 / AC-6 (`docs/requirements/migration-credential-portability.md`) forbid.
+change. It does both without enforcing label uniqueness, which ratified R-6 / AC-6 (`docs/requirements/migration-credential-portability.md`) forbid. Amended 2026-11-03: the operator's `duplicate-label-policy` ruling (§ 12.2) enforces uniqueness at the four write paths, where a write that would make a label name a second account is refused unless `--overwrite` is given; AC-6's bar stands at load time and at `import` until the operator rules on import.
 
 | Feature | Goal of the design |
 |---|---|
@@ -54,8 +54,10 @@ operator sees in them remain. The product lens returned that to the PRD (§ 14.6
 
 ## 1b. Non-Goals
 
-- **Enforcing label uniqueness anywhere.** AC-6 forbids it. A refusal appears only as an option under the
-  open `duplicate-label-policy` decision (§ 12), which would need AC-6 re-ratified first.
+- **Enforcing label uniqueness at load time, or anywhere the operator has not ruled.** AC-6 forbids it.
+  Narrowed 2026-11-03: the operator ruled `duplicate-label-policy` as refuse unless `--overwrite` (§ 12.2), which
+  enforces uniqueness at the four write paths and re-ratifies AC-6 as narrowed; load time and `import` keep
+  AC-6's bar.
 - **Choosing, merging, parking or removing either of two entries that share a credential.** ADR-0028 defers
   the only source of that knowledge (#737). F3 reports.
 - **Displaying the account identifier on F4's panel rows or in `status`'s rendered output.** F4 carries it
@@ -74,7 +76,7 @@ operator sees in them remain. The product lens returned that to the PRD (§ 14.6
 
 | Constraint | Source | Effect on this design |
 |---|---|---|
-| Labels are non-unique by ratified design | R-6, AC-6 | no uniqueness check at load or write; reports only, unless the operator re-ratifies |
+| Labels are non-unique by ratified design | R-6, AC-6 | no uniqueness check at load; at the four write paths the operator's ruling of 2026-11-03 refuses a write that would make a label name a second account unless `--overwrite` is given (§ 12.2), which re-ratifies AC-6 as narrowed |
 | Schema wires version independently | CLAUDE.md § Schema versions | F4 bumps `STATUS_SCHEMA_VERSION` only; `stats`, `log`, `reliability` stay put |
 | One `STATUS_SCHEMA_VERSION` minor for F4, shared with #1457's claim | REQ-WIRE-C-003; #1457 | the version number is taken at merge time, not pre-assigned |
 | Swift decoders throw on an unknown `result` value or rejection tag | #1474; `CaptureAck.swift` | notices ride additive fields; any new tag lands with its Swift case |
@@ -1023,7 +1025,7 @@ F7 premise 4, since case variance would give one account two identifiers under t
 
 #### `duplicate-label-policy` — warn or refuse when a write makes a label name a second account (PRD § 8.1)
 
-`status: proposed`
+`status: decided by the operator on 2026-11-03, refuse unless --overwrite; the requirements around it stay ratification-pending`
 
 **Context.** Every roster writer can create a collision, and all but `import` do it silently (PRD § 2.3,
 D-1). Ratified AC-6 says "BUT NOT by enforcing label uniqueness". A refused `login` spends the
@@ -1034,11 +1036,18 @@ duplicate still exists, so resolution keeps refusing it with exit 6 until the op
 Refuse: needs AC-6 re-ratified first, adds the `label-in-use` tag and its Swift case, and refuses before
 any write.
 
-**Decision.** Open. **Consequences.** Open; the answer fixes the assertion form of REQ-ROS-C-002's oracles.
+**Decision (the operator, 2026-11-03).** Refuse: a write that would make a label name a second account is refused
+before any write on all four paths unless `--overwrite` is given, under which the new account replaces the
+existing holder; the operator's words and the orchestrator's reading are in PRD § 8.1. **Consequences.** The
+`label-in-use` tag and its Swift case are built; REQ-ROS-C-002's oracles assert the refusal; the collision
+notices of F1 (D-1, UX-1 to UX-9) reach only rosters that already hold a duplicate, since no completed write on
+the four paths creates one; AC-6 is re-ratified as narrowed (the migration PRD's amendment note); the items that
+built the warn default (#1556, #1558, #1559, #1560, #1561) re-enter the ready gate. Open: the replaced account's
+fate under `--overwrite`, the socket paths' carriage of the override, and `import`.
 
 #### `login-mismatch-policy` — what `login <label>` does when the captured account is not the one the label names
 
-`status: proposed`
+`status: decided by the operator on 2026-11-03, refuse unless --rename; the requirements around it stay ratification-pending`
 
 **Context.** The code refreshes on the uuid and renames on the label, while the ratified stamp REQ-LGN-B-004
 says a bare `login` "refreshes it" (PRD § 8.2). REQ-IDN-B-001's disclosure holds under every option.
@@ -1050,7 +1059,13 @@ renames. Refuse a renaming revive: it blocks the rename path that
 `emailAddress`: it needs #846's rule for when a label is an address and spike SP-1's premise 3, and only
 the comparison's result may be shown.
 
-**Decision.** Open. **Consequences.** Open.
+**Decision (the operator, 2026-11-03).** Refuse a revive that renames an account unless `--rename` is given; the
+words and the reading are in PRD § 8.1. **Consequences.** The `relabels-another-account` tag and its Swift case
+are built for the socket path; the CLI refuses before the stash write; with the flag the rename proceeds and
+REQ-IDN-B-001's disclosure holds; `recapture_updates_the_label_when_a_new_one_is_given` gains the flag;
+REQ-LGN-B-004's "refreshes it" holds for the same-label case. #1570's help sentence is re-keyed to the refusal (the scope
+brief's `login-mismatch-policy-recorded-on-1570` row), and REQ-DOC-B-003's keep-rename wording with it. Open: how
+the socket `capture` carries the override (#1559).
 
 #### `label-normalization-policy` — what makes two labels the same, if anything
 
@@ -1253,8 +1268,8 @@ origin, and the stub it references.
 |---|---|---|---|---|---|---|---|---|---|
 | readiness acknowledgment | blocks scoping | PRD § 14c | Surface | the operator ratifies or rewrites PRD § 2 and § 10 | design kept `draft` | operator | ratification-pending | design | — |
 | identifier form on the wire (DQ-1) | high: costly to reverse | the tree's #15 conventions; `config-get`; A-6 | Surface | #791 ruling; a pasted uuid; premise 4 | D-5 confines it to the wire | operator | open | requirements | `account-key-form` |
-| warn or refuse a collision | high | AC-6; the silent writers (PRD § 2.3) | Surface | AC-6 re-ratified | D-2's gate serves both | operator | open | requirements | `duplicate-label-policy` |
-| login that lands elsewhere | high | REQ-LGN-B-004 vs code | Surface | SP-1 premise 3; #846 | disclosure holds under all | operator | open | requirements | `login-mismatch-policy` |
+| warn or refuse a collision | high | AC-6; the silent writers (PRD § 2.3) | Surface | AC-6 re-ratified | D-2's gate serves both | operator | ruled 2026-11-03: refuse unless `--overwrite` (§ 12.2) | requirements | `duplicate-label-policy` |
+| login that lands elsewhere | high | REQ-LGN-B-004 vs code | Surface | SP-1 premise 3; #846 | disclosure holds under all | operator | ruled 2026-11-03: refuse unless `--rename` (§ 12.2) | requirements | `login-mismatch-policy` |
 | label sameness | medium | no record | Surface | a reported confusable pair | D-1's key hook | operator | open | requirements | `label-normalization-policy` |
 | duplicate credentials in a payload | medium | A-7 | Surface | A-7 found false | placement fixed (D-11) | operator | open | requirements | `import-duplicate-uuid-policy` |
 | orphan stash items | medium | A-10; witness | Surface | DQ-9's census count | the census is shared by both options | operator | open | requirements | `orphan-stash-policy` |
@@ -1281,8 +1296,9 @@ at `draft`:
 2. **`account-key-form`** (DQ-1): F4's wire and panel half waits on it. The store, the log and
    every other feature do not.
 3. **`duplicate-label-policy`**: decides whether F1's oracles assert a report or a refusal, and whether
-   `label-in-use` exists.
-4. **`login-mismatch-policy`**: decides whether a renaming revive is reported, refused or compared.
+   `label-in-use` exists. Ruled 2026-11-03: refuse unless `--overwrite`, so `label-in-use` exists (§ 12.2).
+4. **`login-mismatch-policy`**: decides whether a renaming revive is reported, refused or compared. Ruled
+   2026-11-03: refused unless `--rename` (§ 12.2).
 5. **`label-normalization-policy`**: decides whether REQ-LBL-B-001 applies at all.
 6. **`import-duplicate-uuid-policy`**: decides the form of F5's report.
 7. **`orphan-stash-policy`**: decides whether F10 builds a report, a reaper or nothing.
@@ -1407,7 +1423,9 @@ alternatives existed — are marked **(default)**.
 - The answers to DQ-2 (unattributed samples age out unchanged), DQ-3 (no `stats` shape change), DQ-5 (no
   sweep), DQ-6 (both channels) and DQ-10 (enabled count); DQ-7 deferred with its signpost.
 - The delivery order and F4's split into separate items (§ 4).
-- Treating DQ-1 and the PRD § 8.1 decisions as open stubs (§ 12.2) rather than deciding them.
+- Treating DQ-1 and the PRD § 8.1 decisions as open stubs (§ 12.2) rather than deciding them. Two of those
+  stubs, `duplicate-label-policy` and `login-mismatch-policy`, were decided by the operator on 2026-11-03
+  (§ 12.2); the readings recorded beside the rulings are the pipeline's.
 
 ### 14.9 Dual-lens ratification
 

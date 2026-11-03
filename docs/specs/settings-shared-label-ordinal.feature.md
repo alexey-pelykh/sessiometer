@@ -327,6 +327,12 @@ src/config/validate.rs:312 `label.trim().is_empty()`
 ```
 
 ### 2. `duplicate-label-policy` — warn or refuse (design § 12.2, PRD § 8.1)
+> **Ruling, 2026-11-03.** Refuse: once #1558 lands, a save that would make a label name a second account is
+> rejected rather than applied, so the scenario that scripts an `applied` reply for such a save describes today's
+> daemon, which the ruling retires. The scenario holds under both answers, as this card says, and #1574 stays
+> READY; its executor binds the scenario against whichever daemon is in the tree. Rosters that already hold
+> duplicates still render the ordinals. The header's count predates the ruling.
+
 
 Does a daemon answer a Settings save that makes a label name a second account with `applied` (warn) or with a rejection such as `label-in-use` (refuse)? The issue lists no such decision, yet one acceptance criterion rests on it: "after one that creates a duplicate they appear". The scenario for it scripts the daemon's `applied` reply and pins only the model's reaction, which holds under both answers. Held: whether that save can happen at all. Under refuse, a duplicate reaches Settings only by a load, the creating-save scenario has no case in operation, and nothing else changes.
 

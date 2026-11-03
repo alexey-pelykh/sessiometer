@@ -560,6 +560,11 @@ Scenario: every new string passes the framing scan, and the scan can fail
 ```
 
 ## Red cards — the questions that no scenario above can close
+> **Ruling, 2026-11-03.** Both policies this table waits on are decided by the operator: refuse (PRD § 8.1, design
+> § 12.2). The card's Refused state shows the `label-in-use` or `relabels-another-account` rejection; a collision line
+> on a completed capture no longer arises from the panel's own capture, and whether the panel offers the override is
+> #1561's re-gate to settle. The 🟥 scenarios take the refuse form there; the header's count predates the ruling.
+
 
 | Blocked on | Question | Hangs on it | The item's own default |
 |---|---|---|---|

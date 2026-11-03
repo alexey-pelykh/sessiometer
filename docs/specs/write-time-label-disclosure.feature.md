@@ -527,6 +527,11 @@ Scenario: config-set's writer is pending until #1558 removes the mark
 ```
 
 ## Red cards — the questions that no scenario above can close
+> **Ruling, 2026-11-03.** Both policies this section waits on are decided by the operator: refuse (PRD § 8.1, design
+> § 12.2). CLI `capture` and `login` refuse before the stash write: a duplicate label unless `--overwrite`, a landing
+> on a different account than the label names unless `--rename`; with the flag the write completes and discloses
+> what it did. The 🟥 scenarios take that form at #1556's re-gate; the header's count predates the ruling.
+
 
 | Blocked on | Question | Hangs on it | The item's own default |
 |---|---|---|---|

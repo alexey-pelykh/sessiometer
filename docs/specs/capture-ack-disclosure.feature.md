@@ -642,6 +642,12 @@ Scenario: the drift that exists today does not fail the gate
 ```
 
 ## Red cards — the questions that no scenario above can close
+> **Ruling, 2026-11-03.** Both policies this section waits on are decided by the operator: refuse (PRD § 8.1, design
+> § 12.2). The 🟥 scenarios below take the refuse form at #1559's re-gate: `label-in-use` and `relabels-another-account`
+> rejections in the acknowledgement, with the override carried in the request in a form #1559 settles; the collision
+> and previous-label lines on a completed write remain only for rosters that already hold a duplicate. The header's
+> count predates the ruling.
+
 
 | Blocked on | Question | Hangs on it | The item's own default |
 |---|---|---|---|
