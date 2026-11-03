@@ -2001,34 +2001,98 @@ CC 2.1.285 · macOS 26.6.2 / 25G83 · sessiometer #1540.
 
 Recorded on CC `2.1.294`, which is **outside** the verified range above and does **not** widen it.
 This entry records which environment variables decide a `claude` child's credential before the
-claude.ai login in the keychain is reached. `SPAWN_ENV_REMOVE` in `src/isolated_spawn.rs` is the
-list every isolated spawn removes, and its membership rule cites this entry. The entry re-verifies
-none of the findings the range records.
+claude.ai login in the keychain is reached. It also records `ANTHROPIC_BASE_URL`, which decides
+which host Claude Code's first-party API client sends that credential to. Claude Code lists two
+companions for that variable. Only one of them is scrubbed: `ANTHROPIC_CUSTOM_HEADERS`, a supplier.
+`SPAWN_ENV_REMOVE` in `src/isolated_spawn.rs` is the list every isolated spawn removes, and its
+membership rule cites this entry. The entry re-verifies none of the findings the range records.
 
 **Terms.** The *claude.ai login* is the OAuth credential Claude Code keeps in its keychain item.
 sessiometer seeds it into an isolated `CLAUDE_CONFIG_DIR` before a refresh. The *gate* is the
-function that decides whether Claude Code may use that login at all. The *builder* returns the
-OAuth access token a request carries while the gate is open. The *resolver* picks an API key. An
-input *supplies* a credential when its value, or the file or descriptor it names, is the credential
-the child sends. It *selects* when it decides which credential or store the child uses without
-being one. A *gate-closer* is an input that makes the gate return false. A *bypass* input closes
-the gate, or stops the builder short of the keychain item, while supplying nothing; it selects in
-the membership rule's sense. The ratified scope adds inputs that supply, or that select and
-supply, and leaves pure bypass inputs for their own issues.
+function that decides whether the API clients built by `EN`, the API client builder, may use that
+login. The token refresh does not call it, though it does read the gate's provider test (below). The *builder* returns the OAuth
+access token a request carries while the gate is open. The *resolver* picks an API key. An input
+*supplies* a credential when its value, or the file or descriptor it names, is the credential the
+child sends. It *selects* when it decides which credential or store the child uses without being
+one. A *gate-closer* is an input that makes the gate return false. A *bypass* input closes the
+gate, or stops the builder short of the keychain item, while supplying nothing; it selects in the
+membership rule's sense. A *redirector* decides which host receives the credential the child
+authenticates with. A *scrub seam* is a place that builds a child environment through
+`SPAWN_ENV_REMOVE`: the refresh spawn, the login spawn and the issue #783 login-shell PATH harvest.
+The *refresh seam* is the refresh spawn.
+
+**Scope.** The scope ratified on issue #1535 adds only `ANTHROPIC_AUTH_TOKEN`,
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` and `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`. It leaves to
+their own issues the inputs it counts as bypassing or redirecting the claude.ai login without
+supplying a credential. It named `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS` among those.
+Both later joined the list under issue #1625, whose analysis classes `ANTHROPIC_CUSTOM_HEADERS` as a
+supplier and the redirector's companion (§ Left out by the ratified scope).
 
 ## Method
 
 | Field | Value |
 |---|---|
 | Binary | the stock `~/.local/share/claude/versions/2.1.294`, Mach-O arm64, read statically with Python `bytes.find`. Offsets are byte offsets into that file |
-| Reads | two, both on 2026-11-01. The investigation behind this issue's ratified scope read it first. This entry's own read re-located every offset below and is the source of every quoted fragment |
+| Read: scope investigation, 2026-11-01 | the investigation behind this issue's ratified scope read the binary first |
+| Read: this entry, 2026-11-01 | this entry's own read. § Reads behind the cited offsets, below this table, lists the sections it covers |
+| Reads: issue #1625 council, 2026-11-02 | council members' reads for issue #1625 resolved the names cited in § `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, added under issue #1625, other than those credited below to another read. Each imported name was resolved through its chunk's import list and the only export list that carries it. Every offset and fragment cited for issue #1625 was re-located against the binary on 2026-11-02 |
+| Reads: PR #1536, 2026-11-02 | the reads made for PR #1536 that day. § Reads behind the cited offsets, below this table, names each and what it located |
+| Read: PR #1536, 2026-11-03 | a fix read that day located the `pn()` call at 202128736, for the resolver finding, and re-read `pn()` at 202121167 whole |
+| Read: PR #1536 fix round after review, 2026-11-03 | this read located `Ufr()` at 194845688 and `jfr()` at 194845961, the callers of `Son()`, for the `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` bullet. It re-read `Son()` at 194845225 whole, and found no other reference to `Son` in its chunk and no export of it. For § What the read did not settle, it located the `Ole` imports at 190473880 and 192126671, the export list at 190239571 that binds `Ole`, and the unexported `function Ole(` at 215211050, and re-read `Ole()` at 190233160 |
 | Control | the stock `2.1.293`. The gate, the builder, the labelling function, the snapshot reader, the gateway check and the provider resolver have the same shape there, 896 bytes earlier. The resolver and the descriptor readers are byte-identical at that shift. The other helpers cited were not compared |
 | Names | minified identifiers are 2.1.294's and change between builds. Anchor on the quoted strings, never on the names |
-| Runs | one runtime check, of `ANTHROPIC_BASE_URL` only, described where that input is listed below |
-| Credentials | none read or written; no keychain item opened |
+| Runs | dummy credentials only, a throwaway `HOME` and `CLAUDE_CONFIG_DIR`. § `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, added under issue #1625, describes each run and what its instrument recorded |
+| Credentials | no real credential read or written; no keychain item opened |
 | macOS | `27.0.1` / `26A434` |
 
-## Finding — a gate decides whether the claude.ai login is used at all ✅
+### Reads behind the cited offsets
+
+The Method table's rows for this entry's read and for the 2026-11-02 PR #1536 reads point here.
+Each read's label is defined where it appears, and each offset sits under the read that located it.
+
+- **This entry's read, 2026-11-01**: this entry's own read. It located every offset that the
+  sections listed next cite and that neither the Method table nor this list credits to another
+  read. It is also the source of those offsets' quoted fragments. The sections are:
+  - every § Finding section;
+  - § What `SPAWN_ENV_REMOVE` removes, and why;
+  - § Left out of the scrub, and why;
+  - § What the read did not settle;
+  - § What would falsify this.
+- **The PR #1536 reads, 2026-11-02**: all the reads made for PR #1536 that day. Together they
+  located:
+  - the host credential slots, read by `co()` at 184051285, `ken()` at 184051670 and `Cen()` at
+    184051825, cited under § What the read did not settle;
+  - `Pl()` at 187086489, and the `S6()` fragments that open `lv()` at 187047767 and `Ul()` at
+    187044587, in the § Finding sections.
+
+  The reads below are among them, each under a label of its own.
+  - **The review read, 2026-11-02**: one read made in reviewing PR #1536. It located:
+    - `z9()` at 191058155, for the `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` bullet of
+      § `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, added under issue #1625;
+    - `Ole()` at 190233160, for § What the read did not settle;
+    - the `EN` log fragment at 191060581.
+  - **The review and validation reads, 2026-11-02**: the reads made in reviewing PR #1536 and in
+    validating the review's findings. This entry does not record whether the review read is one
+    of them. They found that `Ee` is a local definition in `Ren()`'s own chunk. They located:
+    - the steps behind the token refresh: `j7()` at 187085939, `Pl()`'s provider test at
+      187086876, `Pl()`'s calls of `aye()` at 187089311 and 187089510, `aye()` at 187117732 and
+      `cn()` at 184092173;
+    - the steps behind the gateway check: the init function at 200888923, `cYt()` at 187042300,
+      `eQ()` at 184051902 and the export list that binds `Kn` at 184420677;
+    - the header merge `Re` at 190517451, `EN`'s `Y9(ke,Ee())` call at 191061035 and `U0n()` at
+      187852724;
+    - the Files API header builder `wE()` at 191322666.
+  - **The implementation read, 2026-11-02**: the read made in implementing changes for PR #1536
+    that day. It located:
+    - `vFe` at 184091959, `cYt()`'s `eQ(s)` call at 187043621 and `Wo()` at 191069708;
+    - the start-up function `pn()` at 202121167 and `t4e()` at 185999908, in the resolver
+      finding;
+    - the `ht(!0)` call at 183769094 and the launch options' `reset()` at 184011406, for § What
+      the read did not settle.
+
+  Each of these offsets was re-located by its fragment on 2026-11-02.
+
+## Finding — a gate decides whether the API clients `EN` builds use the claude.ai login ✅
 
 The gate is `rl` at offset 187043719, quoted whole:
 
@@ -2036,23 +2100,33 @@ The gate is `rl` at offset 187043719, quoted whole:
 function rl(){if(S6())return!1;if(a.ANTHROPIC_UNIX_SOCKET)return!!a.CLAUDE_CODE_OAUTH_TOKEN;if(ld())return!1;let e=!Kn(),n=Qn()||{},r=yr()?Yf():n.apiKeyHelper,s=Ab(),g;try{g=lv({skipRetrievingKeyFromApiKeyHelper:!0}).source}catch{return!1}let h=g==="ANTHROPIC_API_KEY"||g==="apiKeyHelper",b=b9("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"),w=(s||h)&&!oqe()||(r||b)&&!vr();return!(e||w)}
 ```
 
-It returns false when any row below holds, subject to the `oqe()` and `vr()` exemptions described
-after the table, and Claude Code then does not use the claude.ai login. One arm returns early:
-with `ANTHROPIC_UNIX_SOCKET` set, the gate returns at that row — true when
-`CLAUDE_CODE_OAUTH_TOKEN` is also set, false otherwise — and the rows after it do not run.
+It returns false when any row below holds, and the API clients `EN` builds then do not use the
+claude.ai login. The socket branch below and the `oqe()` and `vr()` exemptions after the table limit
+which rows apply. The token refresh does not call the gate: the refresh path `Pl()` at 187086489
+does not call `rl`. It does call the gate's provider test, `Kn()`. When the provider is not
+first-party, `Pl()` returns `not_needed` at that test and skips the refresh, unless its caller
+passes `usesLoginOffFirstParty: true` (§ What `SPAWN_ENV_REMOVE` removes, and why). That `Pl()`
+does not call `rl` comes from a static read, not a run. So does `Pl()`'s `not_needed` return at
+`Kn()` when the provider is not first-party. The 2026-11-02T05:18:35Z run corroborates that `Pl()`
+does not call `rl`, as do the 2026-11-02T05:46:18Z arms for `ANTHROPIC_AUTH_TOKEN` and the
+unopened `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`. Each set a gate-closer, and the child still sent a
+`CONNECT` to the token host, `platform.claude.com:443`. The socket branch returns before the later
+rows run. With simple mode off and `ANTHROPIC_UNIX_SOCKET` set, the gate returns true when
+`CLAUDE_CODE_OAUTH_TOKEN` is also set.
 
 | The gate closes on | Environment input | Evidence |
 |---|---|---|
 | simple mode | `CLAUDE_CODE_SIMPLE`, or the `--bare` flag | `S6()` calls `yr()` at 184085702: `Le(process.env.CLAUDE_CODE_SIMPLE)\|\|i("--bare")` |
 | a Unix socket without an OAuth token | `ANTHROPIC_UNIX_SOCKET`, unless `CLAUDE_CODE_OAUTH_TOKEN` is also set | `rl` itself. The display string at 190340420 reads `ANTHROPIC_UNIX_SOCKET is set without CLAUDE_CODE_OAUTH_TOKEN, so requests on the socket carry no claude.ai login` |
-| a profile or a workload identity | `ANTHROPIC_PROFILE`; `ANTHROPIC_FEDERATION_RULE_ID` with `ANTHROPIC_ORGANIZATION_ID`; or a profile found in `ANTHROPIC_CONFIG_DIR`, else `$XDG_CONFIG_HOME/anthropic`, else `$HOME/.config/anthropic` | `ld()` at 187040298, through the precedence source at 186228583 and the config directory at 186233078 |
+| a profile or a workload identity, when `ld()` holds | `ANTHROPIC_PROFILE`; `ANTHROPIC_FEDERATION_RULE_ID` with `ANTHROPIC_ORGANIZATION_ID`; or a profile found in `ANTHROPIC_CONFIG_DIR`, else `$XDG_CONFIG_HOME/anthropic`, else `$HOME/.config/anthropic`. Each can make `ld()` hold, though not in every case (§ What the read did not settle) | `ld()` at 187040298, through the precedence source at 186228583 and the config directory at 186233078 |
 | a provider other than first-party | `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_FOUNDRY`, `CLAUDE_CODE_USE_ANTHROPIC_AWS`, `CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD`, `CLAUDE_CODE_USE_MANTLE`, `CLAUDE_CODE_USE_VERTEX`; or the gateway provider | `Kn()` at 184417795 asks the provider resolver at 184417401, which tests for the gateway first |
 | a bearer token | `ANTHROPIC_AUTH_TOKEN` | `Ab()` at 187044531. The display string at 190340149 reads `ANTHROPIC_AUTH_TOKEN is set, so this session is using API-key auth` |
 | an API key | the resolver's source is `ANTHROPIC_API_KEY` or `apiKeyHelper`. The first covers the variable and also a key read through `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, which the resolver labels the same way | `h` in `rl`, taken from the resolver below |
 | an API-key helper or descriptor | `apiKeyHelper` configured, which is a settings key; or `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` merely set | `b9()` at 186263353 counts a variable as set when it is non-empty after trimming, or when its descriptor was already consumed |
 
-`ld()` steps aside when another input already decides the credential (`Ihr()` at 187040127). Three
-more inputs decide whether some rows apply, and none of them supplies a credential:
+`ld()` steps aside when another input already decides the credential (`Ihr()` at 187040127).
+`CLAUDE_CODE_REMOTE`, `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_HOST_AUTH_ENV_VAR` decide whether
+some rows apply, and none of them supplies a credential:
 
 - The bearer and API-key rows do not close the gate while `oqe()` (187039266) holds. It needs
   `vr()`, an unset `CLAUDE_CODE_HOST_AUTH_ENV_VAR`, and a `CLAUDE_CODE_ENTRYPOINT` other than
@@ -2063,8 +2137,8 @@ more inputs decide whether some rows apply, and none of them supplies a credenti
 
 ## Finding — with the gate open, the builder reads environment inputs before the keychain ✅
 
-The builder is `m$` at 187072942. Callers reach it through its cached accessor `mn()` (187074165)
-while the gate is open. Quoted with its two token objects shortened to `…`:
+The builder is `m$` at 187072942. Callers reach it through its cached accessor `mn()` (187074165),
+which returns null in simple mode. Quoted with its two token objects shortened to `…`:
 
 ```js
 function m$(){if(a.CLAUDE_CODE_OAUTH_TOKEN)return{accessToken:a.CLAUDE_CODE_OAUTH_TOKEN,…};let e=eM(),n=(r)=>({accessToken:r,…});if(e&&(!vz()||Ld()))return n(e);if(on())return null;try{let g=zn().read({fromStoreCopy:!0})?.claudeAiOauth;if(g?.accessToken)return g}catch(r){c(r)}if(e)return n(e);return null}
@@ -2073,16 +2147,17 @@ function m$(){if(a.CLAUDE_CODE_OAUTH_TOKEN)return{accessToken:a.CLAUDE_CODE_OAUT
 In the order the builder takes them:
 
 1. `CLAUDE_CODE_OAUTH_TOKEN`. When set, it is the access token.
-2. A token from `eM()` at 186263416, which does two things in turn.
+2. A token from `eM()` at 186263416, which takes the steps below in order.
    - It calls `VNn()` at 186261039, which consumes `CLAUDE_BG_AUTH_SNAPSHOT_PATH`. It reads the
      JSON file the variable names, then deletes the variable. The file's `accessToken` goes into
-     the cache the next step reads, marked as coming from a snapshot. A `gatewayToken` goes to the
-     gateway slot instead.
+     the cache the next step reads, marked as coming from a snapshot. A `gatewayToken` goes instead
+     to the store that `Qit()` at 186263815 reads a gateway token from. The gateway test `kl()` can
+     read that store through `Qit()`. The provider resolver at 184417401 does not read it.
    - It reads `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` through the shared reader `k()` at
      186258176. The reader takes `/dev/fd/N`, or a socket: `rEr()` at 185862568 is an `isSocket()`
-     test. After a socket read it deletes the variable, unless `CLAUDE_CODE_REMOTE` is set or the
-     process has an IPC channel. With the variable unset, `k()` reads the well-known file
-     `/home/claude/.claude/remote/.oauth_token` instead. The guard that would skip that file,
+     test. It reads a socket, and then deletes the variable, only while `CLAUDE_CODE_REMOTE` is
+     unset and the process has no IPC channel. With the variable unset, `k()` reads the well-known
+     file `/home/claude/.claude/remote/.oauth_token` instead. The guard that would skip that file,
      `kA()` at 186017792, is `return!1`, so the file is tried on every host.
 
    This token outranks the keychain item, unless it came from the snapshot: `vz()` at 184050494 is
@@ -2092,19 +2167,40 @@ In the order the builder takes them:
    When set, the builder returns before it reads the keychain item. It also lets a snapshot token
    outrank the item.
 4. The claude.ai login in the keychain.
-5. The snapshot token, when the keychain item holds no access token.
+5. The snapshot token, when the keychain item holds no access token or cannot be read.
 
-The builder also reads `CLAUDE_CODE_SUBSCRIPTION_TYPE` and `CLAUDE_CODE_RATE_LIMIT_TIER`. They only
-label a token that came from the environment or a descriptor; they choose nothing.
+The builder also reads `CLAUDE_CODE_SUBSCRIPTION_TYPE` and `CLAUDE_CODE_RATE_LIMIT_TIER`. In the
+builder they only label a token that did not come from the keychain item, and they choose nothing
+there.
 
 ## Finding — the resolver and the bearer header choose without the login ✅
 
-The resolver is `lv` at 187047767. For a non-interactive child, such as the `-p` refresh child, it
-takes these in order:
+The resolver is `lv` at 187047767. Under simple mode (the gate table's first row), the list below
+does not run. The resolver then returns `ANTHROPIC_API_KEY` if set. Failing that, it returns the
+`apiKeyHelper` key if one is configured, else no key. The fragment opens `lv`'s body:
+`if(S6()){if(a.ANTHROPIC_API_KEY)return{key:a.ANTHROPIC_API_KEY,…`. Otherwise, for a
+non-interactive child such as the `-p` refresh child, it takes these in order:
 
-1. `ANTHROPIC_API_KEY`, whenever `Ren()` at 184053466 holds, which it does for a non-interactive
-   process outside the VS Code client. An interactive child takes this key only once it has been
-   approved.
+1. `ANTHROPIC_API_KEY`, whenever `Ren()` at 184053466 holds. `Ren()` holds for a non-interactive
+   process outside the VS Code client. The read traced that through these steps:
+   - `Ren()` is `return Ee()&&n().host.launchOptions.clientType()!=="claude-vscode"`.
+   - Its first operand, `Ee`, is a local function in `Ren()`'s own chunk (183950003–184074179).
+     That chunk imports no `Ee`. Its definition there is
+     `function Ee(){return!n().host.launchOptions.isInteractive()}` at 184043027.
+   - At start-up, `pn()` at 202121167 computes `w=n.kind==="non-interactive"||t4e(e)`. It marks
+     the process non-interactive when `w` holds. Its caller supplies `n` as its `interactivity`
+     argument.
+   - The call at 202128736, inside the function its chunk exports as `main`, passes
+     `{kind:"detect"}`. So there `t4e()` at 185999908 decides the mark.
+   - `t4e()` holds when the arguments carry `-p` ahead of any `--`. So the refresh child, a
+     `claude -p`, starts non-interactive and takes this key whenever it is set.
+   - With `/login` as its only argument, `t4e()` holds only when stdout is not a terminal.
+     sessiometer's login refuses such a stdout (`require_tty` in `src/login.rs`). The login child
+     inherits sessiometer's stdout. So the login child starts interactive. It takes the key only
+     once the key has been approved.
+
+   Who records that approval was not traced. Neither was whether a later write changes the mark
+   `pn()` sets, in either child. § What the read did not settle lists these open questions.
 2. A key read through `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` by `cre()` at 186264228, using the same
    reader `k()`. With the variable unset, it reads `/home/claude/.claude/remote/.api_key`. The
    resolver labels this key `ANTHROPIC_API_KEY`.
@@ -2114,110 +2210,360 @@ takes these in order:
 One branch, guarded by `Le(!1)`, never runs in this build: `Le` at 183922235 returns false for
 `false`.
 
-The `Authorization: Bearer` header comes from `Y9()` at 191068619. It carries `ANTHROPIC_AUTH_TOKEN`,
-else the output of `apiKeyHelper`.
+`Y9()` at 191068619 writes an `Authorization: Bearer` header into the API client's default headers.
+`EN` calls it only when neither `Me` nor `co()` holds. § `ANTHROPIC_BASE_URL` and
+`ANTHROPIC_CUSTOM_HEADERS`, added under issue #1625, describes these tests. It writes only when it
+finds a token: `ANTHROPIC_AUTH_TOKEN`, else the output of `apiKeyHelper`. While `Me` holds, the SDK
+instead builds the bearer from the client's `authToken`, the OAuth access token, unless a custom
+`Authorization` header replaces it (§ `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, added
+under issue #1625).
 
 ## Finding — the 2.1.207 precedence line, after its first link, is the 2.1.294 labelling order ✅
 
-`Ul()` at 187044587 names the source a session's credential came from, for status lines and
-diagnostics. It returns, in order:
+`Ul()` at 187044587 names the source a session's credential came from. Under simple mode it
+returns `apiKeyHelper` if one is configured, else `none`, and nothing below. The fragment
+`if(S6()){if(Yf())return{source:"apiKeyHelper",…` opens its body. Otherwise it returns, in order:
 
 1. `ANTHROPIC_AUTH_TOKEN`, unless `oqe()` holds;
 2. `CLAUDE_CODE_OAUTH_TOKEN`;
-3. the descriptor token, labelled `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, or
-   `CCR_OAUTH_TOKEN_FILE` for the well-known file;
+3. a token from `eM()`, whichever of the descriptor, the well-known file or the snapshot supplied
+   it. It is labelled `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` when `b9()` counts that variable as
+   set, and `CCR_OAUTH_TOKEN_FILE` otherwise;
 4. `apiKeyHelper`, unless `vr()` holds;
 5. `profile`, then `claude.ai`, then `none`.
 
-That is the order `# Issue #466` records under "Adjacent — auth-source precedence", after its first
-link. Its `CCR-file` is this function's `CCR_OAUTH_TOKEN_FILE` label. The function reports a source;
-it does not choose one. Claude Code chooses through the gate, the builder and the resolver above,
-and in a different order. At 2.1.294 the function has no `ANTHROPIC_API_KEY` branch. Whether its
-2.1.207 version had one was not re-checked; no 2.1.207 binary was read for this entry.
+That is the order `# Issue #466` records under
+"Adjacent — auth-source precedence (out of scope; not recommended)", after its first link. Its
+`CCR-file` is this function's `CCR_OAUTH_TOKEN_FILE` label. The function reports a source; it does
+not choose one. Claude Code chooses through the gate, the builder and the resolver above, and in a
+different order. At 2.1.294 the function has no `ANTHROPIC_API_KEY` branch. Whether its 2.1.207
+version had one was not re-checked; no 2.1.207 binary was read for this entry.
 
 ## What `SPAWN_ENV_REMOVE` removes, and why
 
 Its membership rule: a variable is eligible if Claude Code reads it from the environment to decide
 which credential, which credential store, or which OAuth client identity the child authenticates or
-refreshes with. Selecting a source counts as well as supplying one. Eligibility is not membership:
-the scope ratified for each issue decides which eligible variables join, and a variable the engine
-itself depends on stays inherited (`USER`, whose role `SPAWN_ENV_REMOVE`'s doc records).
+refreshes with. Selecting a source counts as well as supplying one. A variable is also eligible if
+Claude Code reads it to decide which host receives the credential the child authenticates with.
+Eligibility is not membership: the scope ratified for each issue decides which eligible variables
+join, and a variable the engine itself depends on stays inherited (`USER`, whose role
+`SPAWN_ENV_REMOVE`'s doc records).
 
 | Variable | Role, read at 2.1.294 unless the row says otherwise |
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | supplies an OAuth token that outranks the keychain item |
-| `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` | names a descriptor whose OAuth token outranks the keychain item, when the descriptor is readable |
-| `ANTHROPIC_API_KEY` | supplies an API key, and closes the gate when the resolver picks it, unless `oqe()` holds |
-| `ANTHROPIC_AUTH_TOKEN` | supplies the bearer, and closes the gate unless `oqe()` holds |
-| `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` | closes the gate when set to a value non-empty after trimming, unless `vr()` holds; and names a descriptor an API key is read from while it is readable, which the resolver then labels `ANTHROPIC_API_KEY`, so that row closes the gate too, unless `oqe()` holds |
+| `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` | names a descriptor whose OAuth token outranks the keychain item while the descriptor is readable and no snapshot access token was consumed first. Items 2 and 3 of the builder finding record the mechanism |
+| `ANTHROPIC_API_KEY` | supplies an API key, and can close the gate when the resolver picks it. The gate finding says when it does |
+| `ANTHROPIC_AUTH_TOKEN` | supplies a bearer, which `Y9()` writes when neither `Me` nor `co()` holds (§ Finding — the resolver and the bearer header choose without the login). It can close the gate, and the gate finding says when |
+| `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` | can close the gate when set to a value non-empty after trimming. It also names a descriptor an API key is read from while the descriptor is readable. The resolver labels that key `ANTHROPIC_API_KEY`, so the API-key row of the gate table can close the gate too. The gate finding says when each row closes it |
+| `ANTHROPIC_BASE_URL` | a redirector: it is the base URL of the API client builder's first-party client, the host that receives the credential that client carries (issue #1625, below) |
+| `ANTHROPIC_CUSTOM_HEADERS` | a supplier: a header it names replaces an earlier header of the same name. So on the API client builder's first-party client, a custom `Authorization` header replaces the bearer the SDK builds from the client's `authToken`. A header `Y9()` writes replaces a custom `Authorization` the variable names once, in that exact letter case. Other client branches can drop or replace it (issue #1625, below). Claude Code lists it as one of the base URL's two companions, and it is the only one of them scrubbed |
 | `CLAUDE_SECURESTORAGE_CONFIG_DIR` | picks the keychain service name, and so the store (`# Issue #100`) |
 | `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, `CLAUDE_CODE_OAUTH_SCOPES`, `CLAUDE_CODE_OAUTH_CLIENT_ID` | the refresh short-circuit of `auth login` and the OAuth client identity, from issue #1009. Recorded at `SPAWN_ENV_REMOVE`; not re-read here |
 
-Inherited by the refresh child, each of the first five keeps it off the seeded item under the
-condition its row names, and the refresh then silently no-ops. Issue #1535 added
-`ANTHROPIC_AUTH_TOKEN` and the two descriptor variables. The test
-`the_recorded_env_credential_sources_are_scrubbed_by_name` pins those five by name at every seam that
-builds a child environment.
+The 2026-11-02T05:46:18Z run set each of the following inputs in the refresh child's environment,
+one arm per input: `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`,
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`. It recorded
+which hosts the child attempted to `CONNECT` to, through a refusing proxy. The run's table is in
+§ `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, added under issue #1625. Its results differ
+by input:
+
+- `CLAUDE_CODE_OAUTH_TOKEN`, or a readable `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`: the child
+  attempted no `CONNECT` to the token host before its arm timed out. The static read of the builder
+  offers the cause: each hands it a token, so the child has no refresh of the seeded item to
+  attempt. That cause is inferred from the read, not measured.
+- `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`: the child still attempted a `CONNECT` to the token
+  host, which the proxy refused. By the gate reading, the API clients `EN` builds then carry the
+  inherited credential instead of the seeded login. That half is a static read: the run recorded
+  hosts, not headers.
+- `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` set, with nothing readable behind it: the child attempted one
+  `CONNECT` to the token host, which the proxy refused, then exited 1. It printed
+  `Not logged in · Please run /login` to its own stdout. The refresh seam nulls the child's stdout
+  and stderr and discards its exit status (`SpawnPlan::build_command` and `SpawnPlan::run` in
+  `src/isolated_spawn.rs`), so sessiometer sees only a refresh that did not land.
+
+The gate finding records that the refresh path does not call the gate, and the run corroborates it:
+under the inputs that close the gate the child still attempted the token-host `CONNECT`. Not
+measured: a readable `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, whose key the resolver would read,
+because the run's arm had nothing open on the descriptor. Also not measured: whether a refresh that
+succeeds is written back to the item while the request carries an inherited credential, and what
+any of these does at the login spawn.
+
+Issue #1535 added `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` and
+`CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`. The test
+`the_recorded_env_credential_sources_are_scrubbed_by_name` pins `CLAUDE_CODE_OAUTH_TOKEN`,
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+`CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` by name at each scrub seam. The tests' `scrub_seams` helper
+lists those seams: the refresh spawn, the login spawn and the issue #783 login-shell PATH harvest.
+Issue #1625 added `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, and the test
+`the_base_url_and_its_companion_headers_are_scrubbed_by_name` pins them at each scrub seam.
+
+### `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, added under issue #1625
+
+The scope ratified on issue #1535 left both out, each to be filed as its own issue. The
+[maintainer's scope comment](https://github.com/alexey-pelykh/sessiometer/issues/1535#issuecomment-6564262030),
+posted at 2026-11-01T21:39:19Z, records that scope. On 2026-11-02 the maintainer delegated that
+held decision to a council of security, Rust and delivery members, each in its own context. The
+council converged with high confidence: scrub both in PR #1536, under their own issue #1625. Both
+joined the list on 2026-11-02. The remaining redirect and bypass inputs are filed as issue #1626.
+
+**`ANTHROPIC_BASE_URL` is a redirector.** The API client builder `EN` at 191059516 takes one bearer,
+`Te=mn()` at 191060937, whatever its source. Its call at 191067838 passes
+`oauthAccessToken:Te?.accessToken` to `Xcs()`, and keeps what `Xcs()` returns as `Ne`. It then
+builds its first-party client's options from `Ne` at 191068464:
+`st={apiKey:Ne.apiKey,authToken:Ne.authToken,...a.ANTHROPIC_BASE_URL?{baseURL:a.ANTHROPIC_BASE_URL}:!1,…}`.
+Without a managed provider policy, no host test sits between choosing the credential and the base
+URL. In that case, whatever credential the child selects goes to `ANTHROPIC_BASE_URL` on that
+client. Of the credential-selection functions this entry decoded, only the gateway test `kl()`
+reads it. `kl()` sits at 187026260. It accepts `CLAUDE_CODE_USE_GATEWAY` only when the base URL is
+set and a gateway token is found (below).
+
+**`ANTHROPIC_CUSTOM_HEADERS` is a supplier, and the redirector's companion.** `Nqe()` at 185326108
+parses it, one `Name: value` header per line. `lwt()` at 191069890 turns those headers into an
+object with no host test. It drops only `anthropic-beta`, and only while the organization's policy
+disables experimental betas. `EN` spreads that object into the client's default headers (`_e=lwt()`
+at 191060081).
+
+The SDK builds its auth headers from the client's `apiKey` and `authToken` options, and merges the
+default headers after them (190649800). Its merge, `Re=(e)=>{let n=new Headers` at 190517451, takes
+the header sets in order. A header in a later set replaces any earlier header of the same name,
+compared in lower case. The exception is `x-stainless-helper`, whose values it joins. Headers of
+other names are kept.
+
+`EN` builds its first-party client last, from the options `st={…}` at 191068464, and that client
+takes the default headers whole. So on the first-party client a custom `Authorization` header
+replaces the bearer the SDK built, and other named headers ride beside the auth headers.
+
+`EN`'s other client branches can drop or replace a custom `Authorization`. The gateway branch, and
+the branch that `EN` builds from what `Zhe()` returns, remove it with `Wo()` at 191069708 and write
+their own. `Zhe()` itself was not decoded. A provider branch can also drop it, or pass it on. How
+each provider branch treats it is listed under what the read did not settle.
+
+`Y9()` at 191068619 writes into the same default headers. `EN` calls it after the custom headers are
+in place, when neither `Me` nor `co()` holds (`Y9(ke,Ee())` at 191061035). `Y9()` writes
+`Authorization` only when it finds a token, from `ANTHROPIC_AUTH_TOKEN` or the API-key helper. That
+write replaces a custom `Authorization` that `ANTHROPIC_CUSTOM_HEADERS` names once, in that exact
+letter case. Without a token it returns null and writes nothing, so a custom `Authorization` header
+stands.
+
+`Me` is `U0n()` at 187852724, which holds when the gate is open and the OAuth token carries the
+`user:inference` scope. There `Y9()` does not run. So on the first-party client, a custom
+`Authorization` header replaces the login's bearer. Claude Code's own client builder checks for such
+a header: `EN` logs `has Authorization header: ${!!_e.Authorization}` at 191060581.
+
+This account of `ANTHROPIC_CUSTOM_HEADERS` rests on static reads, not runs. No run set
+`ANTHROPIC_CUSTOM_HEADERS`. Claude Code lists two companions for the base URL: `LKe` at 184657724 is
+`[{endpoint:"ANTHROPIC_BASE_URL",companions:["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL","ANTHROPIC_CUSTOM_HEADERS"]},…`.
+Of the two, only `ANTHROPIC_CUSTOM_HEADERS` is scrubbed. It is scrubbed together with the base URL
+because, with only the base URL removed, a gateway's headers, an `Authorization` value or a key
+header, would go to `api.anthropic.com`.
+
+**Runs.** These back this subsection and the per-input result above. All ran the stock 2.1.294
+binary, with dummy credentials only and a throwaway `HOME` and `CLAUDE_CONFIG_DIR`. Each run's
+instrument recorded only what reached it. In the 2026-11-01T22:37Z and 2026-11-02T05:14:47Z runs, a
+loopback listener recorded the requests sent to it, and nothing recorded the rest of the child's
+traffic. In the 2026-11-02T05:18:35Z run and the 2026-11-02T05:46:18Z arms, a loopback proxy
+recorded each `CONNECT` request line and refused every request.
+
+- 2026-11-01T22:37Z, an environment token. A dummy `CLAUDE_CODE_OAUTH_TOKEN`, with
+  `ANTHROPIC_BASE_URL` pointed at a loopback listener on `127.0.0.1`. Two
+  `POST /v1/messages?beta=true` requests reached the listener. Each carried the dummy token as
+  `Authorization: Bearer` and no `x-api-key`. The client did not strip the bearer for that
+  non-Anthropic host. This run took place about an hour after the maintainer's scope comment on
+  issue #1535 was posted, while the issue #1535 change was being planned. So it did not inform the
+  ratified scope.
+- 2026-11-02T05:14:47Z, a stored token. A dummy `.credentials.json` sat in the throwaway config dir,
+  with a far-future `expiresAt`, the scopes `user:inference` and `user:profile`, and no refresh
+  token. No credential was in the environment. The environment held the refresh seam's own
+  variables: `CLAUDE_CONFIG_DIR`, plus `DISABLE_AUTOUPDATER`, `DISABLE_TELEMETRY`,
+  `DISABLE_ERROR_REPORTING` and `DISABLE_BUG_COMMAND` set to `1`. It also held `PATH`, `HOME` and
+  `TERM`, and `ANTHROPIC_BASE_URL` pointed at a loopback listener. Two `POST /v1/messages?beta=true`
+  reached `127.0.0.1`, each carrying the dummy stored token as `Authorization: Bearer` and no
+  `x-api-key`. The child exited 1 printing `Failed to authenticate. API Error: 401 probe`, and the
+  stored file was unchanged. So a stored token that was unexpired and carried `user:inference`
+  reached the inherited base URL. The macOS keychain read itself was not exercised: the store here
+  was the plaintext file.
+- 2026-11-02T05:46:18Z, which inherited input stops the refresh. Its arms ran in parallel. Each had
+  a dummy stored credential with a past `expiresAt` and a dummy refresh token, and the refresh
+  seam's environment. Each had its own loopback HTTPS proxy, which refused every `CONNECT` with 403
+  and recorded its host.
+
+| Arm | `CONNECT`s to the token host `platform.claude.com:443` | `CONNECT`s to `api.anthropic.com:443` | Exit |
+|---|---|---|---|
+| control, no credential input | 2, including the arm's first recorded `CONNECT` | 12 | timed out at 75 s |
+| `CLAUDE_CODE_OAUTH_TOKEN` | 0 | 23 | timed out |
+| `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, a readable pipe holding a dummy token | 0 | 23 | timed out |
+| `ANTHROPIC_API_KEY` | 12, including the arm's first recorded `CONNECT` | 22 | timed out |
+| `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR=97`, nothing open on 97 | 1 | 3 | 1 after 1.8 s, stdout `Not logged in · Please run /login` |
+| `ANTHROPIC_AUTH_TOKEN` | 1 | 11 | timed out |
+
+`ANTHROPIC_AUTH_TOKEN` was also run alone, at 2026-11-02T05:18:35Z: one token-host `CONNECT` among
+12 in all, every one refused by the proxy.
+
+**What the scrub changes.** Before issue #1535, an inherited `ANTHROPIC_BASE_URL` could already
+receive the claude.ai login's token from `EN`'s first-party client. That needed the gate to stay
+open and the token to carry `user:inference`. It also needed the builder to reach the keychain
+item, which an inherited `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` prevents. These conditions are
+necessary, not sufficient. One setup that met them was `ANTHROPIC_BASE_URL` inherited together with
+`ANTHROPIC_API_KEY`, which was already scrubbed. Issue #1535's removals let more inherited setups
+meet them:
+
+- `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN`, the usual bearer-gateway setup. Before
+  issue #1535, the child sent the operator's own gateway token there instead.
+- `ANTHROPIC_BASE_URL` with `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`.
+- `ANTHROPIC_BASE_URL` with a readable `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`.
+- `CLAUDE_CODE_USE_GATEWAY` with `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`. Without a gateway
+  token, which `kl()` also seeks on a descriptor or the snapshot, `kl()` logs `ignoring` and fills
+  no gateway slot. The provider then reverts to first-party. That is a static read. It holds unless
+  a gateway slot is filled by other means. `cYt()`'s stored-gateway restore is one, described below;
+  the read did not trace every other.
+
+The stored-token run above measured a stored token reaching an inherited base URL as the bearer.
+That token was unexpired, had no refresh token, and sat in the plaintext store. The keychain
+read rests on the shared builder and client. The refresh seam's own seed differs: sessiometer
+back-dates its `expiresAt` (`backdate`, below). No run measured that case, which is listed under
+what the read did not settle.
+
+Scrubbing the pair removes the base URL and the custom headers from the environment each scrub seam
+builds: the refresh spawn, the login spawn and the issue #783 login-shell PATH harvest. That closes
+the inherited-environment route through the pair at those seams. So at those seams, the question
+whether a request after `/login` uses an inherited `ANTHROPIC_BASE_URL` no longer arises: the
+environment they build no longer carries one.
+
+Removing `ANTHROPIC_BASE_URL` changes where the refresh child's API requests go. It leaves
+sessiometer's usage poll alone: the poll calls `https://api.anthropic.com/api/oauth/usage` itself
+(`USAGE_URL` in `src/usage.rs`). It does not move the token endpoint either. The token refresh is
+`aye()` at 187117732, which `Pl()` calls at 187089311 and 187089510. It posts with
+`kt.post(cn().TOKEN_URL,…)`. `TOKEN_URL` defaults to `https://platform.claude.com/v1/oauth/token`
+(184090125). `cn()` at 184092173 rebinds it to `${e}/v1/oauth/token` when
+`CLAUDE_CODE_CUSTOM_OAUTH_URL` is one of the origins listed in `vFe` (184091959). For any other
+non-empty value, `cn()` throws `CLAUDE_CODE_CUSTOM_OAUTH_URL is not an approved endpoint.` The name
+`ANTHROPIC_BASE_URL` does not occur in the chunk that holds `cn()`.
+
+Removing the base URL can still change whether the refresh runs, in one inherited setup. This is a
+static read; nothing was run. `Pl()` at 187086489 returns `not_needed` at `if(!Kn()&&!k)`
+(187086876). Its `Kn` is imported from `chunk-k18q62jm.js`. The only export list that carries the
+name, at 184420677, binds it to `Kn()` at 184417795: `return Pe()==="firstParty"`. `Pe()` at
+184417401 returns `gateway` when `co()`, `ken()` or `Cen()` holds, and `co()` reads the
+`gatewayAuth` slot. `k` is the `usesLoginOffFirstParty` option, which `j7()` at 187085939 defaults
+to false. `EN` calls `j7()` without it.
+
+Start-up reaches `kl()`. The init function at 200888923, which logs `init_started`, awaits `cYt()`
+at 187042300 once, and `cYt()` calls `kl()` first. With `CLAUDE_CODE_USE_GATEWAY` set, `kl()` reads
+`ANTHROPIC_BASE_URL` and a gateway token. Given both, `kl()` returns true with `gatewayAuth` filled.
+It writes the slot through `eQ()` at 184051902, or finds it already holding a pinned credential or
+the gateway token. When the slot holds no URL yet, a base URL it cannot parse makes it throw
+instead. The token can come from `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR` or the snapshot, and
+both stay inherited. So with the base URL inherited, `Pe()` returns `gateway`. `Pl()` then returns
+`not_needed` at its provider test, and skips the refresh, for a caller that passes no
+`usesLoginOffFirstParty`. With the base URL removed, `kl()` logs `ignoring`, fills no slot and
+returns false.
+
+A false `kl()` does not end `cYt()`. `kl()` returns false whenever `CLAUDE_CODE_USE_GATEWAY` is
+unset, and whenever the base URL or a gateway token is missing. `cYt()` then goes on, in this order:
+
+- With `CLAUDE_CODE_USE_GATEWAY` set, no `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_BG_AUTH_SNAPSHOT_PATH`
+  still set, it retries reading that snapshot and calls `kl()` again. It returns if `kl()` now
+  holds, and throws if the snapshot stays unread.
+- It returns when `on()` holds. `on()` at 187035254 returns `Ld()`, and `Ld()` at 187035194 returns
+  `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`.
+- Otherwise it restores a stored gateway credential. It reads Claude Code's secure-storage object
+  through `zn().readAsync(e)`; the builder reads `claudeAiOauth` from that same store. The restore
+  needs an `enterpriseGateway` entry whose host has a `gatewayTrust` pin, and whose token is
+  unexpired or carries an `idpRefreshToken`. Given that, `cYt()` calls `eQ(s)` at 187043621 and
+  fills `gatewayAuth`. A TLS-fingerprint probe of the gateway stops the restore only when it returns
+  a different fingerprint. A probe that fails lets the restore go ahead.
+
+So with the base URL removed, `co()` can still hold through that restore. `Pe()` then returns
+`gateway`, and `Pl()` still skips the refresh for `EN`'s `j7()` call. This account is a static read;
+no run stored a gateway credential. sessiometer's refresh seed rewrites only
+`claudeAiOauth.expiresAt` in the blob it copies (`backdate` in `src/refresh.rs`). So the refresh
+child's store holds an `enterpriseGateway` entry whenever the copied item does. The login child's
+isolated item starts empty. Whether stashed items carry such an entry in practice was not settled.
+
+`Cen()` and `ken()` can also hold by other means. Init sets the reader behind `Cen()` to `KDe()`.
+Whether `KDe()` or `ken()` can hold for the refresh child was not traced. A gateway token held only
+in `ANTHROPIC_AUTH_TOKEN` is already removed at the scrub seams. In that setup, removing the base URL
+changes nothing about `kl()`. Whether init's `cYt()` runs before the child's first refresh check,
+with its `kl()` call and its restore, was not traced either. These open points are listed under
+what the read did not settle.
+
+Removing `ANTHROPIC_CUSTOM_HEADERS` changes which headers ride the child's API requests. Whether
+the token-refresh request carries the headers it names was not settled, so what that removal
+changes about the refresh is listed below as open.
+
+`HTTPS_PROXY` stays inherited. The 2026-11-02T05:18:35Z run and the 2026-11-02T05:46:18Z arms set
+it, with `HTTP_PROXY`, `https_proxy` and `http_proxy`, to a loopback proxy that refused every
+request with 403. The 2026-11-01T22:37Z and 2026-11-02T05:14:47Z runs set no proxy. In the proxied
+runs, the refresh child's `CONNECT`s to `platform.claude.com:443` and to `api.anthropic.com:443`
+went to that proxy, so none opened a TLS session through it. The 2026-11-02T05:18:35Z run and each
+arm left its credentials file unchanged. The control arm ran until its 75 s timeout, longer than the
+refresh seam's 40 s `SPAWN_TIMEOUT` (`src/isolated_spawn.rs`). At the refresh seam, that bound would
+kill such a child first, so sessiometer would see a refresh that did not land. That last point is
+inferred from the bound, not run. This entry reads the membership rule as not reaching the proxy: a
+`CONNECT` tunnel relays TLS to the host the client chose, rather than choosing that host. That is
+analysis, not a recorded decision. Whether a proxy could read the credential was not examined.
+
+**Which process inherits them.** The `poke` and `login` verbs spawn the refresh and login children
+from the operator's own shell, so each run carries that shell's environment. A daemon started from a
+shell inherits that shell's environment too. The managed macOS agent's plist carries only
+`XDG_CONFIG_HOME` (`passthrough_environment` in `src/service.rs`), and the app-embedded
+`apps/menubar/LaunchAgents/org.sessiometer.agent.plist` carries no `EnvironmentVariables` key at all.
+But launchd also hands its agents the variables `launchctl setenv` sets in the user's context, so
+neither plist alone bounds it. The repository ships no Linux service definition — `src/service.rs`
+renders only a launchd plist — so on Linux the daemon has whatever environment its starter gives it.
+
+**What stays inherited beside them.**
+
+- `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`, `LKe`'s other companion. It stays inherited, and
+  issue #1626 holds it. In the host classification `pi()` at 184418421 it decides only for a base
+  URL that is set. `pi()` returns true when the variable is set, and otherwise returns `Of()` at 184418502.
+  `Of()` already returns true when `ANTHROPIC_BASE_URL` is unset. So with the base URL removed,
+  `pi()` has nothing left for the variable to classify. `Ikn()`, `Son()` and `jdr()` also read it,
+  whatever the base URL. `Ikn()` at 191057856 returns false off first-party, or when `pi()` is
+  false. Otherwise it returns true on it, and failing that returns `z9()` at 191058155, in the same
+  chunk:
+  `if(a.ANTHROPIC_BASE_URL!==void 0||!dK())return!0;let e=Ole();return e===null||e!==void 0&&$g(e)`.
+  On first-party, `Son()` at 194845225 returns true on it, and otherwise runs that same test
+  inline. Off first-party it returns true, but both its callers, `Ufr()` at 194845688 and `jfr()`
+  at 194845961 in its own chunk, call it only under `case "firstParty"`. `jdr()` at 194770498 skips
+  a check on it. So with `ANTHROPIC_BASE_URL` unset, `Ikn()` and `Son()` classify
+  the value `Ole()` returns rather than that variable. The gateway model-discovery log in `vps()` at
+  186713455 names the variable too. Those reads were not traced to a credential or a host.
+- `CLAUDE_CODE_API_BASE_URL`. `Zd()` at 191322218 is
+  `return process.env.ANTHROPIC_BASE_URL||process.env.CLAUDE_CODE_API_BASE_URL||"https://api.anthropic.com"`.
+  In the 2026-11-02 read it feeds only the Files API helpers. With `ANTHROPIC_BASE_URL` removed,
+  `Zd()` falls through to an inherited `CLAUDE_CODE_API_BASE_URL`. The helpers' header builder
+  `wE()` at 191322666 sends its caller's `oauthToken` as `Authorization: Bearer`. Each helper sends
+  it to `config.baseUrl||Zd()`, so `Zd()` decides the host only for a caller that passes no
+  `baseUrl`. Every caller found on 2026-11-02 passes one: `cn().BASE_API_URL`, or
+  `ANTHROPIC_BASE_URL||cn().BASE_API_URL`. So no path was found on which an inherited
+  `CLAUDE_CODE_API_BASE_URL` receives a token. Whether the refresh or login child reaches those
+  callers, and whose token each passes, is listed under what the read did not settle. It stays
+  inherited, and issue #1626 holds it.
 
 ## Left out of the scrub, and why
 
 ### Left out by the ratified scope
 
 The scope ratified on issue #1535 (2026-11-01) leaves out every input that bypasses or redirects the
-claude.ai login without supplying a credential, each to be filed as its own issue. It also leaves
-out Claude Code's fixed-path token files, which no environment scrub reaches.
+claude.ai login without supplying a credential, each to be filed as its own issue. It named
+`ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS` among them. Both joined the list under
+issue #1625 (above), whose analysis classed `ANTHROPIC_CUSTOM_HEADERS` as a supplier and the
+redirector's companion. Issue #1626 holds the rest. The scope also leaves out Claude Code's
+fixed-path token files, which no environment scrub reaches; issue #1618 holds them.
 
-- **`ANTHROPIC_BASE_URL`.** At 2.1.294 it sets the API client's base URL:
-  `...a.ANTHROPIC_BASE_URL?{baseURL:a.ANTHROPIC_BASE_URL}:!1` at 191068512. On its own it selects
-  no credential. Of the credential-selection functions this read decoded, only the gateway test
-  `kl()` reads it, and only once `CLAUDE_CODE_USE_GATEWAY` is set (below). Whatever credential the
-  child selects goes to that host.
-  - Once the five credential inputs above are scrubbed, an inherited value sends the seeded
-    claude.ai token to that host. That is inferred from the shared builder and client, not
-    measured: the runtime check below used an environment token, and whether any call after
-    `/login` uses this base URL was not traced. It holds while the gate stays open — no
-    gate-closer in the table above is inherited — and the builder reaches the keychain item, which
-    an inherited `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` (below) prevents; the refresh child's
-    bearer is then the seeded item's access token.
-  - That was already true before this change whenever `ANTHROPIC_BASE_URL` was inherited under
-    those two conditions. One such case is `ANTHROPIC_BASE_URL` inherited together with
-    `ANTHROPIC_API_KEY`, which was already scrubbed.
-  - This change makes it reachable in four more cases. `ANTHROPIC_BASE_URL` with
-    `ANTHROPIC_AUTH_TOKEN` is the usual bearer-gateway setup; before this change, the child sent
-    the operator's own gateway token there instead. The other three are `ANTHROPIC_BASE_URL` with
-    `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `ANTHROPIC_BASE_URL` with a readable
-    `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, and `CLAUDE_CODE_USE_GATEWAY` with
-    `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`. In the last case, without the token, `kl()`
-    logs `ignoring` and the provider reverts to first-party. That reversion is a medium-confidence
-    reading.
-  - The runtime check ran on 2026-11-01, in the investigation behind the ratified scope, and was not
-    re-run for this entry. It used stock 2.1.294, a throwaway `HOME` and `CLAUDE_CONFIG_DIR`, a
-    dummy `CLAUDE_CODE_OAUTH_TOKEN`, and `ANTHROPIC_BASE_URL` pointed at a loopback listener on
-    `127.0.0.1`. The run made two `POST /v1/messages?beta=true` requests, and both reached the
-    listener. Each carried the dummy token as `Authorization: Bearer` and no `x-api-key`. The
-    client does not strip the bearer for a non-Anthropic host.
-  - Which process inherits it. The `poke` and `login` verbs spawn the refresh and login children
-    from the operator's own shell, so each run carries that shell's environment. A daemon started
-    from a shell inherits that shell's environment too. The managed macOS agent's plist carries
-    only `XDG_CONFIG_HOME` (`passthrough_environment` in `src/service.rs`), and the app-embedded
-    `apps/menubar/LaunchAgents/org.sessiometer.agent.plist` carries no `EnvironmentVariables` key at
-    all, but launchd also hands its agents the variables `launchctl setenv` sets in the user's
-    context, so neither plist alone bounds it. The repository ships no Linux service definition —
-    `src/service.rs` renders
-    only a launchd plist — so on Linux the daemon has whatever environment its starter gives it.
-  - The ratified scope names it.
 - **`ANTHROPIC_UNIX_SOCKET`.** It closes the gate unless `CLAUDE_CODE_OAUTH_TOKEN` is set. The
   ratified scope names it.
 - **Provider selectors.** `CLAUDE_CODE_USE_BEDROCK` and its siblings in the gate table close the
-  gate. `CLAUDE_CODE_USE_GATEWAY` selects the gateway through `kl()` at 187026260, but only when
-  `ANTHROPIC_BASE_URL` is set and a gateway token is found. That token is `ANTHROPIC_AUTH_TOKEN`, or
-  one from `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR` or the snapshot (`Qit()` at 186263815).
-  Without one, `kl()` logs `CLAUDE_CODE_USE_GATEWAY is set but …; ignoring` (187026393) and returns
-  false. The ratified scope names `CLAUDE_CODE_USE_BEDROCK` and its siblings.
-- **`ANTHROPIC_CUSTOM_HEADERS`.** The SDK merges the client's default headers after its auth
-  headers (190649800). The custom headers ride in those defaults (parsed near 191069984), so a
-  header this variable names replaces the auth header Claude Code built. The ratified scope names
-  it.
+  gate. `CLAUDE_CODE_USE_GATEWAY` is read by `kl()` at 187026260, which accepts the gateway only
+  when `ANTHROPIC_BASE_URL` is set and a gateway token is found. That token is
+  `ANTHROPIC_AUTH_TOKEN`, or one from `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR` or the snapshot
+  (`Qit()` at 186263815). Without one, `kl()` logs `CLAUDE_CODE_USE_GATEWAY is set but …; ignoring`
+  (187026393) and returns false. With one, `kl()` fills the `gatewayAuth` slot the provider resolver
+  reads, or finds it already filled (§ What `SPAWN_ENV_REMOVE` removes, and why). What else can set
+  the provider to `gateway` is listed under what the read did not settle. The ratified scope names
+  `CLAUDE_CODE_USE_BEDROCK` and its siblings.
 - **The well-known token files** `/home/claude/.claude/remote/.oauth_token` and
   `/home/claude/.claude/remote/.api_key`. The reader tries them on every host when the descriptor
   variable is unset. No environment scrub reaches a fixed path, and the ratified scope leaves them
@@ -2226,104 +2572,198 @@ out Claude Code's fixed-path token files, which no environment scrub reaches.
 ### Found by this entry's read, outside the ratified scope
 
 The read behind the ratified scope recorded these only in part, or not at all. Each is left out
-because the ratified scope adds three variables and no others. Each is proposed as its own issue.
+because the ratified scope adds only `ANTHROPIC_AUTH_TOKEN`,
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` and `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`. Issue #1626
+holds the bypass inputs this subsection lists. It also holds `CLAUDE_BG_AUTH_SNAPSHOT_PATH`,
+`CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR`, `CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR`,
+`CCR_AGENT_PROXY_TOKEN_FILE_DESCRIPTOR` and `CLAUDE_CODE_API_BASE_URL`. It leaves
+`CLAUDE_CODE_REMOTE`, `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_HOST_AUTH_ENV_VAR` undecided. The
+fixed-path token files are issue #1618. Sweeping the descriptors the process inherits at start, so
+that no spawned child inherits one, is issue #1622. A drift canary for this precedence is
+issue #1620, and the question whether the scrub should become an allowlist is issue #1619.
 
 - **`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`.** When set, the builder returns before it reads the
   keychain item, so the claude.ai login goes unused. It supplies no credential, which makes it a
   bypass input of the same kind as `ANTHROPIC_UNIX_SOCKET`.
 - **`CLAUDE_BG_AUTH_SNAPSHOT_PATH`.** It names a file that supplies an OAuth access token or a
   gateway token. The builder reads it before the keychain item but ranks it below the item. It ranks
-  above only when `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` is set or the item holds no access token.
-  The second condition holds in the login spawn, whose isolated item starts empty. The read behind
-  the ratified scope recorded it only as "a background snapshot", without the variable. Claude Code
-  clears this variable in the environment it builds for its own bridge workers
-  (`CLAUDE_BG_AUTH_SNAPSHOT_PATH:void 0` at 210029419), together with the five variables on its
+  above only when `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` is set, or the item holds no access token
+  or cannot be read. The second condition holds in the login spawn, whose isolated item starts
+  empty. The read behind the ratified scope recorded it only as "a background snapshot", without the
+  variable. Claude Code clears this variable in the environment it builds for its own bridge workers
+  (`CLAUDE_BG_AUTH_SNAPSHOT_PATH:void 0` at 210029419), together with every variable on its
   credential-descriptor list (184660438): `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`,
   `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`,
   `CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR` and `CCR_AGENT_PROXY_TOKEN_FILE_DESCRIPTOR`.
 - **Profile and workload identity.** `ANTHROPIC_PROFILE`, and `ANTHROPIC_FEDERATION_RULE_ID` with
-  `ANTHROPIC_ORGANIZATION_ID`, close the gate in favour of that identity. So does a stored profile
-  that `ANTHROPIC_CONFIG_DIR`, `XDG_CONFIG_HOME` or `HOME` locates. The managed macOS agent passes
+  `ANTHROPIC_ORGANIZATION_ID`, can close the gate in favour of that identity. So can a stored
+  profile that `ANTHROPIC_CONFIG_DIR`, `XDG_CONFIG_HOME` or `HOME` locates. Not every one does, and
+  when each does is listed under what the read did not settle. The managed macOS agent passes
   `XDG_CONFIG_HOME` through, so a profile stored under it reaches that daemon's children too.
   `XDG_CONFIG_HOME` and `HOME` locate far more than the profile store, so no scrub can take them.
 - **`CLAUDE_CODE_SIMPLE`.** It closes the gate, and the builder's accessor returns nothing under it.
   It supplies no credential, which makes it a bypass input.
-- **`CLAUDE_CODE_REMOTE`, `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_HOST_AUTH_ENV_VAR`.** They decide
-  whether some gate rows apply, and supply no credential. With the five scrubbed, the rows they can
+- **`CLAUDE_CODE_REMOTE`, `CLAUDE_CODE_ENTRYPOINT` and `CLAUDE_CODE_HOST_AUTH_ENV_VAR`.** They
+  decide whether some gate rows apply, and supply no credential. With `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` scrubbed, the rows they can
   cancel are left holding only `apiKeyHelper` and the well-known API-key file. Cancelling a row
-  opens the gate, and the builder above then decides. `CLAUDE_CODE_HOST_AUTH_ENV_VAR` holds the
-  name of another variable: `k9()` at 184663427 returns that name unless it is one of Claude Code's
-  own selectors, and `yEt()` at 187655538 defaults it to `ANTHROPIC_AUTH_TOKEN`. Of the functions
-  this read decoded, only the host-auth 401 recovery (194806723) reads the named variable's value;
-  it runs while a host application has registered a refresh callback (`WFe()` at 184040688), and
-  it compares and replaces that value. The gate, the labelling function and the bearer header read
-  `ANTHROPIC_AUTH_TOKEN` directly: `Ab()` at 187044531 is
-  `return hw()?void 0:a.ANTHROPIC_AUTH_TOKEN`, and `hw()` is `return!1`. So the pair supplies no
-  credential to the child's selection in this build. The variable also marks the environment as
-  host-managed (187669076) and is kept in the environments Claude Code builds for its own children
-  (198073822); what those two change was not traced, and what else `CLAUDE_CODE_REMOTE` and
-  `CLAUDE_CODE_ENTRYPOINT` change outside the gate was not traced either.
+  opens the gate, and the builder above then decides. `CLAUDE_CODE_HOST_AUTH_ENV_VAR` holds the name
+  of another variable: `k9()` at 184663427 returns that name unless it is one of Claude Code's own
+  selectors, and `yEt()` at 187655538 defaults it to `ANTHROPIC_AUTH_TOKEN`. None of the
+  credential-selection functions this read decoded reads the named variable's value. The gate, the
+  labelling function and the bearer header read `ANTHROPIC_AUTH_TOKEN` directly: `Ab()` at
+  187044531 is `return hw()?void 0:a.ANTHROPIC_AUTH_TOKEN`, and `hw()` is `return!1`. So naming a
+  variable through `CLAUDE_CODE_HOST_AUTH_ENV_VAR` adds no credential to the child's selection in
+  this build. Outside credential selection, the host-auth 401 recovery (194806723) reads the named
+  variable's value. It runs while a host application has registered a refresh callback (`WFe()` at
+  184040688), and it compares and replaces that value. The code that builds the environments Claude
+  Code gives its own children also reads the named variable's value (198073822).
+  `CLAUDE_CODE_HOST_AUTH_ENV_VAR` itself marks the environment as host-managed (187669076). What
+  that child-environment read and the host-managed marker change was not traced. What else
+  `CLAUDE_CODE_REMOTE` and `CLAUDE_CODE_ENTRYPOINT` change outside the gate was not traced either.
 - **`CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR`.** It supplies a token only for the gateway, in the
-  paths this read traced: `kl()` reads it once `CLAUDE_CODE_USE_GATEWAY` and `ANTHROPIC_BASE_URL`
-  are set (above). It is on Claude Code's own credential-descriptor list (184660438). The ratified
-  scope does not name it, and it adds three variables and no others.
+  paths this read traced. `kl()` reads it through `Qit()` once `CLAUDE_CODE_USE_GATEWAY` is set and
+  `ANTHROPIC_AUTH_TOKEN` is not, and uses it only with `ANTHROPIC_BASE_URL` set (above). It is on
+  Claude Code's own credential-descriptor list (184660438). The ratified scope does not name it.
+- **`CLAUDE_CODE_CUSTOM_OAUTH_URL`.** It is eligible. An allow-listed value selects the keychain
+  service suffix `-custom-oauth`, and rebinds `TOKEN_URL`, where the token refresh posts (`cn()` at
+  184092173). Any other non-empty value makes every `cn()` call throw. The ratified scope names it
+  neither way. Whether it joins the list is left to its own issue, not to issue #1626. What else it
+  changes is listed under what the read did not settle.
 - **`CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR` and `CCR_AGENT_PROXY_TOKEN_FILE_DESCRIPTOR`.** Both
   are on Claude Code's own credential-descriptor list (184660438), and its bridge-worker environment
   clears both. Neither appears in the gate, the builder, the resolver, or any helper this read
-  decoded. The websocket one has two readers of its own, `x()` at 186264793 and `Dys()` beside it,
-  for a session-ingress token file. The gate, the builder and the resolver call neither directly.
+  decoded. The websocket one has readers of its own, `x()` at 186264793 and `Dys()` beside it, for
+  a session-ingress token file. The gate, the builder and the resolver call neither directly.
 
 ## What the read did not settle
 
-- Whether `ken()` or `Cen()`, the provider resolver's other two gateway tests, select the gateway
-  from a gateway token alone. Only `kl()` was decoded.
-- Whether the provider really reverts to first-party after `kl()` ignores `CLAUDE_CODE_USE_GATEWAY`.
-  That needs `co()`, `ken()` and `Cen()` all false, and none of the three was decoded.
+- What else makes the provider resolver return `gateway`. `Pe()` at 184417401 returns `gateway` when
+  `co()`, `ken()` or `Cen()` holds, and each reads a host credential slot (`gatewayAuth` at
+  184051285, `gatewayServerProcess` at 184051670, `gatewayRequiredByHostPolicy` at 184051825).
+  `CLAUDE_CODE_USE_GATEWAY` reaches it through `kl()`, which fills `gatewayAuth` through `eQ()`
+  (§ What `SPAWN_ENV_REMOVE` removes, and why). Every write of a credential into `gatewayAuth` goes
+  through `eQ()`. Besides `kl()`, the callers of `eQ()` that fill the slot are `cYt()`'s
+  stored-gateway restore and a gateway sign-in flow. Its other callers update a credential already
+  in the slot, or clear it. `eQ()` is also exported under the name `setGatewayAuth`, whose users
+  were not traced. Whether a stashed item carries an `enterpriseGateway` entry in practice was not
+  settled; the refresh seed keeps one if it does. Init sets the reader behind `Cen()` to `KDe()`.
+  Whether `KDe()` or `ken()` can hold for a refresh or login child was not traced. Whether a host
+  fills a gateway slot for a CLI child was not settled either. Any of these would keep the provider
+  at `gateway` after `kl()` ignores `CLAUDE_CODE_USE_GATEWAY`.
+- Which refresh call the refresh child makes first, and whether init's `cYt()` runs before it,
+  with its `kl()` call and its stored-gateway restore. A caller that passes
+  `usesLoginOffFirstParty: true` to `j7()` skips the provider check in `Pl()`.
+- Whether a later write changes the interactive mark `pn()` sets at start-up, in a refresh or login
+  child. The `ht(!0)` call at 183769094, where `ht` is `setIsInteractive`, marks the process
+  interactive. It sits on the path that starts the `agents_view` session type. The launch options'
+  `reset()` at 184011406 marks it non-interactive. Who calls `reset()`, whether either write runs
+  in these children, and whether other writes exist was not traced.
+- Who records the approval that an interactive child needs before the resolver takes
+  `ANTHROPIC_API_KEY`.
+- Exactly when a profile or a workload identity closes the gate. `ld()` at 187040298 returns false
+  for some of them, so not every such input closes it. Its full conditions were not enumerated.
 - Which scope a token must carry before the labelling function reports `claude.ai`. Its test `t2()`
   was not read.
 - What the login spawn does with an inherited `CLAUDE_BG_AUTH_SNAPSHOT_PATH`, whose token the
   builder falls back to while the isolated item is empty.
-- Whether the keychain-token path sends the seeded token to `ANTHROPIC_BASE_URL`. The runtime
-  check used an environment token; the keychain path is inferred from the shared builder and
-  client.
-- Whether any request after `/login` uses `ANTHROPIC_BASE_URL`.
+- Whether the macOS keychain read behaves as the plaintext store did in the 2026-11-02T05:14:47Z
+  run, which sent the stored token to an inherited base URL. That run's store was the plaintext
+  file, so the keychain read itself was not exercised.
+- Which bearer the refresh child sends to an inherited base URL under the refresh seam's own seed.
+  sessiometer back-dates that seed's `expiresAt` (`backdate` in `src/refresh.rs`). `EN` awaits the
+  refresh check `j7()` before it reads the bearer with `Te=mn()`, and that order is a static read.
+  No run measured this case: the 2026-11-02T05:14:47Z run's stored token was unexpired and had no
+  refresh token.
+- Whether a refresh that succeeds is written back to the item while the request carries an
+  inherited credential.
+- Whether the token-refresh request carries the headers `ANTHROPIC_CUSTOM_HEADERS` names.
+- Which `Authorization` value the first-party client sends when `ANTHROPIC_CUSTOM_HEADERS` also
+  names `Authorization` in another letter case, and `Y9()` writes its own.
+- How each of `EN`'s provider branches treats a custom `Authorization`. The issue #1625 subsection
+  records the client branches by class, and that record was not checked for completeness.
+- Whether an inherited `HTTPS_PROXY` lets a proxy read the credential the child sends. This entry
+  reads the membership rule as not reaching the proxy, and that reading is analysis, not a recorded
+  decision (§ `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, added under issue #1625).
+- What `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` changes through `Ikn()`, `jdr()` and `Son()`,
+  which read it whatever the base URL. The `Ole()` that `Son()` calls, and `Ikn()` reaches through
+  `z9()`, is the one their chunks import from `chunk-k1d76t3c.js`, at 190473880 and 192126671. The
+  only export list that carries `Ole`, at 190239571, binds it to
+  `function Ole(){return A().resolvedBaseUrlSnapshot}` at 190233160. A second `function Ole(`, at
+  215211050, is not exported. What `resolvedBaseUrlSnapshot` holds was not traced.
+- Whether Claude Code sends other requests that carry the login's token without consulting the
+  gate.
+- Whether the refresh or login child reaches a caller of the Files API helpers `Zd()` feeds, and
+  whose token each caller hands to `wE()`. `wE()` sends that token as `Authorization: Bearer`. The
+  callers found pass their own `baseUrl`, so none was found on which an inherited
+  `CLAUDE_CODE_API_BASE_URL` decides the host.
 - How the key `/login` stored is read: the helpers behind `RTt()` were not decoded.
 - Whether the 2.1.207 labelling function had an `ANTHROPIC_API_KEY` branch. No 2.1.207 binary was
   read for this entry; the comparison with `# Issue #466` starts after the chain's first link.
-- What the host-managed marker and the child-environment copy that `CLAUDE_CODE_HOST_AUTH_ENV_VAR`
-  feeds (187669076, 198073822) change, and what else `CLAUDE_CODE_REMOTE` and
-  `CLAUDE_CODE_ENTRYPOINT` change outside the gate.
+- What the host-managed marker that `CLAUDE_CODE_HOST_AUTH_ENV_VAR` sets (187669076) changes. What
+  the child-environment code at 198073822 does with the value of the variable
+  `CLAUDE_CODE_HOST_AUTH_ENV_VAR` names. What else `CLAUDE_CODE_REMOTE` and `CLAUDE_CODE_ENTRYPOINT`
+  change outside the gate.
+- What else `CLAUDE_CODE_CUSTOM_OAUTH_URL` changes. `cn()` at 184092173 reads it. An allow-listed
+  value rebinds `TOKEN_URL`, the token endpoint (§ What `SPAWN_ENV_REMOVE` removes, and why). It
+  also selects the keychain service suffix `-custom-oauth` (`# Issue #100`, its `OAUTH_FILE_SUFFIX`
+  bullet). Any other non-empty value makes every `cn()` call throw. What the other URLs `cn()`
+  rebinds change, and where else the variable is read, was not traced. `SPAWN_ENV_REMOVE`'s doc
+  records the variable as eligible and leaves whether it joins the list to its own issue.
 - Anything outside the functions above. This entry is not a census of every environment read in
   the binary.
 - Later builds. No build after 2.1.294 was read.
 
 ## What would falsify this
 
-- A 2.1.294 path that uses the claude.ai login while the gate returns false. The gate table would
-  then not decide what the child authenticates with.
-- `b9()` testing that a descriptor is readable, rather than that its variable is set. Then
-  `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` would select only when its descriptor is open, and Rule 5's
-  third scenario in `docs/specs/spawn-env-scrub.feature.md` would be wrong.
+- A 2.1.294 request from an API client `EN` builds that carries the claude.ai login's access token
+  while the gate returns false. The gate table would then not decide what those clients
+  authenticate with. A request from other code does not count here; whether one carries the
+  login's token without the gate is listed under what the read did not settle.
 - A run in which an inherited `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, set to a value non-empty after
-  trimming, with `CLAUDE_CODE_REMOTE` unset and `CLAUDE_CODE_ENTRYPOINT` neither `claude-desktop`,
-  `claude-desktop-3p` nor `local-agent`, leaves the refresh child refreshing the seeded item. That
-  would contradict the gate reading above.
-- `kA()` returning true on some host. The well-known files would then not be read there.
+  trimming, with nothing open on the descriptor it names, `CLAUDE_CODE_REMOTE` unset and
+  `CLAUDE_CODE_ENTRYPOINT` neither `claude-desktop`, `claude-desktop-3p` nor `local-agent`, leaves
+  the API clients `EN` builds in the refresh child carrying the seeded claude.ai login. That would
+  contradict the gate reading above. A refresh attempt would not. In the 2026-11-02T05:46:18Z
+  run's arm for this input, the child attempted one `CONNECT` to the token host, which the proxy
+  refused. The arm exited 1 after 1.8 s, with `Not logged in · Please run /login` on its stdout.
+- A 2.1.294 run with no managed provider policy, in which `ANTHROPIC_BASE_URL` names another
+  host. In it, the first-party client of the API client builder `EN` sends that host no request.
+  That would break the reading of `ANTHROPIC_BASE_URL` as a redirector. The 2026-11-01T22:37Z and
+  2026-11-02T05:14:47Z runs each recorded two `POST /v1/messages?beta=true` requests reaching the
+  loopback listener the base URL named. The first run's requests carried an environment token as
+  the bearer, and the second's an unexpired stored token with no refresh token.
+- A 2.1.294 request from that first-party client whose `Authorization` header is not the custom
+  value, sent while `ANTHROPIC_CUSTOM_HEADERS` names `Authorization` once, in that exact letter
+  case. The request must also be sent while `Me` holds: the gate is open and the OAuth token
+  carries `user:inference`. That would break the reading of `ANTHROPIC_CUSTOM_HEADERS` as a
+  supplier. No run set that variable.
+- A 2.1.294 run with the gate open, `CLAUDE_CODE_OAUTH_TOKEN` unset, simple mode off, no snapshot
+  token and `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` unset, that never opens
+  `/home/claude/.claude/remote/.oauth_token`. `k()` would then not try the well-known file on every
+  host, and `kA()` would not be the constant `return!1` this read found.
 - A 2.1.294 run with the gate open, `CLAUDE_CODE_OAUTH_TOKEN` set and a seeded keychain token
   present, whose requests carry the keychain token. The builder would then not rank the
   environment token ahead of the item.
-- A non-interactive 2.1.294 child outside the VS Code client that, with `ANTHROPIC_API_KEY` set,
-  sends a key from `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`, `apiKeyHelper` or the stored key. The
-  resolver's order would then be wrong.
-- A 2.1.294 status line that, with neither `oqe()` nor `vr()` holding, names a session's source in
-  an order other than `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, the descriptor token,
-  `apiKeyHelper`, `profile`, `claude.ai`, `none`. The labelling order, and its match with the
-  2.1.207 chain after the first link, would then be wrong.
+- A non-interactive 2.1.294 child outside the VS Code client, with `ANTHROPIC_API_KEY` set, whose
+  first-party `EN` client sends as `x-api-key` a key from `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`,
+  `apiKeyHelper` or the stored key. The resolver's order would then be wrong. A bearer that `Y9()`
+  writes from `apiKeyHelper` does not count, because it rides in the default headers beside
+  `x-api-key`.
+- A 2.1.294 status line that, with neither `oqe()` nor `vr()` holding and simple mode off, names a
+  session's source in an order other than `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, the
+  `eM()` token, `apiKeyHelper`, `profile`, `claude.ai`, `none`. The labelling order, and its
+  match with the 2.1.207 chain after the first link, would then be wrong.
 
 Load-bearing at `SPAWN_ENV_REMOVE` in `src/isolated_spawn.rs`, whose doc comment states the
 membership rule and cites this entry. `the_recorded_env_credential_sources_are_scrubbed_by_name`
-pins the five variables by name, and `docs/specs/spawn-env-scrub.feature.md` Rule 5 records them.
-Re-walk on the same trigger as the range: a CC release whose gate, builder or resolver code moved.
-A drift canary for this precedence is outside this issue's ratified scope.
+pins `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` by name, and
+`docs/specs/spawn-env-scrub.feature.md` records it under "Rule 5 — the issue #1535 variables are
+scrubbed too". `the_base_url_and_its_companion_headers_are_scrubbed_by_name` pins
+`ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, and the spec records it under "Rule 6 — the API
+base URL and its companion custom headers are scrubbed". Re-walk on the same trigger as the range: a
+CC release whose gate, builder, resolver or API client code moved. A drift canary for this
+precedence is outside this issue's ratified scope.
 
-CC 2.1.294 · macOS 27.0.1 / 26A434 · sessiometer #1535.
+CC 2.1.294 · macOS 27.0.1 / 26A434 · sessiometer #1535, #1625.

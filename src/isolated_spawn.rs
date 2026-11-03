@@ -11,9 +11,10 @@
 //! single test would catch.
 //!
 //! The seam owns three of the four scaffold pieces the issue names:
-//!   - the child credential / config-override env **scrub** ([`SPAWN_ENV_REMOVE`]), applied at
-//!     [`SpawnPlan::build_command`] for every `claude` child and, since issue #783, at
-//!     [`crate::paths::build_login_shell_env_command`] for the login-shell PATH harvest;
+//!   - the env **scrub** ([`SPAWN_ENV_REMOVE`]) of variables that decide the child's credential or
+//!     the host that receives it, applied at [`SpawnPlan::build_command`] for every `claude` child
+//!     and, since issue #783, at [`crate::paths::build_login_shell_env_command`] for the
+//!     login-shell PATH harvest;
 //!   - the [`IsolatedSession`] RAII **create/teardown** guard; and
 //!   - a reference to the #100 **suffixed-item resolution** ([`crate::keychain::IsolatedKeychainItem`]),
 //!     which already lives behind its own single seam in [`crate::keychain`] and is only *used*
@@ -50,58 +51,119 @@ const BENIGN_PROMPT: &str = "say pong";
 /// classifies whatever state it left (a refresh may already have landed).
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(40);
 
-/// Env vars **unset** on every isolated spawn so the child `claude` acts on the ISOLATED item
-/// and nothing else — the security-critical scrub (issue #102 step 4).
+/// Env vars **unset** on every isolated spawn — the security-critical scrub (issue #102 step 4).
+/// CC reads each one to decide the credential the child `claude` uses, or the host that receives
+/// it. The refresh spawn, the login spawn and the issue #783 login-shell PATH harvest remove them,
+/// so the child acts on the ISOLATED item and nothing else.
 ///
 /// **Membership rule.** A variable is eligible for this list when CC reads it from the
 /// environment to decide which credential, which credential store, or which OAuth client
-/// identity the child authenticates or refreshes with — selecting a source as well as supplying
-/// one. Inherited, such a variable would make the child act on something other than the item
-/// seeded for it. Eligibility is not membership: the scope ratified for each issue decides which
-/// eligible variables join, and a variable the engine itself depends on stays inherited (`USER`,
-/// below).
+/// identity the child authenticates or refreshes with. Selecting a source counts as well as
+/// supplying one. Inherited, such a variable would make the child act on something other than
+/// the item seeded for it.
+/// A variable is also eligible when CC reads it to decide which host receives the
+/// credential the child authenticates with. Inherited, such a variable would send that
+/// credential to a host the parent environment chose.
+/// Eligibility is not membership: the scope ratified for each issue decides which eligible
+/// variables join, and a variable the engine itself depends on stays inherited (`USER`, below).
 ///
 /// Where each input sits relative to the claude.ai login was read out of the stock Claude Code
 /// 2.1.294 binary. `build/version-compat.md` § "Issue #1535 — environment inputs Claude Code
 /// consults ahead of the claude.ai login (CC 2.1.294)" records that precedence with its evidence.
 /// It also lists the inputs that read traced and this list leaves out, each with its reason. The
-/// list does not hold every eligible variable, and that section is not a census of them. Two
-/// eligible inputs sit outside that read. `CLAUDE_CODE_CUSTOM_OAUTH_URL`, when its value is
-/// allow-listed, selects the keychain service suffix (read at 2.1.227–2.1.233, below) and is not
-/// on this list: the scope ratified on issue #1535 adds three variables and no others, and names
-/// this one neither way, so whether it joins the list is left to its own issue. `USER` decides the
-/// item's `acct`, and it must stay inherited: the engine seeds the item under the `acct` CC
-/// derives from it (`claude_code_acct_from` in `src/keychain.rs`, issue #711), so scrubbing it
-/// would point the child at a different item whenever `USER` differs from the passwd name.
+/// list does not hold every eligible variable, and that section is not a census of them.
+/// `CLAUDE_CODE_CUSTOM_OAUTH_URL` is eligible and is not on this list. When its value is
+/// allow-listed, it selects the keychain service suffix (read at 2.1.227–2.1.233, below). At
+/// 2.1.294 such a value also moves the token endpoint CC posts a refresh to. Any other non-empty
+/// value makes CC's OAuth config resolver throw. The ledger section records these effects. The
+/// scope ratified on issue #1535 adds only `ANTHROPIC_AUTH_TOKEN`,
+/// `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` and `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`. It names
+/// this one neither way, so whether it joins the list is left to its own issue. `USER` is eligible
+/// too. It sits outside the read of the 2.1.294 binary, and this doc comment records its role. It
+/// decides the item's `acct`. It must stay inherited, because the engine seeds the item under the
+/// `acct` CC derives from it (`claude_code_acct_from` in `src/keychain.rs`, issue #711). Scrubbing
+/// it would point the child at a different item whenever `USER` differs from the passwd name.
 ///
-/// Five members are env credential inputs. Inherited by the refresh child, each keeps it off the
-/// seeded item under the condition its entry names, and the refresh then silently no-ops. Their
-/// roles differ:
+/// The env credential inputs that follow are ones CC consults ahead of the claude.ai login at
+/// 2.1.294. Their roles differ:
 ///   - `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` SUPPLY an OAuth
-///     token that outranks the keychain item. The first holds the token. The second names a
-///     descriptor CC reads one from, and that token wins only while the descriptor is readable.
-///   - `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` SUPPLY a credential, and each also closes
-///     the gate that decides whether CC uses the claude.ai login at all. `ANTHROPIC_API_KEY`
-///     closes it whenever CC picks it as the API key, which a non-interactive child outside the
-///     VS Code client always does. Neither closes it while the exemption the ledger calls `oqe()`
-///     holds: `CLAUDE_CODE_HOST_AUTH_ENV_VAR` unset, `CLAUDE_CODE_ENTRYPOINT` not
-///     `claude-desktop-3p`, and either `CLAUDE_CODE_REMOTE` set or `CLAUDE_CODE_ENTRYPOINT` equal
-///     to `claude-desktop` or `local-agent`. The ledger section describes that test, and this list
-///     removes none of those three variables.
+///     token. The first holds the token, which outranks the keychain item. The second names a
+///     descriptor CC reads one from. That token outranks the item while the descriptor is readable
+///     and no access token from the `CLAUDE_BG_AUTH_SNAPSHOT_PATH` snapshot was consumed first.
+///     The ledger's builder finding records the mechanism.
+///   - `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` SUPPLY a credential. Each can also close the
+///     gate that decides whether the API clients CC's client builder makes use the claude.ai
+///     login. The ledger's gate finding says when each does. The token refresh does not call that
+///     gate, though it does read the gate's provider test. The ledger section records when that
+///     test skips the refresh. `ANTHROPIC_API_KEY` can close the gate when CC picks it as the API
+///     key. CC's start-up marks a `-p` child non-interactive. So outside the VS Code client, CC
+///     picks it in the refresh child whenever it is set. The login child inherits sessiometer's
+///     terminal stdout, so CC marks it interactive. Outside simple mode (`CLAUDE_CODE_SIMPLE` or
+///     `--bare`), the login child takes the key only once the key has been approved. Whether a
+///     later write changes the refresh child's non-interactive mark or the login child's
+///     interactive mark is open in the ledger section. So is who records that approval. Neither
+///     input closes the gate while the exemption the ledger calls `oqe()` holds.
 ///   - `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` both SELECTS and SUPPLIES. Set to a value that is
-///     non-empty after trimming, it closes that same gate whether or not its descriptor can be
-///     read, unless the exemption the ledger calls `vr()` holds: `CLAUDE_CODE_REMOTE` set, or
-///     `CLAUDE_CODE_ENTRYPOINT` equal to `claude-desktop`, `claude-desktop-3p` or `local-agent`.
-///     And while the descriptor is readable, CC reads the API key the child sends from it, through
-///     the same reader as the OAuth descriptor above; the resolver labels that key
-///     `ANTHROPIC_API_KEY`, so the `ANTHROPIC_API_KEY` row then closes the gate as well, under
-///     the `oqe()` exemption rather than this one.
+///     non-empty after trimming, it can close that same gate, whether or not its descriptor can be
+///     read. The exemption the ledger calls `vr()` cancels that closure. While the descriptor is
+///     readable, CC also reads from it the API key the child sends. It uses the same reader as for
+///     `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` above. CC's API-key resolver, which the ledger
+///     calls the resolver, labels that key `ANTHROPIC_API_KEY`. So that key can close the gate as
+///     `ANTHROPIC_API_KEY` does. That closure falls under the `oqe()` exemption, not the `vr()`
+///     exemption.
 ///
-/// Removing the three issue #1535 members also lets an inherited `ANTHROPIC_BASE_URL`, which is
-/// not on this list, receive the seeded item's token — while the gate stays open and the builder
-/// reaches the keychain item, which an inherited `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` prevents.
-/// The ledger section records that under the inputs it leaves out, as inferred from the shared
-/// builder and client rather than measured: its runtime check used an environment token.
+/// `oqe()` and `vr()` are minified 2.1.294 names. The ledger's Names row records that such names
+/// change between builds, and its gate finding describes both tests. `vr()` holds when
+/// `CLAUDE_CODE_REMOTE` is set, or when `CLAUDE_CODE_ENTRYPOINT` equals `claude-desktop`,
+/// `claude-desktop-3p` or `local-agent`. `oqe()` holds when `vr()` holds,
+/// `CLAUDE_CODE_HOST_AUTH_ENV_VAR` is unset and `CLAUDE_CODE_ENTRYPOINT` is not
+/// `claude-desktop-3p`. This list removes none of the variables `oqe()` and `vr()` read.
+///
+/// The ledger section records what `CLAUDE_CODE_OAUTH_TOKEN`,
+/// `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+/// `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` each did to the refresh child in its 2026-11-02T05:46:18Z
+/// run, one arm per input. It also records what that run did not measure.
+///
+/// `ANTHROPIC_BASE_URL` decides where CC's first-party API client sends the child's credential.
+/// CC lists two companions for it. `ANTHROPIC_CUSTOM_HEADERS` is one of them, and a supplier in its
+/// own right; it is the only one of the two this list removes. Issue #1625 added the base URL and
+/// the custom headers. The ledger section records the evidence, read out of 2.1.294:
+///   - `ANTHROPIC_BASE_URL` sets the base URL of CC's first-party API client. CC's client builder
+///     chooses the credential first. Without a managed provider policy, no host test sits between
+///     that choice and the base URL. In that case, whatever credential the child selects goes to
+///     that host on that client, the seeded item's token included. The 2026-11-02T05:14:47Z run
+///     measured a dummy stored token arriving at an inherited base URL as the bearer. That token
+///     was unexpired and had no refresh token.
+///     Its store was the plaintext credentials file, so the macOS keychain read was not exercised.
+///     For the keychain item the claim rests on the shared builder and client. sessiometer
+///     back-dates the seed it gives the refresh child, and the ledger section lists that case as
+///     unmeasured.
+///   - `ANTHROPIC_CUSTOM_HEADERS` goes into the client's default headers, which the SDK merges
+///     after the auth headers it builds from the client's options. A header it names replaces an
+///     earlier header of the same name. So on CC's first-party API client, a custom
+///     `Authorization` header replaces the bearer the SDK built, and headers of other names ride
+///     beside the auth headers. CC can also write its own `Authorization` over a custom one, under
+///     conditions the ledger section records. Its other client branches can drop or replace a
+///     custom one. The ledger section records the branches its read decoded.
+///     Replacing the bearer makes the input eligible as a supplier. That is a static read: no run
+///     set this variable. CC also lists it as one of the base URL's two companions. It is removed
+///     together with the base URL because, with only the base URL removed, a gateway's headers
+///     would go to `api.anthropic.com`.
+///
+/// Removing the base URL and the custom headers closes the inherited-environment route through them
+/// at every place that applies this list: the refresh spawn, the login spawn and the issue #783
+/// login-shell PATH harvest. `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`, the base URL's other
+/// companion, stays inherited, and issue #1626 holds it. In the host classification the ledger
+/// calls `pi()` it acts only on a base URL that is set. `Ikn()`, `jdr()` and `Son()` also read it,
+/// whatever the base URL, and those reads were not traced to a credential or a host. Like `oqe()`
+/// and `vr()`, the names `pi()`, `Ikn()`, `jdr()` and `Son()` are minified 2.1.294 names, which
+/// change between builds. The ledger section lists what they change under what the read did not
+/// settle.
+/// `CLAUDE_CODE_API_BASE_URL` stays inherited too, and issue #1626 holds it. In what the read
+/// covered it feeds only the Files API helpers, as their fallback host. Those helpers send their
+/// caller's OAuth token as the bearer, to the caller's own base URL when it passes one. Every
+/// caller the read found passes one. The ledger section lists as unsettled whether either child
+/// reaches those callers, and whose token each passes.
 ///
 /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` picks the STORE: it takes PRECEDENCE over `CLAUDE_CONFIG_DIR`
 /// in CC's keychain service-name derivation (#100, [`crate::keychain`]), so an inherited one would
@@ -176,16 +238,23 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(40);
 /// `all_parametrizations_apply_the_full_scrub_set` test can assert the set is applied for EVERY
 /// parametrization — a dropped entry is a silent isolation regression on whichever caller drops
 /// it. That test derives its expectation FROM this list, so it cannot notice a name deleted from
-/// the list itself. Three tests spell names out literally for exactly that reason:
-/// `the_oauth_refresh_triple_is_scrubbed_by_name` for the #1009 three,
-/// `the_recorded_env_credential_sources_are_scrubbed_by_name` for the five env credential inputs
-/// above, and `refresh_plan_builds_the_legacy_command` for the refresh child's whole env map.
+/// the list itself. The tests that follow spell names out literally for exactly that reason:
+///   - `the_oauth_refresh_triple_is_scrubbed_by_name` pins the issue #1009 triple;
+///   - `the_recorded_env_credential_sources_are_scrubbed_by_name` pins `CLAUDE_CODE_OAUTH_TOKEN`,
+///     `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+///     `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`;
+///   - `the_base_url_and_its_companion_headers_are_scrubbed_by_name` pins `ANTHROPIC_BASE_URL` and
+///     `ANTHROPIC_CUSTOM_HEADERS`;
+///   - `refresh_plan_builds_the_legacy_command` pins every variable the built refresh command sets
+///     or removes.
 pub(crate) const SPAWN_ENV_REMOVE: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
     "CLAUDE_CODE_OAUTH_SCOPES",
@@ -239,8 +308,8 @@ pub(crate) struct SpawnPlan {
 impl SpawnPlan {
     /// The refresh parametrization: `claude -p <benign>`, all stdio nulled, killed after
     /// [`SPAWN_TIMEOUT`]. Equivalent to the pre-#131 inline spawn in argv and stdio; its scrub is
-    /// a strict SUPERSET since issues #1009 and #1535 widened [`SPAWN_ENV_REMOVE`] (guarded by the
-    /// `refresh_plan_builds_the_legacy_command` test, whose doc records the divergence).
+    /// a strict SUPERSET since issues #1009, #1535 and #1625 widened [`SPAWN_ENV_REMOVE`] (guarded
+    /// by the `refresh_plan_builds_the_legacy_command` test, whose doc records the divergence).
     pub(crate) fn refresh() -> Self {
         Self {
             argv: &["-p", BENIGN_PROMPT],
@@ -533,15 +602,23 @@ mod tests {
             .collect()
     }
 
-    /// Every seam that builds a child environment through [`SPAWN_ENV_REMOVE`], each paired with
-    /// the set of variables the command it builds removes. The scrub tests below all iterate this
-    /// one list, so a fourth seam is added here once rather than in each test — the same drift
-    /// the module doc warns about for the scrub list itself.
+    /// Every scrub seam, each paired with the set of variables the command it builds removes. A
+    /// scrub seam is a place that builds a child environment through [`SPAWN_ENV_REMOVE`]: the
+    /// refresh spawn, the login spawn and the issue #783 login-shell PATH harvest. In the scrub
+    /// tests that iterate this list, "seam" names one such place. Elsewhere in this file the word
+    /// also names the shared spawn scaffold, and a point a test substitutes, such as the fake
+    /// keychain below.
     ///
-    /// The two `claude` parametrizations come first. The third, the issue #783 login-shell PATH
-    /// harvest ([`crate::paths::build_login_shell_env_command`]), is the only seam that is not a
-    /// `claude` spawn, and the one with the sharpest need: it runs the user's login shell, which
-    /// sources ARBITRARY rc files, so a dropped entry leaks a live credential into them.
+    /// The scrub tests below all iterate this one list, so a new scrub seam is added here once
+    /// rather than in each test. That avoids the drift the module doc warns about for the scrub
+    /// list itself. Adding it here is a convention nothing checks. These tests protect only the
+    /// places listed here: the refresh and login plans' [`SpawnPlan::build_command`] and
+    /// [`crate::paths::build_login_shell_env_command`].
+    ///
+    /// The login-shell PATH harvest is the only scrub seam that is not a `claude` spawn. It also
+    /// has the sharpest need: it runs the user's login shell, which sources ARBITRARY rc files. A
+    /// variable the harvest fails to remove is visible to those files. Where that variable carries
+    /// a credential, the credential reaches them.
     fn scrub_seams() -> [(&'static str, BTreeSet<OsString>); 3] {
         [
             ("the refresh spawn", scrubbed_vars(&SpawnPlan::refresh())),
@@ -563,11 +640,8 @@ mod tests {
     /// here regardless of which path drops it.
     ///
     /// Extended by issue #783 to a THIRD parametrization, the login-shell PATH harvest
-    /// ([`crate::paths::build_login_shell_env_command`]). It is the only one that is not a `claude`
-    /// spawn, and the one with the sharpest need: it runs the user's login shell, which sources
-    /// ARBITRARY rc files. Renamed from `both_parametrizations_…` at the same time — with three
-    /// callers the old name asserted something no longer true, and a test name that has quietly
-    /// become false is exactly the class of stale documentation this suite exists to prevent.
+    /// ([`crate::paths::build_login_shell_env_command`]); `scrub_seams` records why that seam has
+    /// the sharpest need.
     #[test]
     fn all_parametrizations_apply_the_full_scrub_set() {
         let expected: BTreeSet<OsString> = SPAWN_ENV_REMOVE
@@ -578,8 +652,7 @@ mod tests {
         for (seam, scrubbed) in scrub_seams() {
             assert_eq!(
                 scrubbed, expected,
-                "{seam} must scrub the full credential/config-override set — a dropped entry is a \
-                 silent isolation regression on that seam"
+                "the set of variables {seam} removes differs from SPAWN_ENV_REMOVE"
             );
         }
     }
@@ -618,8 +691,7 @@ mod tests {
             for var in REQUIRED {
                 assert!(
                     scrubbed.contains(&OsString::from(*var)),
-                    "{seam} does not remove {var} from the child environment it constructs, so an \
-                     inherited {var} would reach the child"
+                    "{seam} does not record {var} as removed from the environment it constructs"
                 );
             }
         }
@@ -632,25 +704,30 @@ mod tests {
     ///
     /// `build/version-compat.md` § "Issue #1535 — environment inputs Claude Code consults ahead of
     /// the claude.ai login (CC 2.1.294)" records, from a static read of the stock binary, which
-    /// environment inputs CC consults ahead of the claude.ai keychain login. The five pinned here
-    /// are the ones that supply or select the child's credential AND sit on the list:
+    /// environment inputs CC consults ahead of the claude.ai keychain login. The ones pinned here
+    /// supply or select the child's credential ahead of that login, AND sit on the list:
     ///   - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` supply a
     ///     credential directly;
     ///   - `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` supplies one through the descriptor it names,
-    ///     and that token outranks the keychain item while the descriptor is readable;
+    ///     and that token outranks the keychain item while the descriptor is readable and no
+    ///     access token from the `CLAUDE_BG_AUTH_SNAPSHOT_PATH` snapshot was consumed first;
     ///   - `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` selects and supplies: set to a value non-empty
-    ///     after trimming, it closes the login gate, except under the exemption
-    ///     [`SPAWN_ENV_REMOVE`]'s doc names for it, and while its descriptor is readable CC reads
-    ///     the API key from it.
+    ///     after trimming, it can close the login gate, and while its descriptor is readable CC
+    ///     reads the API key from it.
     ///
-    /// That section records more inputs than these five — others that supply or select a
-    /// credential, and the ones the scrub leaves out, each with its reason. Nothing here pins
-    /// those.
+    /// That section records more inputs than these — others that supply or select a credential,
+    /// and the ones the scrub leaves out, each with its reason. Nothing here pins those.
+    /// `ANTHROPIC_CUSTOM_HEADERS` can supply a credential as well, and
+    /// `the_base_url_and_its_companion_headers_are_scrubbed_by_name` pins it.
     ///
-    /// Because the roles differ, the failure message claims only what holds at each seam and for
-    /// each of the five: that the variable would reach the child environment. It names no
-    /// consequence. The PATH harvest runs a login shell, not `claude`, and the login spawn is not a
-    /// refresh, so "outranks the keychain" or "no-ops the refresh" would be false on one of them.
+    /// Because the roles differ, the failure message names no consequence. It states only the
+    /// detected symptom: the variable is not recorded as removed from the environment the seam
+    /// builds. That holds at each seam and for each input.
+    /// The PATH harvest runs a login shell, not `claude`. The login spawn is not a refresh. So
+    /// "outranks the keychain" or "skips the refresh" would be false on at least one of them. At
+    /// the refresh spawn itself, the ledger's 2026-11-02T05:46:18Z run saw a token-host `CONNECT`
+    /// still attempted under each of `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and an unopened
+    /// `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`.
     ///
     /// Spelled out rather than derived from [`SPAWN_ENV_REMOVE`] for the reason
     /// `the_oauth_refresh_triple_is_scrubbed_by_name` already records: an expectation taken from
@@ -659,7 +736,7 @@ mod tests {
     fn the_recorded_env_credential_sources_are_scrubbed_by_name() {
         // Spelled out, deliberately NOT `SPAWN_ENV_REMOVE`: deleting any of these from that list
         // must fail here, naming the seam and the variable.
-        const RECORDED: &[&str] = &[
+        const RECORDED_ENV_CREDENTIAL_SOURCES: &[&str] = &[
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
@@ -668,11 +745,57 @@ mod tests {
         ];
 
         for (seam, scrubbed) in scrub_seams() {
-            for var in RECORDED {
+            for var in RECORDED_ENV_CREDENTIAL_SOURCES {
                 assert!(
                     scrubbed.contains(&OsString::from(*var)),
-                    "{seam} does not remove {var}, so an inherited {var} would reach the child \
-                     environment it builds"
+                    "{seam} does not record {var} as removed from the environment it builds"
+                );
+            }
+        }
+    }
+
+    /// The API base URL and its companion custom headers are scrubbed, named LITERALLY, at each
+    /// seam `scrub_seams` lists. Issue #1625 added them to [`SPAWN_ENV_REMOVE`].
+    ///
+    /// `build/version-compat.md` § "Issue #1535 — environment inputs Claude Code consults ahead of
+    /// the claude.ai login (CC 2.1.294)" records why each is on the list, read out of the stock
+    /// binary:
+    ///   - `ANTHROPIC_BASE_URL` sets the base URL of CC's first-party API client. Without a managed
+    ///     provider policy, whatever credential the child selects there goes to that host;
+    ///   - `ANTHROPIC_CUSTOM_HEADERS` goes into the API client's default headers, with no host
+    ///     test. A header it names replaces an earlier header of the same name. That makes it a
+    ///     supplier: on CC's first-party API client, a custom `Authorization` header replaces the
+    ///     bearer the SDK builds from the client's options.
+    ///
+    /// Claude Code lists `ANTHROPIC_CUSTOM_HEADERS` as one of two companions of
+    /// `ANTHROPIC_BASE_URL`, and it is the only one of the two on the list. The base URL and the
+    /// custom headers are scrubbed together because removing the base URL alone would send a
+    /// gateway's headers to `api.anthropic.com`.
+    ///
+    /// Kept apart from `the_recorded_env_credential_sources_are_scrubbed_by_name`, whose inputs
+    /// decide which credential the child sends. The base URL decides where the first-party client
+    /// sends it. The custom headers ride beside it, and can replace the credential it carries.
+    ///
+    /// The failure message states only the detected symptom: the variable is not recorded as
+    /// removed from the environment the seam builds. That holds at every seam. The PATH harvest
+    /// runs a login shell, not `claude`, so a message naming the host a credential reaches would
+    /// be false there.
+    ///
+    /// Spelled out rather than derived from [`SPAWN_ENV_REMOVE`] for the reason
+    /// `the_oauth_refresh_triple_is_scrubbed_by_name` already records: an expectation taken from
+    /// the thing under test cannot detect that thing being wrong.
+    #[test]
+    fn the_base_url_and_its_companion_headers_are_scrubbed_by_name() {
+        // Spelled out, deliberately NOT `SPAWN_ENV_REMOVE`: deleting either from that list must
+        // fail here, naming the seam and the variable.
+        const BASE_URL_AND_COMPANION_HEADERS: &[&str] =
+            &["ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS"];
+
+        for (seam, scrubbed) in scrub_seams() {
+            for var in BASE_URL_AND_COMPANION_HEADERS {
+                assert!(
+                    scrubbed.contains(&OsString::from(*var)),
+                    "{seam} does not record {var} as removed from the environment it builds"
                 );
             }
         }
@@ -699,11 +822,22 @@ mod tests {
     ///
     /// Issue #1535 widened the list again, by `ANTHROPIC_AUTH_TOKEN`,
     /// `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` and `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`.
-    /// Removing these DOES change what this `-p` child does, as intended: inherited, each keeps
-    /// the child off the seeded item under the condition [`SPAWN_ENV_REMOVE`]'s doc names, which
-    /// turns the refresh into a silent no-op. Removing them also lets an inherited
-    /// `ANTHROPIC_BASE_URL`, which stays unscrubbed, receive the seeded item's token under the
-    /// condition, and with the calibration, [`SPAWN_ENV_REMOVE`]'s doc records for it.
+    /// Removing these DOES change what this `-p` child does, as intended.
+    /// `build/version-compat.md` § "Issue #1535 — environment inputs Claude Code consults ahead of
+    /// the claude.ai login (CC 2.1.294)" records what each of these inherited inputs did to this
+    /// child, in the section's 2026-11-02T05:46:18Z run.
+    ///
+    /// Issue #1625 widened it by `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`. CC lists two
+    /// companions for the base URL, and the custom headers are the only one of them on the list.
+    /// Removing the base URL changes where this child's API requests go. It does not move the
+    /// token endpoint CC posts the refresh to. In one inherited setup it can change whether that
+    /// refresh runs. That setup is `CLAUDE_CODE_USE_GATEWAY` with a gateway token from
+    /// `CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR` or the snapshot, both still inherited. There an
+    /// inherited base URL can make CC pick its gateway provider and skip the refresh as not needed.
+    /// The ledger section records that chain as a static read, with the parts it did not trace.
+    /// Removing the custom headers changes which headers ride its API requests, an
+    /// `Authorization` header included. Whether the token-refresh request carries them was not
+    /// settled. The ledger section lists it as open.
     ///
     /// The expectation below stays spelled out literally rather than derived from the const: it is
     /// the one place the whole env map is pinned by hand, and a derived one could not catch the
@@ -739,6 +873,10 @@ mod tests {
             ("ANTHROPIC_AUTH_TOKEN", None),
             ("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", None),
             ("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", None),
+            // The issue #1625 additions, also pinned by name in
+            // `the_base_url_and_its_companion_headers_are_scrubbed_by_name`.
+            ("ANTHROPIC_BASE_URL", None),
+            ("ANTHROPIC_CUSTOM_HEADERS", None),
         ]
         .into_iter()
         .map(|(k, v)| (OsString::from(k), v.map(OsString::from)))
