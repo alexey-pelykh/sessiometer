@@ -4588,8 +4588,9 @@ fn expiry_view(expiry: Option<AccountExpiry>, now: i64) -> ExpiryView {
 }
 
 /// A `0..=100` percent as `N%`, or `n/a` when the wire carries no percent (never a
-/// fabricated `0`): the last poll for that account failed, or, until the status-wire
-/// item #1599 lands its no-window key, the served reading carried no such window.
+/// fabricated `0`): the last poll for that account failed. Transitionally (see
+/// `session_pct`'s doc in `src/daemon/snapshot.rs`), a served reading with no session
+/// window also renders `n/a` here, beside its weekly figures.
 fn pct(percent: Option<u8>) -> String {
     match percent {
         Some(percent) => format!("{percent}%"),
