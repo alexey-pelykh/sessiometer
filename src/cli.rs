@@ -1257,7 +1257,7 @@ USAGE:
     --since <d> bound every indicator to events at/after now - <duration>. <duration> is a
                 non-negative integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w). Omit for
                 the whole-log aggregate (the default).
-    --json      print the readout as JSON (schema:13, for scripts) instead of the text view
+    --json      print the readout as JSON (schema:14, for scripts) instead of the text view
     -h, --help  print this help
 
 READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
@@ -1543,12 +1543,12 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
             .retention_policy(config.tunables.poll_secs as i64),
     )
     // Wire the per-poll usage-sample collector (#156) at the real store path so the daemon
-    // records at most one redacted sample per poll: none for a failed poll, nor, while the
-    // #1613 hot-fix serves, for a reading with no readable session window. The path is
-    // INJECTED here rather than resolved inside the collector (#315), so the hermetic test
-    // harness — which never wires it — writes nothing to the real store. `support_dir()`
-    // already gated startup via `.with_swap_lock(paths::swap_lock()?)` above, so this `?`
-    // adds no new failure mode.
+    // records at most one redacted sample per poll: none for a failed poll, nor, until #1598
+    // writes it as `null`, for a reading with a quota window absent. The path is INJECTED
+    // here rather than resolved inside the collector (#315), so the hermetic test harness —
+    // which never wires it — writes nothing to the real store. `support_dir()` already gated
+    // startup via `.with_swap_lock(paths::swap_lock()?)` above, so this `?` adds no new
+    // failure mode.
     .with_usage_samples(paths::usage_samples()?)
     // Wire the proactive fleet-runway warn probe (#650) to the real store-reading aggregate —
     // the SAME `NativeHistoryStore` → `build_report` → `fleet_runway` pipeline the `stats`
@@ -4587,11 +4587,10 @@ fn expiry_view(expiry: Option<AccountExpiry>, now: i64) -> ExpiryView {
     }
 }
 
-/// A `0..=100` percent as `N%`, or `n/a` when the last poll for that account
-/// failed (never a fabricated `0`). One exception while the issue #1613 hot-fix
-/// serves: a session percent read from a reply with no readable session window
-/// beside a readable weekly one is the idle `0` the daemon substitutes, not a
-/// measurement, so it renders `0%`. Issue #1597 maps that case to `n/a`.
+/// A `0..=100` percent as `N%`, or `n/a` when the wire carries no percent (never a
+/// fabricated `0`): the last poll for that account failed. Transitionally (see
+/// `session_pct`'s doc in `src/daemon/snapshot.rs`), a served reading with no session
+/// window also renders `n/a` here, beside its weekly figures.
 fn pct(percent: Option<u8>) -> String {
     match percent {
         Some(percent) => format!("{percent}%"),

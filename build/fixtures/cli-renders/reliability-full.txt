@@ -52,7 +52,7 @@ false-projection (velocity-projection swap fired ahead of the observed overshoot
 
 blind-arm projection error (projected − session_at_recovery, pp; the BLIND_VELOCITY_RATE_INFLATION tuning input)
   reconcilable n=0 of 0 projectable (0 excluded: session_at_recovery=0 window-reset sentinel), from 3 blind windows
-  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed
+  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed; 0 with no session window
   censoring: RECOVERED-ONLY — excludes 0 swapped-away and 0 never-recovered episodes (counted from the uncensored blind_enter/blind_exit pair above)
   no reconcilable blind windows — percentiles withheld (an empty subject is not a 0 pp error)
 

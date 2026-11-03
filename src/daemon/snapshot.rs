@@ -756,10 +756,10 @@ pub(crate) struct AccountStatusLine {
     #[serde(default)]
     pub(crate) recovering: bool,
     /// Last-polled session-window usage percent (`0..=100`); `null` if the last
-    /// poll for this account failed (never a fabricated `0`). One exception while the
-    /// issue #1613 hot-fix serves: a reply that carried no readable session window
-    /// beside a readable weekly one reads `0` here, the idle value the daemon
-    /// substitutes, not a measurement. Issue #1597 maps that case to `null`.
+    /// poll for this account failed (never a fabricated `0`). Transitionally, until the
+    /// status-wire item #1599 lands its no-window key, also `null` when the served
+    /// reading carried no session window, then beside a non-null `weekly_pct`, because
+    /// a failed poll nulls both percents; that item reverts this sentence.
     pub(crate) session_pct: Option<u8>,
     /// Last-polled weekly-window usage percent (`0..=100`).
     pub(crate) weekly_pct: Option<u8>,
@@ -996,8 +996,8 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 enabled: account.enabled,
                 quarantined: account.quarantined,
                 recovering: account.recovering,
-                session_pct: account.usage.map(|u| to_pct(u.session)),
-                weekly_pct: account.usage.map(|u| to_pct(u.weekly)),
+                session_pct: account.usage.and_then(|u| u.session.map(to_pct)),
+                weekly_pct: account.usage.and_then(|u| u.weekly.map(to_pct)),
                 session_resets_at: account.usage.and_then(|u| u.session_resets_at),
                 weekly_resets_at: account.usage.and_then(|u| u.weekly_resets_at),
                 weekly_exhausted: account.weekly_exhausted,

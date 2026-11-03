@@ -83,7 +83,7 @@
 //! least-bad account, its `cause=` (session-blocked vs weekly-exhausted) and, when
 //! known, the `resets_at=` of the relief that unblocks it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::Write;
@@ -467,8 +467,13 @@ const RETRY_AFTER_WALK_MAX: usize = 2;
 /// `auto_protection_degraded` projection (#479) and [`Daemon::note_blind_gate_eligibility`]'s
 /// not-eligible guard (#482) cannot drift apart — both express THIS one predicate (the latter as its
 /// negation) rather than re-encoding the two comparisons independently.
-fn blind_gate_armed(blind_secs: u64, anchor_session: f64) -> bool {
-    blind_secs > BLIND_GATE_SECS && anchor_session >= BLIND_GATE_RISK_BAND
+///
+/// An anchor whose session window does not APPLY (`None`, issue #1602 — a weekly-only account)
+/// reads FALSE: ADR-0017's "never fires on a `None`/missing reading", extended by #1593 to a
+/// window the account does not have, so neither the SLI nor `status`'s projection can arm on it
+/// (D3's default). Whether a WEEKLY anchor should arm the gate is OAD-2, outside this predicate.
+fn blind_gate_armed(blind_secs: u64, anchor_session: Option<f64>) -> bool {
+    blind_secs > BLIND_GATE_SECS && anchor_session.is_some_and(|s| s >= BLIND_GATE_RISK_BAND)
 }
 
 /// The #584 BLIND velocity-projection report arm: does the active account's retained pre-blind anchor,
@@ -502,13 +507,18 @@ fn blind_gate_armed(blind_secs: u64, anchor_session: f64) -> bool {
 /// horizon.
 fn blind_velocity_projected_armed(
     blind_secs: u64,
-    anchor_session: f64,
+    anchor_session: Option<f64>,
     velocity: Option<VelocityEma>,
     session_ceiling: f64,
 ) -> bool {
     if blind_secs <= BLIND_GATE_SECS {
         return false;
     }
+    // Issue #1602: no session window on the anchor → nothing to project from → false, exactly as
+    // `blind_gate_armed` reads it; never a projection off a fabricated `0`.
+    let Some(anchor_session) = anchor_session else {
+        return false;
+    };
     let Some(vel) = velocity else {
         return false;
     };
@@ -664,9 +674,9 @@ const USAGE_PROVIDER: &str = "claude";
 
 /// Record at most ONE usage sample for a poll (issue #156), fail-open, to the INJECTED store path.
 ///
-/// A failed poll records none, and so does a reading flagged
-/// [`session_window_absent`](PolledReading::session_window_absent) while the issue #1613
-/// hot-fix serves; [`append_sample_for_poll`] owns both skips.
+/// A failed poll records none, and so does a reading with a quota window absent (its
+/// fraction `None`), until issue #1598 writes that window as `null`;
+/// [`append_sample_for_poll`] owns both skips.
 ///
 /// The poll-loop entry point. `samples_path` is `Some` when production wired the real
 /// `crate::paths::usage_samples()` path via `Daemon::with_usage_samples` — then delegate to
@@ -696,11 +706,11 @@ fn record_usage_sample(
 ///   swap poll already fetched, never issuing its own usage request.
 /// - **Gap honesty**: a FAILED poll (`Err` — API error, 401, offline) records
 ///   NOTHING. A gap is absent, never a fabricated zero/healthy sample (issue #157
-///   reads a missing sample as UNKNOWN, never zero). A reading flagged
-///   [`session_window_absent`](PolledReading::session_window_absent) (issue #1613) also
-///   records NOTHING: its `session` is the idle value the hot-fix substitutes, not a
-///   measurement, so it leaves no stored sample rather than a fabricated zero. It is
-///   still a READING, not a gap, to the `usage_gap` tracker — see
+///   reads a missing sample as UNKNOWN, never zero). A reading with a quota window
+///   absent (its fraction `None`: the account has no such window) also records
+///   NOTHING until issue #1598 writes that window as `null`: a [`Sample`] cannot hold
+///   `null` for either window yet, and a substituted number would read as a
+///   measurement. It is still a READING, not a gap, to the `usage_gap` tracker — see
 ///   [`stats_events_for_poll`].
 /// - **Redaction-clean**: `acct` is the account's roster `label` — never a token or a
 ///   credential-read email. Since #444/#447 an operator-*authored* label MAY be an
@@ -724,30 +734,24 @@ fn append_sample_for_poll(
     let Ok(reading) = polled else {
         return; // gap: a poll with no reading records no sample
     };
-    // Gap honesty (issue #1613 hot-fix): a reading whose reply carried no readable session
-    // window (the parse's session lookup found none: a window absent from the reply, or one
-    // present without a numeric fraction) reaches the swap decision as idle (`session: 0.0`),
-    // but that zero is a substitute, not a measurement. Stored, it would read as a real idle
-    // session, where a missing sample reads as UNKNOWN (issue #157). So record nothing: no
-    // stored sample, never a stored zero. (To the `usage_gap` tracker this poll is still a
-    // reading, not a gap: see `stats_events_for_poll`.) Issue #1598 replaces this skip with a
-    // `null` session on the sample line, and issue #1596 removes the flag.
-    if reading.session_window_absent {
+    // Gap honesty: a reading with a quota window absent (its fraction `None`: the account
+    // has no such window) carries no number to store for that window, and a `Sample`
+    // cannot hold `null` for either window until issue #1598 writes one. So record
+    // nothing: no stored sample, never a substituted zero, which would read as a measured
+    // idle window where a missing sample reads as UNKNOWN (issue #157). (To the
+    // `usage_gap` tracker this poll is still a reading, not a gap: see
+    // `stats_events_for_poll`.) Issue #1598 replaces this skip with a `null` window on the
+    // sample line.
+    let (Some(session), Some(weekly)) = (reading.usage.session, reading.usage.weekly) else {
         return;
-    }
-    let sample = Sample::new(
-        now,
-        USAGE_PROVIDER,
-        account_label,
-        reading.usage.session,
-        reading.usage.weekly,
-    )
-    .with_resets(
-        reading.usage.session_resets_at,
-        reading.usage.weekly_resets_at,
-    )
-    .with_severity(reading.severity.clone())
-    .with_spend(None);
+    };
+    let sample = Sample::new(now, USAGE_PROVIDER, account_label, session, weekly)
+        .with_resets(
+            reading.usage.session_resets_at,
+            reading.usage.weekly_resets_at,
+        )
+        .with_severity(reading.severity.clone())
+        .with_spend(None);
     if let Err(err) = append_sample(samples_path, &sample) {
         eprintln!("sessiometer: usage-sample write skipped: {err}");
     }
@@ -825,9 +829,9 @@ struct StatsState {
 /// the poll loop):
 ///
 /// - **Gap** (`is_gap`): a no-reading poll recorded no sample (#156's gap-honesty), and MAY
-///   surface a rate-limited `usage_gap`. A reading flagged `session_window_absent` (#1613)
-///   records no sample either, yet it is not a gap here: `is_gap` only says the poll had no
-///   reading, so such a poll clears the streak and emits no `usage_gap`. The first poll of a
+///   surface a rate-limited `usage_gap`. A reading with a quota window absent records no
+///   sample either (until #1598), yet it is not a gap here: `is_gap` only says the poll had
+///   no reading, so such a poll clears the streak and emits no `usage_gap`. The first poll of a
 ///   streak emits (`since = now`); later gapping polls re-emit only once
 ///   `cadence.gap_reemit_secs` has elapsed, `since` fixed at the streak start. A reading
 ///   clears the account's streak.
@@ -1337,7 +1341,8 @@ struct AccountRuntime {
     /// The retained SESSION-velocity EMA (issue #539, ADR-0017) — the smoothed rate the #539
     /// velocity-projection preemptive trigger ([`Daemon::velocity_swap`]) projects from. `None` until
     /// the account has a usable two-reading interval, and RESET to `None` on a session-usage DROP (a
-    /// 5 h reset / recovery). Updated in the poll fold by
+    /// 5 h reset / recovery) and on every served reading whose session window is absent (issue
+    /// #1602, D7 as ruled — so no consumer reads a pre-vanish EMA). Updated in the poll fold by
     /// [`note_session_velocity`](Daemon::note_session_velocity) from the SAME `(prev, next, elapsed)`
     /// the durable [`Event::UsageVelocity`] uses. See [`VelocityEma`].
     session_velocity: Option<VelocityEma>,
@@ -1699,77 +1704,6 @@ struct DecisionState {
     /// fresh verdict IS the edge trigger for the durable `canary_drift` / `canary_ambiguous` /
     /// `canary_cleared` events, and [`Daemon::snapshot`] copies it onto the `status` wire.
     canary: Option<CanaryStatus>,
-    /// The accounts whose absent-session-window stderr line has been printed for their CURRENT
-    /// episode of flagged readings (issue #1613), keyed by `account_uuid`: an entry exists only
-    /// while an episode is open, so a roster reload never has to reindex it. The uuid, and not
-    /// the roster label the printed line names: roster validation keeps `account_uuid` unique but
-    /// checks a label only for emptiness (`src/config/validate.rs`), so two accounts may share a
-    /// label, and a label-keyed latch would give them one entry, each one's unflagged reading
-    /// closing the other's episode. ([`StatsState::gap_state`] predates this and keys on the
-    /// label.) Folded per poll by
-    /// [`note_session_window_absence`](Self::note_session_window_absence); an unflagged reading
-    /// removes the entry, a failed poll leaves it, and a roster reload that drops the account
-    /// drops its entry with the rest of its state (`reconcile_roster`), so a re-added account
-    /// opens a new episode. Removed together with the flag by issue #1596.
-    absent_session_line_noted: BTreeSet<String>,
-}
-
-impl DecisionState {
-    /// Fold one poll's absent-session-window flag (issue #1613) into the latch entry keyed by
-    /// `account_uuid`, and write the operator-facing line, naming the account by `label`, to
-    /// `out` exactly on the FIRST flagged reading of an episode. Later flagged readings in the
-    /// same episode write nothing, so a weekly-only account logs once per episode rather than
-    /// once per poll (the daemon polls it every cycle until #1596 lands); an unflagged reading
-    /// writes nothing, closes the episode and re-arms the line, so the next flagged reading
-    /// writes again. Not called for a failed poll (no reading, so no flag to fold), which is
-    /// what keeps an outage from splitting an episode in two. Both handles arrive as strings,
-    /// as `append_sample_for_poll` and `stats_events_for_poll` take theirs: the dispositioned
-    /// reader of the roster's identity fields is the caller, [`Daemon::tick`]
-    /// (`HANDLE_READ_REGISTER` in `src/use_account.rs`); this helper reads none itself.
-    ///
-    /// The write is a DISCARDED `writeln!` and never `eprintln!`, for the reason
-    /// `run_loop::emit_best_effort` states (issue #1494): `eprintln!` panics when the stderr
-    /// write ITSELF fails, under launchd stderr is a file on the event log's volume, and `tick`
-    /// is awaited by the run loop with no unwind guard, so that panic would end the daemon to
-    /// report one line. A failed write still opens the episode: the line is best-effort, the
-    /// latch is not. The line names the account by its roster label only (never a token, the
-    /// uuid or response bytes), cites #1613 and says #1596 removes it. Production passes the
-    /// daemon's `absent_session_line_out` (stderr); a test passes a sink.
-    ///
-    /// The line is deliberately undated and stderr-only, like the sibling `usage-sample write
-    /// skipped` line. It carries no `ts=`, `event=` or `diag=` field, so `sessiometer log
-    /// --event` cannot select it, and `--since` places it only through the diagnostic channel's
-    /// carry-forward from the nearest preceding timestamped line; with no such line before it,
-    /// `--since` drops it. That is a default install's case: diagnostics are off unless
-    /// `[tunables] verbose` or `-v` turns them on, so the diagnostic channel holds no timestamped
-    /// line, `sessiometer log --since` never selects this one, and only an unwindowed
-    /// `sessiometer log --channel diag` or `daemon.err.log` itself shows it. Nothing is written
-    /// when an episode ends, and the latch lives in memory, so a daemon restart writes the line
-    /// again for every account whose readings are still flagged. A dated start-and-end record
-    /// would be a new log surface, which this hot-fix does not add.
-    fn note_session_window_absence(
-        &mut self,
-        account_uuid: &str,
-        label: &str,
-        flagged: bool,
-        out: &mut dyn Write,
-    ) {
-        if !flagged {
-            self.absent_session_line_noted.remove(account_uuid);
-            return;
-        }
-        // `insert` is `true` only when the uuid was not there: the first flagged reading.
-        if self
-            .absent_session_line_noted
-            .insert(account_uuid.to_owned())
-        {
-            let _ = writeln!(
-                out,
-                "sessiometer: usage reply for {label} carried no readable session window; served \
-                 as idle, no usage sample recorded (issue #1613 hot-fix, removed by #1596)"
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2034,25 +1968,15 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// `with_stats` without this injection fails instead of compacting the real store — the
     /// same #315 isolation [`usage_samples_path`](Self::usage_samples_path) already has.
     stats_store_paths: Option<(PathBuf, PathBuf)>,
-    /// Where the issue-#1613 absent-session-window line is written: the operator's stderr in
-    /// production (`std::io::stderr()`, the channel the sibling `usage-sample write skipped`
-    /// line uses), or a test's sink (`with_absent_session_line_out`, test-only), so the
-    /// once-per-episode gate is observable where the line is WRITTEN and not only in the latch.
-    /// Every write to it is a DISCARDED `writeln!` (`DecisionState::note_session_window_absence`),
-    /// for the reason `run_loop::emit_best_effort` states (issue #1494): under launchd stderr is a
-    /// file on the event log's volume, and a failed write must not end the daemon. Removed
-    /// together with the line by issue #1596.
-    absent_session_line_out: Box<dyn Write>,
     /// The per-poll usage-sample store path (issue #156/#315), or `None` to disable the
     /// collector (the hermetic-test default — a test with no on-disk store wires nothing, so
     /// ticking a `FakeDaemon` writes NO sample and the developer's real store stays untouched).
     /// Production wires the real `crate::paths::usage_samples()` path via
     /// [`with_usage_samples`](Self::with_usage_samples); when `Some`, each poll appends at most
-    /// one redacted `Sample` to it: none for a failed poll, nor for a reading flagged
-    /// [`session_window_absent`](PolledReading::session_window_absent) (issue #1613). The path
-    /// is INJECTED, never resolved inline, so a test cannot reach the real support dir
-    /// (issue #315) — the same reason `NativeHistoryStore` holds its paths so a test can point
-    /// one at a temp dir.
+    /// one redacted `Sample` to it: none for a failed poll, nor, until issue #1598 writes it as
+    /// `null`, for a reading with a quota window absent. The path is INJECTED, never resolved
+    /// inline, so a test cannot reach the real support dir (issue #315) — the same reason
+    /// `NativeHistoryStore` holds its paths so a test can point one at a temp dir.
     usage_samples_path: Option<PathBuf>,
     /// The fleet-runway probe seam (issue #650), or `None` to disable the warn check entirely
     /// (the hermetic-test default — a probe-less `FakeDaemon` tick never reads the real usage
@@ -2242,9 +2166,6 @@ where
             // The stats layer, when wired, resolves the real store paths unless a test injects
             // its own pair (`with_stats_store_paths`); production never sets this.
             stats_store_paths: None,
-            // The issue-#1613 absent-session-window line goes to the operator's stderr; a test
-            // redirects it (`with_absent_session_line_out`) to observe the once-per-episode gate.
-            absent_session_line_out: Box::new(std::io::stderr()),
             // No per-poll usage-sample collector by default (issue #156/#315); production opts
             // in via `with_usage_samples`. Left unset, ticking writes NO sample, so `cargo test`
             // never touches the developer's real store — the isolation the injected path buys.
@@ -2369,22 +2290,14 @@ where
         self
     }
 
-    /// Redirect the issue-#1613 absent-session-window line from stderr to `out` — test-only, so
-    /// a tick test reads the line back and pins the once-per-episode gate where the line is
-    /// written. Production never calls it; the field holds `std::io::stderr()` there.
-    #[cfg(test)]
-    pub(crate) fn with_absent_session_line_out(mut self, out: Box<dyn Write>) -> Self {
-        self.absent_session_line_out = out;
-        self
-    }
-
     /// Wire the per-poll usage-sample store path (issue #156/#315): the daemon then appends at
-    /// most one redacted `Sample` to `path` per poll (none for a failed poll, nor for a reading
-    /// flagged `session_window_absent`, issue #1613). Production sets the real
-    /// `crate::paths::usage_samples()` path; left unset, the collector is inert so a hermetic
-    /// `FakeDaemon` tick writes nothing to the real support dir. The path is INJECTED rather than
-    /// resolved inline precisely so a test cannot reach the real store (issue #315).
-    /// Builder-style to mirror `with_stats` / `with_swap_lock` and keep `new`'s args stable.
+    /// most one redacted `Sample` to `path` per poll (none for a failed poll, nor, until issue
+    /// #1598 writes it as `null`, for a reading with a quota window absent). Production sets
+    /// the real `crate::paths::usage_samples()` path; left unset, the collector is inert so a
+    /// hermetic `FakeDaemon` tick writes nothing to the real support dir. The path is INJECTED
+    /// rather than resolved inline precisely so a test cannot reach the real store (issue
+    /// #315). Builder-style to mirror `with_stats` / `with_swap_lock` and keep `new`'s args
+    /// stable.
     pub(crate) fn with_usage_samples(mut self, path: PathBuf) -> Self {
         self.usage_samples_path = Some(path);
         self
@@ -2886,8 +2799,8 @@ where
             let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
             // Record at most ONE usage sample for this poll (issue #156): piggyback the
             // reading just fetched (no extra usage-API call), recording nothing on a
-            // gap or on a reading flagged `session_window_absent` (issue #1613 hot-fix),
-            // and swallowing any store error. The store path is INJECTED (issue #315):
+            // gap or on a reading with a quota window absent (until #1598 writes it as
+            // `null`), and swallowing any store error. The store path is INJECTED (issue #315):
             // `None` in the hermetic-test default, so ticking a `FakeDaemon` writes nothing —
             // off the swap-decision path, so a sampling failure never perturbs the loop below.
             record_usage_sample(
@@ -2902,24 +2815,6 @@ where
             // wired the retention policy; off the swap-decision path, so a store failure is
             // swallowed and never perturbs the loop below.
             self.maintain_stats_store(i, polled.is_err(), wall_clock_now_secs(), &mut events);
-            // Issue #1613 hot-fix visibility: a reading served through the substituted-idle path
-            // (no readable session window in its reply: absent, or present without a numeric
-            // fraction) stores no sample, and no event marks the substitution (the poll still
-            // counts as a reading, so it takes part in other events as one), so say so ONCE per
-            // account per episode on `absent_session_line_out`: stderr in production, the
-            // channel the sibling `usage-sample write skipped` line uses, or a test's sink. The
-            // fold, the once-per-episode gate and the fail-open write all live in
-            // `note_session_window_absence`. Roster label only, never a token or response bytes.
-            // The latch re-arms on the account's next unflagged reading; a failed poll leaves it
-            // as it is. Issue #1596 removes the flag and this line with it.
-            if let Ok(reading) = &polled {
-                self.state.note_session_window_absence(
-                    &self.roster[i].account_uuid,
-                    &self.roster[i].label,
-                    reading.session_window_absent,
-                    &mut *self.absent_session_line_out,
-                );
-            }
             // Project to the lean `Usage` the decision path consumes; the sample-only
             // `severity` does not travel past here.
             let mut result = polled.map(|reading| reading.usage);
@@ -2993,7 +2888,11 @@ where
                 // `prev`/`next` borrows and frees `self` for the `&mut self` EMA update below.
                 let (prev_usage, next_usage) = (*prev, *next);
                 let (prev_session, next_session) = (prev_usage.session, next_usage.session);
-                if (session_delta_pct != 0 || weekly_delta_pct != 0) && elapsed_secs > 0 {
+                // Issue #1602: a per-axis delta is `None` where either reading lacks that window;
+                // the event fires on a non-zero delta in ANY axis the account has and omits the
+                // axis it does not.
+                let moved = |delta: Option<i16>| delta.is_some_and(|delta| delta != 0);
+                if (moved(session_delta_pct) || moved(weekly_delta_pct)) && elapsed_secs > 0 {
                     events.push(Event::UsageVelocity {
                         account: self.roster[i].account_uuid.clone(),
                         session_delta_pct,
@@ -3020,7 +2919,14 @@ where
                 let high_water = self.state.accounts[i].session_high_water;
                 let stale_low_interval = swap::is_stale_low(high_water, &prev_usage)
                     || swap::is_stale_low(high_water, &next_usage);
-                if !stale_low_interval {
+                // Issue #1602: the EMA is a SESSION-window signal, so the fold runs only when BOTH
+                // endpoints carry a session; an interval with an absent endpoint (a weekly-only
+                // account, or a window that appeared / vanished between polls) is skipped — never a
+                // fold against a fabricated `0`. A served reading with no session window then
+                // RESETS the slot, below and outside this block (D7 as ruled).
+                if let (false, Some(prev_session), Some(next_session)) =
+                    (stale_low_interval, prev_session, next_session)
+                {
                     self.note_session_velocity(i, prev_session, next_session, elapsed_secs);
                 }
             }
@@ -3044,9 +2950,14 @@ where
                     events.push(Event::BlindWindow {
                         account: self.roster[i].account_uuid.clone(),
                         duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
-                        session_pct: to_pct(anchor.session),
-                        session_at_recovery: to_pct(fresh.session),
-                        near_limit: anchor.session >= self.session_ceiling_base,
+                        // Issue #1602: each percent is `None` — an omitted token — when that
+                        // reading's session window did not apply, and `near_limit` reads false on
+                        // such an anchor (it sat in no band it did not have).
+                        session_pct: anchor.session.map(to_pct),
+                        session_at_recovery: fresh.session.map(to_pct),
+                        near_limit: anchor
+                            .session
+                            .is_some_and(|session| session >= self.session_ceiling_base),
                         // Issue #634: the retained #539 velocity in force through the window, so the
                         // REPORT-ONLY blind velocity-projection arm
                         // ([`blind_velocity_projected_armed`], #584/#600) — which fires no swap and
@@ -3091,6 +3002,16 @@ where
             if let Ok(fresh) = result.as_ref() {
                 self.state.accounts[i].session_high_water =
                     swap::SessionHighWater::fold(self.state.accounts[i].session_high_water, fresh);
+            }
+            // Issue #1602 (D7 as ruled, `REQ-ARM-B-011`): a served reading with no session window
+            // RESETS the account's session-velocity EMA to `None`, as a session drop resets it in
+            // `note_session_velocity`, so no consumer reads a pre-vanish EMA and a window that
+            // reappears seeds a fresh one. Deliberately OUTSIDE the velocity fold above, which runs
+            // only off a previous reading: the first served reading after a failed poll resets the
+            // slot too. Never on the failed poll itself — the blind projection reads the retained
+            // EMA across a blind episode (`blind_velocity_ingredients`, read above, before this).
+            if result.as_ref().is_ok_and(|fresh| fresh.session.is_none()) {
+                self.state.accounts[i].session_velocity = None;
             }
             self.state.accounts[i].last_reading = result.ok();
             // Track WHEN this reading was observed, beside it on the same `AccountRuntime` (issue
@@ -3484,8 +3405,10 @@ where
     /// [`recent_landing_overshoot_view`]) and DISARMS the watch, so it fires once per parked episode.
     ///
     /// Disarms with NO overshoot when the account has gone ACTIVE again (the window is moot — it is no
-    /// longer a parked tail) or the [`landing::LANDING_WINDOW`] has elapsed (a later climb is a fresh
-    /// session cycle, not this swap's tail). A failed poll (`Err`) leaves the watch armed — blindness
+    /// longer a parked tail), when the [`landing::LANDING_WINDOW`] has elapsed (a later climb is a
+    /// fresh session cycle, not this swap's tail), or when the live reading carries NO session
+    /// window (issue #1602: an account without one cannot overshoot this swap's session tail, and
+    /// a window that reappears later is a fresh window). A failed poll (`Err`) leaves the watch armed — blindness
     /// is not evidence of a safe landing, so a later live reading can still catch the overshoot inside
     /// the window. MUST be called on the FRESH `result` BEFORE the caller overwrites `accounts[i].last_reading`.
     /// `now` is the tick's monotonic clock, the SAME [`Instant`] the swap arms the watch with.
@@ -3509,7 +3432,15 @@ where
         // A live reading at/over the SLO ceiling is a landing overshoot: retain it and disarm (once
         // per parked episode). A failed poll leaves the watch armed for a later reading in the window.
         if let Ok(fresh) = result {
-            let landing_pct = to_pct(fresh.session);
+            // Issue #1602: a live reading whose session window no longer APPLIES releases the watch
+            // with NO landing record — an account without a session window cannot overshoot this
+            // swap's session tail, and a window that reappears later is a fresh window (the
+            // high-water fold re-seeds it), not that tail. Never a `0` read as a safe landing.
+            let Some(session) = fresh.session else {
+                self.state.accounts[i].parked_landing = None;
+                return;
+            };
+            let landing_pct = to_pct(session);
             if landing::is_overshoot(landing_pct) {
                 let from_label = self.roster[i].label.clone();
                 self.state.last_landing_overshoot = Some(LandingOvershootRecord {
@@ -3564,7 +3495,7 @@ where
     ) {
         match (self.state.accounts[i].blind_anchor, result) {
             // ENTRY edge — the account had a live reading and this poll failed. Anchor its last
-            // reading (BOTH windows) and open the episode.
+            // reading (every window it has) and open the episode.
             (None, Err(_)) => {
                 let (Some(prev), Some(prev_at)) = (
                     self.state.accounts[i].last_reading,
@@ -3578,7 +3509,12 @@ where
                 // both lines of one episode agree BY CONSTRUCTION rather than by two derivations
                 // that happen to coincide. Keys off the BASE (un-jittered) trigger, matching
                 // `blind_window`'s tag so the two families filter alike.
-                let near_limit = prev.session >= self.session_ceiling_base;
+                // Issue #1602: false on an anchor whose session window does not apply — it sat in
+                // no band it did not have; both lines of the episode then agree on `false`. Each
+                // percent below is `None` (an omitted token) for a window the account lacks.
+                let near_limit = prev
+                    .session
+                    .is_some_and(|session| session >= self.session_ceiling_base);
                 self.state.accounts[i].blind_anchor = Some(BlindAnchor {
                     session: prev.session,
                     weekly: prev.weekly,
@@ -3588,22 +3524,23 @@ where
                 });
                 events.push(Event::BlindEnter {
                     account: self.roster[i].account_uuid.clone(),
-                    session_pct: to_pct(prev.session),
-                    weekly_pct: to_pct(prev.weekly),
+                    session_pct: prev.session.map(to_pct),
+                    weekly_pct: prev.weekly.map(to_pct),
                     was_active,
                     near_limit,
                 });
             }
             // EXIT edge — an episode was open and this poll read live. Close it with the anchor, the
-            // fresh reading in BOTH windows (the burn the log line derives), and the swap-away tag.
+            // fresh reading in every window it has (the burn the log line derives per axis, only
+            // where both ends carry it — issue #1602), and the swap-away tag.
             (Some(anchor), Ok(fresh)) => {
                 events.push(Event::BlindExit {
                     account: self.roster[i].account_uuid.clone(),
                     duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
-                    session_pct: to_pct(anchor.session),
-                    session_at_recovery: to_pct(fresh.session),
-                    weekly_pct: to_pct(anchor.weekly),
-                    weekly_at_recovery: to_pct(fresh.weekly),
+                    session_pct: anchor.session.map(to_pct),
+                    session_at_recovery: fresh.session.map(to_pct),
+                    weekly_pct: anchor.weekly.map(to_pct),
+                    weekly_at_recovery: fresh.weekly.map(to_pct),
                     was_active: anchor.was_active,
                     // The tail `blind_window` cannot see: active when it went blind, not active now.
                     swapped_away: anchor.was_active && active != Some(i),
@@ -3989,9 +3926,18 @@ where
             self.state.accounts[active_idx].session_high_water,
             anchor.session,
         );
-        if !blind_gate_armed(blind_elapsed.as_secs(), gate_session) {
+        // Issue #1602: `blind_gate_armed` reads FALSE on an anchor whose session window does not
+        // apply (`None`), so no eligibility event is emitted for a weekly-only blind active — the
+        // same single-source predicate `blind_active_view` projects (D3's default; arming on a
+        // weekly anchor is OAD-2). The RAW session is bound HERE, from the same `Some` the gate
+        // armed on, so the event's `session_pct` stays a plain `u8`: past this point it is never
+        // absent.
+        let (Some(anchor_session), true) = (
+            anchor.session,
+            blind_gate_armed(blind_elapsed.as_secs(), gate_session),
+        ) else {
             return;
-        }
+        };
         // Partial-reading guard (#80 warm-up): don't measure viable-target availability off an
         // incomplete first cycle, or an unpolled peer fabricates a no-viable-target falsifier.
         if !self.state.warmed_up {
@@ -4021,7 +3967,7 @@ where
             account: self.roster[active_idx].account_uuid.clone(),
             viable_target,
             blind_secs: blind_elapsed.as_secs(),
-            session_pct: to_pct(anchor.session),
+            session_pct: to_pct(anchor_session),
         });
         self.state.blind_gate_signaled = true;
     }
@@ -4271,7 +4217,7 @@ where
     /// Every path that decides whether an account may be swapped TO, stays in rotation, or is
     /// previewed as the next swap MUST key off this, not the raw ceiling. The reason is
     /// `pick_target`'s anti-thrash invariant — "the acquire predicate is at least as strict as the
-    /// negation of the release predicate on BOTH dimensions". Since #607 the weekly RELEASE point is
+    /// negation of the release predicate on every dimension the account has". Since #607 the weekly RELEASE point is
     /// `ceiling − WEEKLY_TAIL_MARGIN`, so an acquire gate left at the raw ceiling admits targets in
     /// the `[ceiling − margin, ceiling)` band that re-trip `swap::decide`'s weekly dimension on the
     /// very next tick — a ping-pong bounded only by cooldown. The session dimension closes the same
@@ -4414,7 +4360,7 @@ where
         // ONE derived weekly line is used for BOTH the release (fire) and acquire (target-viability)
         // predicates below. That is load-bearing, not incidental: `pick_target`'s anti-thrash
         // invariant is that "the acquire predicate is at least as strict as the negation of the
-        // release predicate on BOTH dimensions". Lowering only the release side would open a
+        // release predicate on every dimension the account has". Lowering only the release side would open a
         // `[weekly_threshold, weekly_ceiling)` band in which an account is simultaneously
         // fire-eligible and target-eligible — swap TO it and it re-trips `decide`'s weekly dimension
         // next cycle, the exact ping-pong that exclusion exists to prevent. The session dimension
@@ -4504,8 +4450,13 @@ where
             .as_ref()
             .is_some_and(|last| at.saturating_duration_since(last.at) < cooldown);
         // `>=` (not `>`) so a reading landing EXACTLY on the raw ceiling still bypasses — the ceiling
-        // is the not-cross line, so being AT it already warrants escape.
-        let at_raw_ceiling = active_usage.session >= session_ceiling;
+        // is the not-cross line, so being AT it already warrants escape. Issue #1602: session-only,
+        // and false on an active whose session window does not apply — a weekly-only active has no
+        // raw session ceiling to be at, so within cooldown it defers exactly as a two-window active
+        // below the raw ceiling does.
+        let at_raw_ceiling = active_usage
+            .session
+            .is_some_and(|session| session >= session_ceiling);
         if within_cooldown && !at_raw_ceiling {
             return TickAction::SkippedCooldown;
         }
@@ -4536,7 +4487,7 @@ where
             // among exhausted accounts only thrashes), and emit ONE edge-triggered
             // signal naming the least-bad account and WHY relief is blocked
             // (`cause=session|weekly`), so the operator knows when relief arrives. The
-            // hint keys off the SOONEST spare-return across BOTH windows (issue #665) —
+            // hint keys off the SOONEST spare-return across every window the spare has (issue #665) —
             // whichever spare comes back first, named by the dimension gating it: a
             // session reset (issue #398) and a weekly one (#11) are compared on the same
             // footing, since a window's length is not its time remaining. The signal is
@@ -4576,16 +4527,23 @@ where
                 self.record_swap(target_idx, &incoming, at).await;
                 // Log the swap (issue #9). `swap::decide` returns only a binary
                 // verdict, so the reason is re-derived here from the active reading:
-                // session-first when BOTH dimensions are over their (this-cycle) fire
-                // points — the session dimension against the #597 velocity-derived
-                // `session_threshold` (NOT the raw ceiling), so a velocity-early session
-                // swap is attributed to Session, never mis-logged as Weekly. `session_pct`
-                // is the #614 plausibility-corrected reading the swap DECIDED on (raised to
-                // the retained high-water mark on a stale-low tick), rounded via the same
-                // `to_pct` every swap line uses — so on a stale-low tick it is the value the
-                // daemon acted on, which differs from the raw reading `status` still shows
-                // (that surface stays verbatim by design — see `plausible_active_usage`).
-                let reason = if active_usage.session >= session_threshold {
+                // session-first when every dimension the account has is over its
+                // (this-cycle) fire point — the session dimension against the #597
+                // velocity-derived `session_threshold` (NOT the raw ceiling), so a
+                // velocity-early session swap is attributed to Session, never mis-logged
+                // as Weekly. Issue #1602: `Session` is read only from a session window the
+                // reading CARRIES, so a weekly-only active (session `None`) is always
+                // `Weekly`, and its `session_pct` is `None` — an omitted token on the line,
+                // never a fabricated `0`. Otherwise `session_pct` is the #614
+                // plausibility-corrected reading the swap DECIDED on (raised to the retained
+                // high-water mark on a stale-low tick), rounded via the same `to_pct` every
+                // swap line uses — so on a stale-low tick it is the value the daemon acted
+                // on, which differs from the raw reading `status` still shows (that surface
+                // stays verbatim by design — see `plausible_active_usage`).
+                let session_over = active_usage
+                    .session
+                    .filter(|&session| session >= session_threshold);
+                let reason = if session_over.is_some() {
                     SwapReason::Session
                 } else {
                     SwapReason::Weekly
@@ -4594,7 +4552,7 @@ where
                     from: self.roster[active_idx].label.clone(),
                     to: self.roster[target_idx].label.clone(),
                     reason,
-                    session_pct: to_pct(active_usage.session),
+                    session_pct: active_usage.session.map(to_pct),
                     // Reactive session/weekly swap: it fired on the OBSERVED reading, not a
                     // projection, so `session_pct` fully describes the decision (issue #634).
                     projection: None,
@@ -4607,10 +4565,12 @@ where
                 // watches its subsequent polls for a climb to the SLO ceiling within the landing window.
                 // `record_swap` above already cleared `accounts[target_idx].parked_landing` (the incoming can't be
                 // a parked-landing subject); `active_idx != target_idx`, so this arm does not collide.
-                if reason == SwapReason::Session {
+                // Issue #1602: `decision_pct` is read from the very `Some` the Session attribution
+                // matched, so a weekly-only active — always `Weekly` — never arms a watch.
+                if let Some(session) = session_over {
                     self.state.accounts[active_idx].parked_landing = Some(ParkedLanding {
                         armed_at: at,
-                        decision_pct: to_pct(active_usage.session),
+                        decision_pct: to_pct(session),
                     });
                 }
                 TickAction::Swapped {
@@ -5105,11 +5065,17 @@ where
         // reached through the blind path. Raised to the frozen per-window high-water mark (a true
         // lower bound, never a synthesized number); the stored anchor + every measurement/display
         // surface keep the raw value (see `swap::plausible_anchor_session`).
+        //
+        // Issue #1602: an anchor whose session window does not apply (`None`) reads NOT armed — in
+        // this expression's own right (it compares against the config band and never calls
+        // `blind_gate_armed`); D3's default, with arming on a weekly anchor left to OAD-2. The #582
+        // server-directed arm below never reads the session, so it still fires for such an anchor.
         let blind_elapsed = at.saturating_duration_since(anchor.at).as_secs();
         let anchor_armed = swap::plausible_anchor_session(
             self.state.accounts[active_idx].session_high_water,
             anchor.session,
-        ) >= self.session_blind_risk_band;
+        )
+        .is_some_and(|session| session >= self.session_blind_risk_band);
         // Issue #582: the server-directed arm. A nonzero `Retry-After` STILL holding the active
         // account off its poll arms the gate on its OWN, wherever the anchor sat — below the band
         // that blindness is otherwise unreachable by every swap path (see the doc comment). Shares
@@ -5225,8 +5191,10 @@ where
                 let from_label = self.roster[active_idx].label.clone();
                 let to_label = self.roster[target_idx].label.clone();
                 // The active is BLIND, so the stale pre-blind anchor is the only session signal — the
-                // same value the `swap` log line records and the narration surfaces (#479).
-                let last_known_session_pct = to_pct(anchor.session);
+                // same value the `swap` log line records and the narration surfaces (#479). `None`
+                // when the anchor's session window did not apply (issue #1602): the line then omits
+                // its `session_pct=` token, and no notice is retained (below).
+                let last_known_session_pct = anchor.session.map(to_pct);
                 self.record_swap(target_idx, &incoming, at).await;
                 events.push(Event::Swap {
                     from: from_label.clone(),
@@ -5245,12 +5213,22 @@ where
                 // prior notice (superseding a same-active one), so set THIS swap's as the current one.
                 // `recent_blind_preempt_swap_view` projects it onto the wire only while still-current +
                 // recent; the narration names the `use <from>` undo (derived from `from`, not stored).
-                self.state.last_blind_preempt_swap = Some(BlindPreemptSwapRecord {
-                    from: from_label,
-                    to: to_label,
-                    last_known_session_pct,
-                    at,
-                });
+                //
+                // Issue #1602 (D10's analogue, the transitional `STATUS_SCHEMA_VERSION` `1.14`
+                // state): the record, its wire projection and the CLI narration ("last-known N%")
+                // all carry a `u8` that cannot say "none", so a swap off an anchor whose session
+                // window did not apply retains NO record — `record_swap` above already cleared any
+                // earlier notice, so none survives. Never a `0` default: the wire and the CLI would
+                // then show a fabricated "last-known 0%". The swap itself, its `swap` line and the
+                // #582 walk record below are unchanged; the status-wire item (#1599) lifts the
+                // record's field and restores the notice with its percent omitted.
+                self.state.last_blind_preempt_swap =
+                    last_known_session_pct.map(|last_known_session_pct| BlindPreemptSwapRecord {
+                        from: from_label,
+                        to: to_label,
+                        last_known_session_pct,
+                        at,
+                    });
                 // Issue #582: record a swap fired away from a SERVER-THROTTLED active — the
                 // evidence the walk breaker above counts. Recorded on `retry_after` (any swap the
                 // directive was live for), NOT on `speculative`: the throttle moved whichever arm
@@ -5418,12 +5396,16 @@ where
     ///
     /// A pure read of retained state; the fraction→percent conversion is the log's unit boundary
     /// ([`to_pct`]).
-    fn blind_anchor_high_water(&self, i: usize, anchor_session: f64) -> Option<u8> {
+    fn blind_anchor_high_water(&self, i: usize, anchor_session: Option<f64>) -> Option<u8> {
         let corrected = swap::plausible_anchor_session(
             self.state.accounts[i].session_high_water,
             anchor_session,
         );
-        (corrected > anchor_session).then(|| to_pct(corrected))
+        // Issue #1602: no session window on the anchor → no mark to raise it to → `None` (token
+        // omitted), exactly like an anchor that was already plausible.
+        anchor_session
+            .zip(corrected)
+            .and_then(|(anchor, corrected)| (corrected > anchor).then(|| to_pct(corrected)))
     }
 
     /// The #539 velocity-projection preemptive swap (ADR-0017) — the OBSERVED-overshoot peer of the
@@ -5489,6 +5471,13 @@ where
         else {
             return TickAction::Held;
         };
+        // Issue #1602: this arm projects the SESSION window only, so an active whose session window
+        // does not apply (a weekly-only account) has nothing to project — hold, before any read of
+        // the velocity or the band, never a projection off a fabricated `0`. The binding is the
+        // `Some` every read below, the `swap` line's `session_pct` included, takes.
+        let Some(session) = active_usage.session else {
+            return TickAction::Held;
+        };
         // The retained velocity signal must exist AND be SUSTAINED (≥ MIN_VELOCITY_SAMPLES blended
         // intervals). Absent (a first/failed poll, or reset by a window drop — the poll-gap case #540
         // owns) or single-sample → never project (the "no-fire on a missing/unwarmed velocity"
@@ -5499,7 +5488,7 @@ where
         // The free guard (#538): only project from a reading already at/over the band. The
         // projection cannot reach below it (max reach ≤ ~14 pp at H ≤ 150 s), so a lower reading can
         // never cross anyway — the guard just excludes spurious low-usage projections cheaply.
-        if active_usage.session < self.session_velocity_min_project_above {
+        if session < self.session_velocity_min_project_above {
             return TickAction::Held;
         }
         // #597: project `last + velocity × H` and require it to reach the EFFECTIVE CEILING (the
@@ -5511,7 +5500,7 @@ where
         // the re-observation gap (#609); the composed swap fires at `eff − v·max(poll_gap, H)` (see
         // `swap::reactive_session_threshold`), so whichever window is larger sets the fire point.
         let effective_ceiling = swap::effective_ceiling(session_ceiling);
-        let projected = active_usage.session + vel.rate * horizon as f64;
+        let projected = session + vel.rate * horizon as f64;
         if projected < effective_ceiling {
             return TickAction::Held;
         }
@@ -5571,8 +5560,9 @@ where
                     // plausibility-corrected live reading: the retained high-water mark (a true lower
                     // bound on the account's usage, and the value the swap decided on) when the
                     // response came back stale-low for its own window — see `plausible_active_usage`.
-                    // A percent, like every swap line; never a token / email (#15).
-                    session_pct: to_pct(active_usage.session),
+                    // A percent, like every swap line; never a token / email (#15). Always
+                    // `Some` on this path: the arm held above on an absent session (issue #1602).
+                    session_pct: Some(to_pct(session)),
                     // The PROJECTION this arm actually decided on (issue #634), so the line explains
                     // its own fire instead of reading like a bug at a below-trigger `session_pct`:
                     // `projected >= ceiling` is the very predicate checked above, now checkable from
@@ -5797,9 +5787,17 @@ where
         // really near the ceiling — widening the very re-observation gap the reactive arm looks ahead
         // over, and so compounding the overshoot this guard exists to narrow.
         let active_usage = self.plausible_active_usage(active_idx, active_usage);
+        // Issue #1602 (D4's default, stated and pinned rather than accidental): the band is a
+        // SESSION-window band, so an active whose session window does not apply (a weekly-only
+        // account) reads false on BOTH arms below — the in-band floor and the sustained-EMA
+        // projection — never a `0` or a `1.0` standing in for a window it does not have. A weekly
+        // near-limit band would be a new behaviour nobody specified.
+        let Some(session) = active_usage.session else {
+            return false;
+        };
         let floor = self.session_velocity_min_project_above;
         // In-band by the observed reading.
-        if active_usage.session >= floor {
+        if session >= floor {
             return true;
         }
         // Approaching the band: the #539 projection reaches the floor within the horizon. Requires a
@@ -5813,7 +5811,7 @@ where
         let Some(vel) = self.state.accounts[active_idx].sustained_session_velocity() else {
             return false;
         };
-        active_usage.session + vel.rate * horizon as f64 >= floor
+        session + vel.rate * horizon as f64 >= floor
     }
 
     /// Whether the near-limit poll-coverage fast-poll (issue #540) is engaged THIS tick: the path is
@@ -6108,9 +6106,15 @@ where
         // snapshot's `weekly_exhausted` verdict and the swap gate key off — weekly through the
         // #607 rotation line, so an account the daemon will not rotate onto is also the account it
         // slow-polls, with no band that is excluded from selection yet still polled at full rate).
+        // Issue #1602: each axis is read only where the reading HAS it — an absent window puts
+        // nothing out of rotation (a weekly-only peer is keyed on its weekly line alone).
         let out_of_rotation = active != Some(i)
-            && (reading.weekly >= self.weekly_rotation_line()
-                || reading.session >= self.session_ceiling_base);
+            && (reading
+                .weekly
+                .is_some_and(|weekly| weekly >= self.weekly_rotation_line())
+                || reading
+                    .session
+                    .is_some_and(|session| session >= self.session_ceiling_base));
         let account_uuid = self.roster[i].account_uuid.clone();
         if out_of_rotation {
             let window = exhausted_poll_window(
@@ -6207,10 +6211,18 @@ fn exhausted_poll_window(
             soonest = Some(soonest.map_or(at, |cur: i64| cur.min(at)));
         }
     };
-    if reading.weekly >= weekly_ceiling {
+    // Issue #1602: an axis the reading does not have is neither exhausted nor a window — it
+    // contributes no reset, so a weekly-only peer's window is keyed off its weekly reset alone.
+    if reading
+        .weekly
+        .is_some_and(|weekly| weekly >= weekly_ceiling)
+    {
         consider(reading.weekly_resets_at);
     }
-    if reading.session >= session_ceiling {
+    if reading
+        .session
+        .is_some_and(|session| session >= session_ceiling)
+    {
         consider(reading.session_resets_at);
     }
     let ceiling = exhausted_poll_secs as i64;
@@ -6276,7 +6288,7 @@ fn spare_relief(
 /// dimension gating the WINNING spare, and `hold_idx` names that spare — the account relief
 /// actually arrives on.
 ///
-/// Both dimensions are compared on the SAME footing, because a window's LENGTH is not its
+/// Every dimension a spare has is compared on the SAME footing, because a window's LENGTH is not its
 /// time REMAINING: a spare six days into its weekly window returns sooner than one that just
 /// opened a session. Issue #665 corrects the superseded rule, which early-returned
 /// [`SwapReason::Session`] the moment ANY weekly-viable-but-session-blocked spare existed and
@@ -6310,8 +6322,16 @@ fn all_exhausted_relief(
             continue;
         }
         let Some(usage) = reading else { continue };
-        let session_blocked = usage.session >= session_block_line;
-        let weekly_blocked = usage.weekly >= weekly_block_line;
+        // Issue #1602: each axis is read only where the spare HAS it, so a weekly-only spare
+        // blocked on its weekly line is a POSITIVE case here — `cause: weekly`, `hold` = that
+        // spare, `resets_at` = its weekly reset — never the nameless fallthrough below, and never
+        // "session-blocked" by a `0` or a `1.0` standing in for a window it does not have.
+        let session_blocked = usage
+            .session
+            .is_some_and(|session| session >= session_block_line);
+        let weekly_blocked = usage
+            .weekly
+            .is_some_and(|weekly| weekly >= weekly_block_line);
         if !session_blocked && !weekly_blocked {
             continue;
         }
@@ -6478,12 +6498,6 @@ mod tests {
         Unauthorized,
         Locked,
         ScopeMissing,
-        /// A reading whose reply carried no readable SESSION window (issue #1613: absent, or
-        /// present without a numeric fraction): served to the decision as idle (`session:
-        /// 0.0`) and flagged `session_window_absent`, so the tick-level usage-sample skip and
-        /// its `usage_gap` interplay are observable through a real tick rather than only at
-        /// the `append_sample_for_poll` seam.
-        OkSessionAbsent(Usage),
     }
 
     /// Scripts each account's poll outcome keyed by `account_uuid`: `ok` yields a
@@ -6518,8 +6532,8 @@ mod tests {
             self.readings.insert(
                 uuid.to_owned(),
                 Scripted::Ok(Usage {
-                    session,
-                    weekly,
+                    session: Some(session),
+                    weekly: Some(weekly),
                     weekly_resets_at: None,
                     session_resets_at: None,
                 }),
@@ -6539,8 +6553,8 @@ mod tests {
             self.readings.insert(
                 uuid.to_owned(),
                 Scripted::Ok(Usage {
-                    session,
-                    weekly,
+                    session: Some(session),
+                    weekly: Some(weekly),
                     weekly_resets_at: Some(weekly_resets_at),
                     session_resets_at: None,
                 }),
@@ -6560,26 +6574,29 @@ mod tests {
             self.readings.insert(
                 uuid.to_owned(),
                 Scripted::Ok(Usage {
-                    session,
-                    weekly,
+                    session: Some(session),
+                    weekly: Some(weekly),
                     weekly_resets_at: None,
                     session_resets_at: Some(session_resets_at),
                 }),
             );
             self
         }
-        /// Script a weekly-only reply (issue #1613): the reading carries `weekly` and an idle
-        /// session with no reset stamp, and the poller flags it `session_window_absent`.
-        pub(super) fn ok_session_absent(mut self, uuid: &str, weekly: f64) -> Self {
+        /// Script a weekly-only reply: the reading carries `weekly` and NO session window
+        /// (`session: None`, no reset stamp), so the tick-level usage-sample skip and its
+        /// `usage_gap` interplay are observable through a real tick rather than only at the
+        /// `append_sample_for_poll` seam.
+        pub(super) fn ok_without_a_session_window(mut self, uuid: &str, weekly: f64) -> Self {
             self.readings.insert(
                 uuid.to_owned(),
-                Scripted::OkSessionAbsent(Usage {
-                    session: 0.0,
-                    weekly,
-                    weekly_resets_at: None,
-                    session_resets_at: None,
-                }),
+                Scripted::Ok(usage_without_a_session_window(weekly)),
             );
+            self
+        }
+        /// Script an arbitrary reading verbatim — for shapes the typed builders above do not
+        /// cover (issue #1597: a weekly-only reading that carries its weekly reset stamp).
+        pub(super) fn ok_reading(mut self, uuid: &str, usage: Usage) -> Self {
+            self.readings.insert(uuid.to_owned(), Scripted::Ok(usage));
             self
         }
         pub(super) fn failing(mut self, uuid: &str) -> Self {
@@ -6621,13 +6638,6 @@ mod tests {
                 Some(Scripted::Ok(usage)) => Ok(PolledReading {
                     usage: *usage,
                     severity: None,
-                    session_window_absent: false,
-                }),
-                // The issue-#1613 weekly-only reading: the same shape, flagged.
-                Some(Scripted::OkSessionAbsent(usage)) => Ok(PolledReading {
-                    usage: *usage,
-                    severity: None,
-                    session_window_absent: true,
                 }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::Locked) => Err(Error::KeychainLocked { op: "read" }),
@@ -7356,8 +7366,19 @@ mod tests {
     /// A carried usage reading for seeding an account's `last_reading` in the reconcile tests.
     pub(super) fn reading(session: f64, weekly: f64) -> Usage {
         Usage {
-            session,
-            weekly,
+            session: Some(session),
+            weekly: Some(weekly),
+            weekly_resets_at: None,
+            session_resets_at: None,
+        }
+    }
+
+    /// A usage reading whose SESSION window is absent (`session: None`: the account has no
+    /// such window) beside a present weekly one, for scripting a weekly-only reply.
+    pub(super) fn usage_without_a_session_window(weekly: f64) -> Usage {
+        Usage {
+            session: None,
+            weekly: Some(weekly),
             weekly_resets_at: None,
             session_resets_at: None,
         }
@@ -7408,8 +7429,8 @@ mod tests {
 
     pub(super) fn live(session: f64, weekly: f64) -> Result<Usage> {
         Ok(Usage {
-            session,
-            weekly,
+            session: Some(session),
+            weekly: Some(weekly),
             weekly_resets_at: None,
             session_resets_at: None,
         })
@@ -7433,20 +7454,11 @@ mod tests {
                 Some(Scripted::Ok(usage)) => Ok(PolledReading {
                     usage: *usage,
                     severity: None,
-                    session_window_absent: false,
-                }),
-                // The issue-#1613 weekly-only reading: the same shape, flagged. Scripted here as
-                // well so a test can move ONE account between flagged, unflagged and failed
-                // outcomes across ticks (the outcome cell is shared and mutable).
-                Some(Scripted::OkSessionAbsent(usage)) => Ok(PolledReading {
-                    usage: *usage,
-                    severity: None,
-                    session_window_absent: true,
                 }),
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
-                // Only `Ok` / `OkSessionAbsent` / `Unauthorized` / `ScopeMissing` are scripted
-                // here; anything else (or an unscripted account) is an unavailable transient gap.
+                // Only `Ok` / `Unauthorized` / `ScopeMissing` are scripted here; anything
+                // else (or an unscripted account) is an unavailable transient gap.
                 _ => Err(Error::UsageTransient {
                     status: 0,
                     retry_after: None,
@@ -7600,8 +7612,8 @@ mod tests {
     /// the shape the #11 weekly-wide branch is built on.
     fn weekly_exhausted(weekly_resets_at: Option<i64>) -> Option<Usage> {
         Some(Usage {
-            session: 0.0,
-            weekly: 0.99,
+            session: Some(0.0),
+            weekly: Some(0.99),
             weekly_resets_at,
             session_resets_at: None,
         })
@@ -7667,22 +7679,22 @@ mod tests {
         let readings = vec![
             // idx 0: the exhausted active account — skipped (active == 0).
             Some(Usage {
-                session: 0.99,
-                weekly: 0.99,
+                session: Some(0.99),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(500),
                 session_resets_at: Some(500),
             }),
             // idx 1: weekly-viable, session-blocked; first seen → the naming fallback.
             Some(Usage {
-                session: 0.90,
-                weekly: 0.10,
+                session: Some(0.90),
+                weekly: Some(0.10),
                 weekly_resets_at: None,
                 session_resets_at: Some(300),
             }),
             // idx 2: weekly-viable, session-blocked; resets SOONEST → the winner.
             Some(Usage {
-                session: 0.85,
-                weekly: 0.20,
+                session: Some(0.85),
+                weekly: Some(0.20),
                 weekly_resets_at: None,
                 session_resets_at: Some(150),
             }),
@@ -7708,22 +7720,22 @@ mod tests {
         let readings = vec![
             // idx 0: the exhausted active — masked (active == 0).
             Some(Usage {
-                session: 0.99,
-                weekly: 0.99,
+                session: Some(0.99),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(9_000),
                 session_resets_at: Some(9_000),
             }),
             // idx 1: weekly-EXHAUSTED, session-viable → returns at its weekly reset, SOONEST.
             Some(Usage {
-                session: 0.0,
-                weekly: 0.98,
+                session: Some(0.0),
+                weekly: Some(0.98),
                 weekly_resets_at: Some(3_600),
                 session_resets_at: None,
             }),
             // idx 2: weekly-viable, session-BLOCKED → returns at its session reset, LATER.
             Some(Usage {
-                session: 0.96,
-                weekly: 0.53,
+                session: Some(0.96),
+                weekly: Some(0.53),
                 weekly_resets_at: None,
                 session_resets_at: Some(10_800),
             }),
@@ -7739,7 +7751,7 @@ mod tests {
 
     #[test]
     fn all_exhausted_relief_takes_the_later_reset_of_a_double_blocked_spare() {
-        // The inner `max` (issue #665): a spare blocked on BOTH dimensions returns only once
+        // The inner `max` (issue #665): a spare blocked on every dimension it has returns only once
         // the LATER window clears, so fleet relief is min-over-spares of MAX-over-that-spare's-
         // blocked-dimensions — never a flat min across every reset in the fleet. Here the
         // double-blocked idx 1 has the earliest reset of all (its session, 1_000), but its
@@ -7747,22 +7759,22 @@ mod tests {
         let readings = vec![
             // idx 0: the exhausted active — masked.
             Some(Usage {
-                session: 0.99,
-                weekly: 0.99,
+                session: Some(0.99),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(9_000),
                 session_resets_at: Some(9_000),
             }),
             // idx 1: session-blocked AND weekly-exhausted → returns at max(1_000, 8_000).
             Some(Usage {
-                session: 0.90,
-                weekly: 0.99,
+                session: Some(0.90),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(8_000),
                 session_resets_at: Some(1_000),
             }),
             // idx 2: session-blocked only → returns at 5_000, the true fleet soonest.
             Some(Usage {
-                session: 0.85,
-                weekly: 0.10,
+                session: Some(0.85),
+                weekly: Some(0.10),
                 weekly_resets_at: None,
                 session_resets_at: Some(5_000),
             }),
@@ -7794,8 +7806,8 @@ mod tests {
         let tie = vec![
             readings[0], // idx 0: the active — masked.
             Some(Usage {
-                session: 0.90,
-                weekly: 0.99,
+                session: Some(0.90),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(4_000),
                 session_resets_at: Some(4_000),
             }),
@@ -8289,14 +8301,14 @@ mod tests {
         // The `next_swap` preview reads the same effective line → the same WEEKLY cause.
         let readings = [
             Some(Usage {
-                session: 0.10,
-                weekly: 0.99,
+                session: Some(0.10),
+                weekly: Some(0.99),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
-                session: 0.85,
-                weekly: 0.975,
+                session: Some(0.85),
+                weekly: Some(0.975),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -8325,8 +8337,8 @@ mod tests {
         let daemon = three_account_daemon(FakeRosterPoller::new()).await;
         let usage = |session: f64, weekly: f64| {
             Some(Usage {
-                session,
-                weekly,
+                session: Some(session),
+                weekly: Some(weekly),
                 weekly_resets_at: None,
                 session_resets_at: None,
             })
@@ -8575,13 +8587,13 @@ mod tests {
             daemon.state.accounts[0]
                 .last_reading
                 .map(|r| (r.session, r.weekly)),
-            Some((0.68, 0.40)),
+            Some((Some(0.68), Some(0.40))),
         );
         let anchor = daemon
             .state
             .last_good
             .expect("a clean active poll sets last_good");
-        assert_eq!((anchor.session, anchor.weekly), (0.68, 0.40));
+        assert_eq!((anchor.session, anchor.weekly), (Some(0.68), Some(0.40)));
 
         // The active now `429`s. Drive to its next scheduled poll — the #366 interleave
         // re-observes the active on tick 3 (`[active, peer, active, peer]`).
@@ -8597,8 +8609,58 @@ mod tests {
         // …but the pre-blind anchor is retained intact.
         assert_eq!(
             daemon.state.last_good.map(|g| (g.session, g.weekly)),
-            Some((0.68, 0.40)),
+            Some((Some(0.68), Some(0.40))),
             "a 429 must not disturb the retained last-good anchor",
+        );
+    }
+
+    #[tokio::test]
+    async fn last_good_retains_a_weekly_only_reading_with_its_session_absent() {
+        // Issue #1597 (M3): the retained pre-blind anchor copies the reading's absence through.
+        // A weekly-only active — its served reading carries no session window (issue #1596) —
+        // retains an anchor whose session is `None`, "does not apply", never a fabricated `0`;
+        // and a following `429` leaves that anchor standing exactly as it leaves a two-window
+        // one (the #450 retention above). What the blind gate does with a `None` anchor is the
+        // decision-arms item's (#1602 row 7), not this seam's. The three ticks sit inside the
+        // warm-up hold (every account polled once first), so the 90 % weekly reading never
+        // triggers a swap-away that would reset the anchor for an unrelated reason.
+        let weekly_only = Usage {
+            session: None,
+            weekly: Some(0.90),
+            // The captured reply's weekly reset, 2026-11-06T22:59:59Z.
+            weekly_resets_at: Some(1_794_005_999),
+            session_resets_at: None,
+        };
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok_reading("u-A", weekly_only)
+                .ok("u-B", 0.05, 0.05)
+                .ok("u-C", 0.05, 0.05),
+        )
+        .await;
+
+        daemon.tick().await; // tick 1 polls the active `work` — the weekly-only reading
+        let anchor = daemon
+            .state
+            .last_good
+            .expect("a served weekly-only active poll sets last_good");
+        assert_eq!(
+            (anchor.session, anchor.weekly),
+            (None, Some(0.90)),
+            "the absent session window copies through as None beside the present weekly",
+        );
+
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.05, 0.05)
+            .ok("u-C", 0.05, 0.05);
+        daemon.tick().await; // tick 2 — peer `spare`
+        daemon.tick().await; // tick 3 — active `work` 429s
+        assert_eq!(daemon.state.accounts[0].last_reading, None);
+        assert_eq!(
+            daemon.state.last_good.map(|g| (g.session, g.weekly)),
+            Some((None, Some(0.90))),
+            "a 429 must not disturb the retained weekly-only anchor",
         );
     }
 
@@ -8619,7 +8681,7 @@ mod tests {
             .state
             .last_good
             .expect("the first active poll sets the anchor");
-        assert_eq!((first.session, first.weekly), (0.20, 0.10));
+        assert_eq!((first.session, first.weekly), (Some(0.20), Some(0.10)));
 
         // A later active poll reads higher, at a later time.
         daemon.poller = FakeRosterPoller::new()
@@ -8633,7 +8695,7 @@ mod tests {
         let second = daemon.state.last_good.expect("the anchor is still set");
         assert_eq!(
             (second.session, second.weekly),
-            (0.50, 0.30),
+            (Some(0.50), Some(0.30)),
             "the anchor tracks the latest active reading",
         );
         assert!(
@@ -9287,8 +9349,8 @@ mod tests {
         assert!(
             second.events.contains(&Event::UsageVelocity {
                 account: "u-A".to_owned(),
-                session_delta_pct: 7,
-                weekly_delta_pct: 0,
+                session_delta_pct: Some(7),
+                weekly_delta_pct: Some(0),
                 elapsed_secs: 60,
             }),
             "the second reading must emit its velocity + interval: {:?}",
@@ -9330,8 +9392,8 @@ mod tests {
         let reset = daemon.tick().await;
         assert!(reset.events.contains(&Event::UsageVelocity {
             account: "u-A".to_owned(),
-            session_delta_pct: -85,
-            weekly_delta_pct: 0,
+            session_delta_pct: Some(-85),
+            weekly_delta_pct: Some(0),
             elapsed_secs: 60,
         }));
     }
@@ -9360,6 +9422,60 @@ mod tests {
                 .any(|e| matches!(e, Event::UsageVelocity { .. })),
             "a velocity must not span a throttle gap: {:?}",
             post_gap.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_served_reading_without_a_session_window_resets_the_session_velocity_ema() {
+        // Issue #1602 (row 12, D7 as ruled; `REQ-ARM-B-011`): through the real poll fold, a served
+        // reading whose session window is `None` resets the account's retained session-velocity
+        // EMA to `None` — directly after a two-window reading, and across a failed poll between
+        // the two, where the velocity fold (gated on a previous reading) does not run at all, so
+        // the reset has to sit outside it (mutant M-ah keeps the slot on such a reading). A failed
+        // poll itself KEEPS the slot: the blind projection reads the retained EMA across a blind
+        // episode.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.30, 0.20)).await;
+        daemon.tick().await; // seed the prior reading
+        daemon.clock.advance(Duration::from_secs(60));
+        daemon.poller = FakeRosterPoller::new().ok("u-A", 0.40, 0.20);
+        daemon.tick().await; // the reading at session 0.40 folds the first interval
+        assert!(
+            daemon.state.accounts[0].session_velocity.is_some(),
+            "a two-reading interval seeds the EMA",
+        );
+        // Directly: the next served reading carries no session window.
+        daemon.clock.advance(Duration::from_secs(60));
+        daemon.poller = FakeRosterPoller::new().ok_without_a_session_window("u-A", 0.22);
+        daemon.tick().await;
+        assert_eq!(
+            daemon.state.accounts[0].session_velocity, None,
+            "a served reading with no session window resets the slot to None",
+        );
+        // Across a failed poll: re-seed the EMA from two two-window readings, fail a poll (a 429,
+        // which keeps the slot — the blind projection reads it), then serve a reading with no
+        // session window.
+        for session in [0.40, 0.50] {
+            daemon.clock.advance(Duration::from_secs(60));
+            daemon.poller = FakeRosterPoller::new().ok("u-A", session, 0.20);
+            daemon.tick().await;
+        }
+        assert!(
+            daemon.state.accounts[0].session_velocity.is_some(),
+            "the EMA is re-seeded from two readings that both carry a session",
+        );
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await;
+        assert!(
+            daemon.state.accounts[0].session_velocity.is_some(),
+            "a failed poll keeps the retained EMA",
+        );
+        daemon.clock.advance(Duration::from_secs(120));
+        daemon.poller = FakeRosterPoller::new().ok_without_a_session_window("u-A", 0.22);
+        daemon.tick().await;
+        assert_eq!(
+            daemon.state.accounts[0].session_velocity, None,
+            "the first served reading after a failed poll resets the slot too",
         );
     }
 
@@ -9396,10 +9512,10 @@ mod tests {
             recovered.events.contains(&Event::BlindWindow {
                 account: "u-A".to_owned(),
                 duration_secs: 300,
-                session_pct: 96,
+                session_pct: Some(96),
                 // Recovered at 97% — above the 96% anchor, so a stale-anchor preemptive swap would
                 // have been necessary (still climbing). The #482 recovery pct (raw, un-classified).
-                session_at_recovery: 97,
+                session_at_recovery: Some(97),
                 near_limit: true,
                 // No sustained velocity was seeded (a single pre-blind reading), so the arm could
                 // not have armed and no ingredient is published (issue #634). The `.ok()` poller
@@ -9440,8 +9556,8 @@ mod tests {
             recovered.events.contains(&Event::BlindWindow {
                 account: "u-A".to_owned(),
                 duration_secs: 120,
-                session_pct: 40,
-                session_at_recovery: 42,
+                session_pct: Some(40),
+                session_at_recovery: Some(42),
                 near_limit: false,
                 velocity: None,
                 session_high_water_pct: None,
@@ -9537,8 +9653,8 @@ mod tests {
                 account: "u-A".to_owned(),
                 duration_secs: 400,
                 // The RAW stale-low anchor — the measurement, never the synthesized correction.
-                session_pct: 20,
-                session_at_recovery: 55,
+                session_pct: Some(20),
+                session_at_recovery: Some(55),
                 near_limit: false,
                 velocity: None,
                 // The #670 correction term: the frozen mark, stamped because it exceeds the anchor.
@@ -9568,8 +9684,8 @@ mod tests {
             recovered.events.contains(&Event::BlindWindow {
                 account: "u-A".to_owned(),
                 duration_secs: 120,
-                session_pct: 40,
-                session_at_recovery: 42,
+                session_pct: Some(40),
+                session_at_recovery: Some(42),
                 near_limit: false,
                 velocity: None,
                 session_high_water_pct: None,
@@ -9636,31 +9752,31 @@ mod tests {
 
         daemon.state.accounts[0].session_high_water = None;
         assert_eq!(
-            daemon.blind_anchor_high_water(0, 0.20),
+            daemon.blind_anchor_high_water(0, Some(0.20)),
             None,
             "no retained mark → no token (the pre-#670 line shape stands)",
         );
 
         seed_high_water(&mut daemon, 0.50);
         assert_eq!(
-            daemon.blind_anchor_high_water(0, 0.20),
+            daemon.blind_anchor_high_water(0, Some(0.20)),
             Some(50),
             "a mark above the raw anchor IS the stale-low correction, stamped as a percent",
         );
         assert_eq!(
-            daemon.blind_anchor_high_water(0, 0.498),
+            daemon.blind_anchor_high_water(0, Some(0.498)),
             Some(50),
             "a SUB-PERCENT raise still stamps — the strict `>` runs on the un-rounded fractions, so \
              the rendered token TIES `session_pct` (both round to 50) rather than sitting below it",
         );
 
         assert_eq!(
-            daemon.blind_anchor_high_water(0, 0.50),
+            daemon.blind_anchor_high_water(0, Some(0.50)),
             None,
             "a mark EQUAL to the anchor is a plausible reading — strict `>`, no redundant token",
         );
         assert_eq!(
-            daemon.blind_anchor_high_water(0, 0.60),
+            daemon.blind_anchor_high_water(0, Some(0.60)),
             None,
             "an anchor already above the mark needs no raise",
         );
@@ -9702,8 +9818,8 @@ mod tests {
         assert!(
             entered.events.contains(&Event::BlindEnter {
                 account: "u-A".to_owned(),
-                session_pct: 96,
-                weekly_pct: 30,
+                session_pct: Some(96),
+                weekly_pct: Some(30),
                 was_active: true,
                 // The anchor sat at/over the 95% trigger — the risk band, tagged at entry.
                 near_limit: true,
@@ -9769,8 +9885,8 @@ mod tests {
         assert!(
             entry.contains(&Event::BlindEnter {
                 account: "u-A".to_owned(),
-                session_pct: 68,
-                weekly_pct: 20,
+                session_pct: Some(68),
+                weekly_pct: Some(20),
                 was_active: true,
                 // 68% is inside the interim 60% risk band but below the 95% reactive trigger, so the
                 // `near_limit` tag (which keys off the trigger, matching `blind_window`) is false.
@@ -9811,10 +9927,10 @@ mod tests {
                 // The anchor was stamped on the last live reading (frozen clock), so the episode
                 // spans the two explicit advances: the gate crossing plus the 10 min out of rotation.
                 duration_secs: BLIND_GATE_SECS + 1 + 600,
-                session_pct: 68,
-                session_at_recovery: 71,
-                weekly_pct: 20,
-                weekly_at_recovery: 22,
+                session_pct: Some(68),
+                session_at_recovery: Some(71),
+                weekly_pct: Some(20),
+                weekly_at_recovery: Some(22),
                 was_active: true,
                 swapped_away: true,
                 near_limit: false,
@@ -9864,11 +9980,11 @@ mod tests {
                 account: "u-A".to_owned(),
                 duration_secs: 7512,
                 // The session dimension alone tells the WRONG story: 29 → 0 reads as a quiet reset.
-                session_pct: 29,
-                session_at_recovery: 0,
+                session_pct: Some(29),
+                session_at_recovery: Some(0),
                 // The weekly dimension carries the truth: 5 → 17 is the +12 pp that actually burned.
-                weekly_pct: 5,
-                weekly_at_recovery: 17,
+                weekly_pct: Some(5),
+                weekly_at_recovery: Some(17),
                 was_active: true,
                 swapped_away: false,
                 near_limit: false,
@@ -9903,8 +10019,8 @@ mod tests {
             recovered.events.contains(&Event::BlindWindow {
                 account: "u-A".to_owned(),
                 duration_secs: 300,
-                session_pct: 96,
-                session_at_recovery: 97,
+                session_pct: Some(96),
+                session_at_recovery: Some(97),
                 near_limit: true,
                 velocity: None,
                 session_high_water_pct: None,
@@ -9928,10 +10044,10 @@ mod tests {
             recovered.events.contains(&Event::BlindExit {
                 account: "u-A".to_owned(),
                 duration_secs: 300,
-                session_pct: 96,
-                session_at_recovery: 97,
-                weekly_pct: 30,
-                weekly_at_recovery: 31,
+                session_pct: Some(96),
+                session_at_recovery: Some(97),
+                weekly_pct: Some(30),
+                weekly_at_recovery: Some(31),
                 was_active: true,
                 swapped_away: false,
                 near_limit: true,
@@ -10206,7 +10322,7 @@ mod tests {
                 e,
                 Event::Swap {
                     reason: SwapReason::BlindPreempt,
-                    session_pct: 68,
+                    session_pct: Some(68),
                     ..
                 }
             )),
@@ -10503,8 +10619,8 @@ mod tests {
         // window's high-water mark (`mark_session`) — an earlier plausible reading `fold`'s max kept.
         let anchor_at = daemon.clock.now();
         daemon.state.last_good = Some(LastGood {
-            session: anchor_session,
-            weekly: 0.20,
+            session: Some(anchor_session),
+            weekly: Some(0.20),
             at: anchor_at,
         });
         seed_high_water(&mut daemon, mark_session);
@@ -10558,7 +10674,7 @@ mod tests {
                 e,
                 Event::Swap {
                     reason: SwapReason::BlindPreempt,
-                    session_pct: 10,
+                    session_pct: Some(10),
                     ..
                 }
             )),
@@ -10675,7 +10791,7 @@ mod tests {
                 e,
                 Event::Swap {
                     reason: SwapReason::BlindPreempt,
-                    session_pct: 29,
+                    session_pct: Some(29),
                     ..
                 }
             )),
@@ -11190,7 +11306,7 @@ mod tests {
                 e,
                 Event::Swap {
                     reason: SwapReason::VelocityPreempt,
-                    session_pct: 92,
+                    session_pct: Some(92),
                     ..
                 }
             )),
@@ -11572,8 +11688,8 @@ mod tests {
     fn active_session_reading(daemon: &FakeDaemon, session: f64) -> Vec<Option<Usage>> {
         let mut readings = daemon.state.readings();
         readings[0] = Some(Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: None,
         });
@@ -11743,8 +11859,8 @@ mod tests {
     ) -> Vec<Option<Usage>> {
         let mut readings = daemon.state.readings();
         readings[0] = Some(Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: window,
         });
@@ -11757,8 +11873,8 @@ mod tests {
         daemon.state.accounts[0].session_high_water = swap::SessionHighWater::fold(
             None,
             &Usage {
-                session,
-                weekly: 0.20,
+                session: Some(session),
+                weekly: Some(0.20),
                 weekly_resets_at: None,
                 session_resets_at: Some(WINDOW),
             },
@@ -11829,7 +11945,7 @@ mod tests {
         // written back over what the API reported (so `status` / telemetry stay honest).
         assert_eq!(
             readings[0].expect("active reading").session,
-            stale,
+            Some(stale),
             "the decision-path correction does not mutate the carried reading",
         );
     }
@@ -11893,7 +12009,7 @@ mod tests {
                 e,
                 Event::Swap {
                     reason: SwapReason::VelocityPreempt,
-                    session_pct: 88,
+                    session_pct: Some(88),
                     ..
                 }
             )),
@@ -11973,8 +12089,8 @@ mod tests {
             swap::SessionHighWater::fold(
                 None,
                 &Usage {
-                    session: 0.94,
-                    weekly: 0.20,
+                    session: Some(0.94),
+                    weekly: Some(0.20),
                     weekly_resets_at: None,
                     session_resets_at: Some(WINDOW)
                 }
@@ -12194,7 +12310,7 @@ mod tests {
             daemon.tick().await;
             if daemon.state.accounts[0]
                 .last_reading
-                .is_some_and(|u| u.session == session)
+                .is_some_and(|u| u.session == Some(session))
             {
                 return;
             }
@@ -12212,8 +12328,8 @@ mod tests {
         // cross-signal sweep is `reconcile_roster_rekeys_every_per_account_signal_by_uuid_not_by_index`;
         // this focused case narrates the high-water stake specifically.)
         let stamped = |session: f64| Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: Some(WINDOW),
         };
@@ -12307,15 +12423,15 @@ mod tests {
         let base = Instant::now();
         let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
         daemon.state.accounts[0].blind_anchor = Some(BlindAnchor {
-            session: 0.96,
-            weekly: 0.40,
+            session: Some(0.96),
+            weekly: Some(0.40),
             at: base,
             was_active: true,
             near_limit: true,
         });
         daemon.state.accounts[1].blind_anchor = Some(BlindAnchor {
-            session: 0.30,
-            weekly: 0.10,
+            session: Some(0.30),
+            weekly: Some(0.10),
             at: base,
             was_active: false,
             near_limit: false,
@@ -12340,8 +12456,8 @@ mod tests {
         assert_eq!(
             daemon.state.accounts[0].blind_anchor,
             Some(BlindAnchor {
-                session: 0.30,
-                weekly: 0.10,
+                session: Some(0.30),
+                weekly: Some(0.10),
                 at: base,
                 was_active: false,
                 near_limit: false,
@@ -12352,6 +12468,31 @@ mod tests {
         assert!(
             daemon.state.accounts[1].blind_anchor.is_none(),
             "the onboarded account starts inside no episode",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blind_entry_anchor_for_a_weekly_only_account_carries_no_session_fraction() {
+        // Issue #1597 (M4): the per-slot pre-blind anchor (#583) copies the reading's absence
+        // through on the live→blind ENTRY edge of `note_blind_episode`. A weekly-only account —
+        // its served reading carries no session window (issue #1596) — that then fails its poll
+        // anchors `session: None` beside its present weekly: "does not apply", never a
+        // fabricated `0`. The anchor's `near_limit` tag for a `None` session is the
+        // decision-arms item's (#1602 row 7) to assert, not this seam's.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok_without_a_session_window("u-A", 0.30))
+                .await;
+        daemon.tick().await; // the live weekly-only reading that becomes the anchor
+
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await; // the 429 that blinds it — the entry edge
+        let anchor = daemon.state.accounts[0]
+            .blind_anchor
+            .expect("the entry edge anchors the last live reading");
+        assert_eq!(
+            (anchor.session, anchor.weekly),
+            (None, Some(0.30)),
+            "the absent session window copies through as None beside the present weekly",
         );
     }
 
@@ -12721,8 +12862,8 @@ mod tests {
         // early reset. (Base triggers: weekly 0.98, session 0.95.)
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now + 7_200),
             session_resets_at: None,
         };
@@ -12738,8 +12879,8 @@ mod tests {
         // than the ceiling: a window that elapses sooner than an hour is caught promptly.
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now + 1_800),
             session_resets_at: None,
         };
@@ -12754,8 +12895,8 @@ mod tests {
         let now = 1_000_000;
         // Reset 10 s away (< the 60 s floor) → floored to poll_secs, not a sub-cadence re-poll.
         let imminent = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now + 10),
             session_resets_at: None,
         };
@@ -12766,8 +12907,8 @@ mod tests {
         // Reset already PAST but the account still reads exhausted (rare server lateness) →
         // floored to poll_secs, so a persistently-late reset never busy-polls every tick.
         let past = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now - 500),
             session_resets_at: None,
         };
@@ -12782,8 +12923,8 @@ mod tests {
         // No parseable reset for the exhausted dimension → the plain hourly ceiling (#537).
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -12800,8 +12941,8 @@ mod tests {
         // (here absent, but even if present) weekly reset does not key the window.
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.96,
-            weekly: 0.10,
+            session: Some(0.96),
+            weekly: Some(0.10),
             weekly_resets_at: Some(now + 100), // must be IGNORED — weekly is not exhausted
             session_resets_at: Some(now + 1_200),
         };
@@ -12817,8 +12958,8 @@ mod tests {
         // the SOONER applicable reset governs, catching relief at the earliest opportunity.
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.96,
-            weekly: 0.99,
+            session: Some(0.96),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now + 900),
             session_resets_at: Some(now + 2_400),
         };
@@ -13190,7 +13331,10 @@ mod tests {
                 .ok("u-C", 0.33, 0.10),
         )
         .await;
-        let sessions = |d: &FakeDaemon| -> Vec<Option<f64>> {
+        // The outer `Option` is "polled yet?" (the slot holds no reading); the inner one is the
+        // reading's own session window (issue #1597: `None` when the account has none). Kept
+        // nested rather than flattened, so the two absences stay distinguishable here too.
+        let sessions = |d: &FakeDaemon| -> Vec<Option<Option<f64>>> {
             d.state
                 .accounts
                 .iter()
@@ -13201,25 +13345,25 @@ mod tests {
         daemon.tick().await;
         assert_eq!(
             sessions(&daemon),
-            vec![Some(0.11), None, None],
+            vec![Some(Some(0.11)), None, None],
             "tick 1 polls only the active work; spare/backup are still unread"
         );
         daemon.tick().await;
         assert_eq!(
             sessions(&daemon),
-            vec![Some(0.11), Some(0.22), None],
+            vec![Some(Some(0.11)), Some(Some(0.22)), None],
             "tick 2 adds spare, carrying work's earlier reading"
         );
         daemon.tick().await;
         assert_eq!(
             sessions(&daemon),
-            vec![Some(0.11), Some(0.22), None],
+            vec![Some(Some(0.11)), Some(Some(0.22)), None],
             "tick 3 RE-polls the interleaved active work (#366); backup is still unread"
         );
         daemon.tick().await;
         assert_eq!(
             sessions(&daemon),
-            vec![Some(0.11), Some(0.22), Some(0.33)],
+            vec![Some(Some(0.11)), Some(Some(0.22)), Some(Some(0.33))],
             "tick 4 adds backup — the schedule's last peer — so every account is now carried"
         );
     }
@@ -14742,8 +14886,8 @@ mod tests {
         daemon.near_limit_poll_secs = 60; // enable the path (the `tunables` fixture ships it at 0)
         daemon.session_velocity_horizon_secs = 150; // arm the #539 projection horizon
         let usage = |session: f64| Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -14858,8 +15002,8 @@ mod tests {
         daemon.session_velocity_horizon_secs = 0; // projection OFF → isolate the OBSERVED-band arm
         daemon.state.accounts[0].session_velocity = None; // no velocity → only the reading can carry the band
         let stale = Usage {
-            session: 0.40,
-            weekly: 0.20,
+            session: Some(0.40),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: Some(WINDOW),
         };
@@ -15231,8 +15375,8 @@ mod tests {
         // on an in-band reading — at/above the 95 % trigger yet strictly below the 100 %
         // ceiling. On the pre-#366 sweep-latency schedule this reading would be 100.
         assert!(
-            *session_pct >= 95 && *session_pct < 100,
-            "expected an in-band swap ∈ [95, 100); got session_pct={session_pct}",
+            session_pct.is_some_and(|pct| (95..100).contains(&pct)),
+            "expected an in-band swap ∈ [95, 100); got session_pct={session_pct:?}",
         );
 
         // Companion AC (#365 marker): an in-band swap is NOT late — `Event::to_log_line`
@@ -15671,7 +15815,7 @@ mod tests {
                     from: "work".to_owned(),
                     to: "spare".to_owned(),
                     reason: SwapReason::Session,
-                    session_pct: 97,
+                    session_pct: Some(97),
                     projection: None,
                 },
                 &Event::AllExhaustedCleared,
@@ -19889,23 +20033,22 @@ mod tests {
 
     // --- Usage-sample collector (issue #156) ------------------------------
 
-    /// A successful poll whose reading is not flagged `session_window_absent` writes EXACTLY
-    /// ONE sample carrying the redacted handle and every projected field — including the
-    /// widened `severity` — with no secret. A flagged reading writes none (issue #1613:
-    /// `collector_records_nothing_for_a_reading_whose_session_window_was_absent`).
+    /// A successful poll whose reading carries each window writes EXACTLY ONE sample
+    /// carrying the redacted handle and every projected field — including the widened
+    /// `severity` — with no secret. A reading with a window absent writes none
+    /// (`collector_records_nothing_for_a_reading_whose_session_window_was_absent`).
     #[test]
     fn collector_writes_one_redacted_sample_per_successful_poll() {
         let dir = tempfile::tempdir().unwrap();
         let samples_path = dir.path().join("usage-samples.jsonl");
         let reading = Ok(PolledReading {
             usage: Usage {
-                session: 0.42,
-                weekly: 0.88,
+                session: Some(0.42),
+                weekly: Some(0.88),
                 weekly_resets_at: Some(1_700_600_000),
                 session_resets_at: Some(1_700_003_600),
             },
             severity: Some("critical".to_owned()),
-            session_window_absent: false,
         });
 
         append_sample_for_poll(&samples_path, "work", &reading, 1_700_000_000);
@@ -19950,13 +20093,12 @@ mod tests {
         let samples_path = dir.path().join("usage-samples.jsonl");
         let reading = Ok(PolledReading {
             usage: Usage {
-                session: 0.42,
-                weekly: 0.88,
+                session: Some(0.42),
+                weekly: Some(0.88),
                 weekly_resets_at: Some(1_700_600_000),
                 session_resets_at: Some(1_700_003_600),
             },
             severity: Some("critical".to_owned()),
-            session_window_absent: false,
         });
         let authored = "alice@example.com";
 
@@ -19989,13 +20131,12 @@ mod tests {
         let samples_path = dir.path().join("usage-samples.jsonl");
         let reading = Ok(PolledReading {
             usage: Usage {
-                session: 0.1,
-                weekly: 0.2,
+                session: Some(0.1),
+                weekly: Some(0.2),
                 weekly_resets_at: None,
                 session_resets_at: None,
             },
             severity: None,
-            session_window_absent: false,
         });
 
         append_sample_for_poll(&samples_path, "spare", &reading, 42);
@@ -20027,13 +20168,12 @@ mod tests {
         // A gap AFTER a real sample adds nothing — the earlier reading stands alone.
         let ok = Ok(PolledReading {
             usage: Usage {
-                session: 0.3,
-                weekly: 0.4,
+                session: Some(0.3),
+                weekly: Some(0.4),
                 weekly_resets_at: None,
                 session_resets_at: None,
             },
             severity: None,
-            session_window_absent: false,
         });
         append_sample_for_poll(&samples_path, "work", &ok, 200);
         let transient: Result<PolledReading> = Err(Error::UsageTransient {
@@ -20050,40 +20190,49 @@ mod tests {
         assert_eq!(samples[0].ts, 200);
     }
 
-    /// GAP HONESTY (issue #1613): a reading whose session window was absent from the
-    /// reply is served to the swap decision, but it must NOT be stored — its
-    /// `session: 0.0` is a lift, not a measurement, and a stored zero would read as a
-    /// real idle session. The flagged call writes no line; an unflagged reading
-    /// through the same store writes exactly one.
+    /// GAP HONESTY: a reading whose session window is absent from the reply (`session:
+    /// None`) is served to the swap decision, but it must NOT be stored — a `Sample` cannot
+    /// hold `null` for a window until issue #1598, and a substituted zero would read as a
+    /// real idle session. The call with the window absent writes no line; a reading with
+    /// the window present through the same store writes exactly one. Issue #1598 rewrites
+    /// this test when it writes the window as `null`.
     #[test]
     fn collector_records_nothing_for_a_reading_whose_session_window_was_absent() {
         let dir = tempfile::tempdir().unwrap();
         let samples_path = dir.path().join("usage-samples.jsonl");
-        let reading_with = |session_window_absent: bool| {
+        let reading_with_session = |session: Option<f64>| {
             Ok(PolledReading {
                 usage: Usage {
-                    session: 0.0,
-                    weekly: 0.90,
+                    session,
+                    weekly: Some(0.90),
                     weekly_resets_at: Some(1_700_600_000),
                     session_resets_at: None,
                 },
                 severity: Some("critical".to_owned()),
-                session_window_absent,
             })
         };
 
-        append_sample_for_poll(&samples_path, "work", &reading_with(true), 100);
+        append_sample_for_poll(&samples_path, "work", &reading_with_session(None), 100);
         assert!(
             crate::usage_store::read_samples(&samples_path)
                 .unwrap()
                 .is_empty(),
-            "a flagged reading writes no sample"
+            "a reading with its session window absent writes no sample"
         );
 
-        append_sample_for_poll(&samples_path, "work", &reading_with(false), 200);
+        append_sample_for_poll(
+            &samples_path,
+            "work",
+            &reading_with_session(Some(0.42)),
+            200,
+        );
         let samples = crate::usage_store::read_samples(&samples_path).unwrap();
-        assert_eq!(samples.len(), 1, "an unflagged reading writes exactly one");
-        assert_eq!(samples[0].ts, 200, "and it is the unflagged call's");
+        assert_eq!(
+            samples.len(),
+            1,
+            "a reading with its session window present writes exactly one"
+        );
+        assert_eq!(samples[0].ts, 200, "and it is the present-window call's");
     }
 
     /// FAIL-OPEN: a store-write error is swallowed — the collector returns normally
@@ -20099,13 +20248,12 @@ mod tests {
             .join("usage-samples.jsonl");
         let reading = Ok(PolledReading {
             usage: Usage {
-                session: 0.5,
-                weekly: 0.6,
+                session: Some(0.5),
+                weekly: Some(0.6),
                 weekly_resets_at: None,
                 session_resets_at: None,
             },
             severity: Some("warning".to_owned()),
-            session_window_absent: false,
         });
 
         // Must NOT panic / unwind: reaching the assertion below proves the write
@@ -20321,81 +20469,13 @@ mod tests {
         );
     }
 
-    // --- Issue #1613: the absent-session-window line, observed where it is written ---------
-
-    /// A `Write` sink a tick test hands to `Daemon::with_absent_session_line_out` and keeps a
-    /// handle on, so the issue-#1613 line is read back after a tick: clones share one buffer.
-    #[derive(Clone, Default)]
-    pub(super) struct SharedSink(Rc<RefCell<Vec<u8>>>);
-
-    impl SharedSink {
-        /// Every line written so far, in order.
-        pub(super) fn lines(&self) -> Vec<String> {
-            String::from_utf8(self.0.borrow().clone())
-                .expect("the line is UTF-8")
-                .lines()
-                .map(str::to_owned)
-                .collect()
-        }
-    }
-
-    impl std::io::Write for SharedSink {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.borrow_mut().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// A `Write` whose every write fails: the full-volume stderr the fail-open discipline of
-    /// issue #1494 exists for.
-    pub(super) struct FailingWriter;
-
-    impl std::io::Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("stderr is a file on a full volume"))
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// The issue-#1613 line's contract, as the hot-fix item pins it: it names the account by its
-    /// roster `label`, says what the parse established, cites #1613 and says #1596 removes it,
-    /// and carries no account uuid (nor a token or response bytes, which these fakes never hold).
-    pub(super) fn assert_absent_session_line(line: &str, label: &str) {
-        assert!(
-            line.starts_with("sessiometer: "),
-            "the daemon's stderr prefix: {line}"
-        );
-        assert!(
-            line.contains(&format!("usage reply for {label} ")),
-            "names the account by its label: {line}"
-        );
-        assert!(
-            line.contains("no readable session window"),
-            "says what the parse established: {line}"
-        );
-        assert!(
-            line.contains("#1613") && line.contains("#1596"),
-            "cites the hot-fix and its retirement: {line}"
-        );
-        assert!(
-            !line.contains("u-A") && !line.contains("u-B") && !line.contains("u-C"),
-            "no account uuid: {line}"
-        );
-    }
-
-    /// Issue #1613: the hot-fix's two tick-level effects for a reading flagged
-    /// `session_window_absent` (its reply carried no readable session window), observed
-    /// through a real tick with BOTH stores wired to a temp dir — the per-poll sample path and
-    /// the stats maintenance layer. The flagged account writes no sample and emits no
-    /// `usage_gap` (to the gap tracker, which keys on `polled.is_err()`, it is a READING); an
-    /// unflagged account through the same wiring writes exactly one; and a FAILING account
-    /// proves the gap tracker is live through this wiring, so the flagged account's silence is
-    /// not the silence of an unwired seam.
+    /// The two tick-level effects for a reading whose session window is absent (`session:
+    /// None`: the account has none), observed through a real tick with BOTH stores wired to a
+    /// temp dir — the per-poll sample path and the stats maintenance layer. That account writes
+    /// no sample (until #1598 writes the window as `null`) and emits no `usage_gap` (to the gap
+    /// tracker, which keys on `polled.is_err()`, it is a READING); a two-window account through
+    /// the same wiring writes exactly one; and a FAILING account proves the gap tracker is live
+    /// through this wiring, so the first account's silence is not the silence of an unwired seam.
     #[tokio::test]
     async fn tick_stores_no_sample_and_logs_no_gap_for_a_reading_whose_session_window_was_absent() {
         let dir = tempfile::tempdir().unwrap();
@@ -20405,17 +20485,14 @@ mod tests {
         // `backup` fails outright. The #366 interleave schedules `[work, spare, work, backup]`.
         let mut daemon = three_account_daemon(
             FakeRosterPoller::new()
-                .ok_session_absent("u-A", 0.10)
+                .ok_without_a_session_window("u-A", 0.10)
                 .ok("u-B", 0.22, 0.10)
                 .failing("u-C"),
         )
         .await
         .with_usage_samples(samples_path.clone())
         .with_stats(RetentionPolicy::default())
-        .with_stats_store_paths(samples_path.clone(), rollup_path)
-        // `work`'s flagged reading writes the issue-#1613 line; a sink keeps it off the test
-        // run's raw stderr, as the sibling tick tests do.
-        .with_absent_session_line_out(Box::new(SharedSink::default()));
+        .with_stats_store_paths(samples_path.clone(), rollup_path);
 
         let polled = |outcome: &TickOutcome| -> String {
             outcome
@@ -20439,30 +20516,42 @@ mod tests {
         };
         let stored = || crate::usage_store::read_samples(&samples_path).unwrap();
 
-        // Tick 1 — the flagged account: no sample stored, no `usage_gap` emitted.
+        // Tick 1 — the account without a session window: no sample stored, no `usage_gap`.
         let t1 = daemon.tick().await;
-        assert_eq!(polled(&t1), "work", "tick 1 polls the flagged active");
-        assert!(stored().is_empty(), "a flagged reading stores no sample");
+        assert_eq!(
+            polled(&t1),
+            "work",
+            "tick 1 polls the active, whose session window is absent"
+        );
+        assert!(
+            stored().is_empty(),
+            "a reading with a window absent stores no sample"
+        );
         assert!(
             gaps(&t1).is_empty(),
-            "a flagged reading is a reading, not a gap: no usage_gap"
+            "a reading with a window absent is a reading, not a gap: no usage_gap"
         );
 
-        // Tick 2 — an unflagged account through the same wiring writes exactly one sample.
+        // Tick 2 — a two-window account through the same wiring writes exactly one sample.
         let t2 = daemon.tick().await;
-        assert_eq!(polled(&t2), "spare", "tick 2 polls the unflagged peer");
+        assert_eq!(polled(&t2), "spare", "tick 2 polls the two-window peer");
         let samples = stored();
-        assert_eq!(samples.len(), 1, "an unflagged reading stores one sample");
+        assert_eq!(samples.len(), 1, "a two-window reading stores one sample");
         assert_eq!(
             samples[0].acct, "spare",
-            "and it is the unflagged account's"
+            "and it is the two-window account's"
         );
         assert!(gaps(&t2).is_empty());
 
-        // Tick 3 — the flagged account again: still nothing of its own stored, still no gap.
+        // Tick 3 — the account without a session window again: still nothing of its own
+        // stored, still no gap.
         let t3 = daemon.tick().await;
-        assert_eq!(polled(&t3), "work", "tick 3 re-polls the flagged active");
-        assert_eq!(stored().len(), 1, "the flagged account added no sample");
+        assert_eq!(polled(&t3), "work", "tick 3 re-polls the active");
+        assert_eq!(
+            stored().len(),
+            1,
+            "the account without a session window added no sample"
+        );
         assert!(gaps(&t3).is_empty());
 
         // Tick 4 — the failing account: the gap tracker IS live through this wiring.
@@ -20471,323 +20560,24 @@ mod tests {
         assert_eq!(
             gaps(&t4),
             vec!["backup".to_owned()],
-            "a no-reading poll emits usage_gap, so the flagged silence above was observed"
+            "a no-reading poll emits usage_gap, so the silence above was observed"
         );
         assert_eq!(stored().len(), 1, "a failed poll stores nothing either");
     }
 
-    /// Issue #1613: the rate limit on the absent-session-window stderr line is
-    /// once per account per EPISODE — the first flagged reading prints, later ones in the same
-    /// run are silent, an unflagged reading re-arms it, and the next flagged reading prints
-    /// again; another account's episode is independent. Pinned here because a line per flagged
-    /// poll would repeat every cycle for every weekly-only account until #1596 lands.
-    #[test]
-    fn the_absent_session_line_fires_once_per_episode_and_re_arms_on_an_unflagged_reading() {
-        let mut state = DecisionState::default();
-        let mut out = SharedSink::default();
-        state.note_session_window_absence("u-A", "work", true, &mut out);
-        assert_eq!(
-            out.lines().len(),
-            1,
-            "the first flagged reading of an episode prints"
-        );
-        assert_absent_session_line(&out.lines()[0], "work");
-        state.note_session_window_absence("u-A", "work", true, &mut out);
-        assert_eq!(
-            out.lines().len(),
-            1,
-            "a second flagged reading in the same episode is silent"
-        );
-        state.note_session_window_absence("u-A", "work", true, &mut out);
-        assert_eq!(out.lines().len(), 1, "and so is a third");
-        state.note_session_window_absence("u-B", "spare", true, &mut out);
-        assert_eq!(
-            out.lines().len(),
-            2,
-            "another account's first flagged reading is its own episode"
-        );
-        assert_absent_session_line(&out.lines()[1], "spare");
-        state.note_session_window_absence("u-A", "work", false, &mut out);
-        assert_eq!(
-            out.lines().len(),
-            2,
-            "an unflagged reading prints nothing and closes the episode"
-        );
-        assert!(
-            !state.absent_session_line_noted.contains("u-A"),
-            "the episode is closed"
-        );
-        state.note_session_window_absence("u-A", "work", true, &mut out);
-        assert_eq!(
-            out.lines().len(),
-            3,
-            "the next flagged reading opens a new episode and prints"
-        );
-        state.note_session_window_absence("u-B", "spare", true, &mut out);
-        assert_eq!(
-            out.lines().len(),
-            3,
-            "while the other account's episode is still open"
-        );
-    }
+    // --- one account moving between outcomes across ticks --------------------------------
 
-    /// A failed write of the line (under launchd stderr is a file on the event log's volume, so
-    /// a full volume fails it) is swallowed, never a panic, and the episode still opens: the
-    /// line is best-effort, the latch is not. The companion of the run loop's discarded
-    /// `writeln!` discipline (issue #1494), which `eprintln!` would have broken here.
-    #[test]
-    fn a_failed_write_of_the_absent_session_line_does_not_panic_and_still_opens_the_episode() {
-        let mut state = DecisionState::default();
-        // Must NOT panic / unwind: reaching the assertions below proves the write error was
-        // swallowed and control returned to the (simulated) poll loop.
-        state.note_session_window_absence("u-A", "work", true, &mut FailingWriter);
-        assert!(
-            state.absent_session_line_noted.contains("u-A"),
-            "the episode opened although its line could not be written"
-        );
-        // The episode is open, so the next flagged reading attempts no write at all — observed
-        // through a sink that would have recorded one.
-        let mut sink = SharedSink::default();
-        state.note_session_window_absence("u-A", "work", true, &mut sink);
-        assert!(
-            sink.lines().is_empty(),
-            "no second line: the failed first write still counted as the episode's line"
-        );
-    }
-
-    /// The poll loop folds the latch for the polled account only, and writes the line where the
-    /// latch says it is due: the flagged active's first poll opens its episode and writes the
-    /// line once; the unflagged peer's poll opens no episode of its own, closes none but its own
-    /// and writes nothing; and the active's next flagged poll finds its episode still open, so
-    /// no second line. The line is read off the injected sink, so a loop that wrote on every
-    /// flagged poll, or never wrote, fails here even with the latch state intact. Each tick's
-    /// polled account is asserted from its `Diagnostic::Poll` before the latch is read, so the
-    /// unflagged peer's step is exercised rather than assumed from the schedule.
-    #[tokio::test]
-    async fn tick_opens_the_absent_session_line_episode_for_the_polled_account_only() {
-        let sink = SharedSink::default();
-        let mut daemon = three_account_daemon(
-            FakeRosterPoller::new()
-                .ok_session_absent("u-A", 0.10)
-                .ok("u-B", 0.22, 0.10)
-                .ok("u-C", 0.33, 0.10),
-        )
-        .await
-        .with_absent_session_line_out(Box::new(sink.clone()));
-        let noted = |daemon: &FakeDaemon| -> Vec<String> {
-            daemon
-                .state
-                .absent_session_line_noted
-                .iter()
-                .cloned()
-                .collect()
-        };
-        assert!(noted(&daemon).is_empty(), "no episode before any poll");
-        assert!(sink.lines().is_empty(), "no line before any poll");
-        let t1 = daemon.tick().await;
-        assert!(peer_polled(&t1, "work"), "tick 1 polls the flagged active");
-        assert_eq!(
-            noted(&daemon),
-            vec!["u-A".to_owned()],
-            "the first flagged reading opens the active's episode, keyed by its uuid"
-        );
-        let lines = sink.lines();
-        assert_eq!(lines.len(), 1, "and writes the line once: {lines:?}");
-        assert_absent_session_line(&lines[0], "work");
-        let t2 = daemon.tick().await;
-        assert!(
-            peer_polled(&t2, "spare") && !peer_polled(&t2, "work"),
-            "tick 2 polls the unflagged peer, not the active"
-        );
-        assert_eq!(
-            noted(&daemon),
-            vec!["u-A".to_owned()],
-            "an unflagged reading opens no episode and closes none but its own"
-        );
-        assert_eq!(sink.lines().len(), 1, "and writes nothing");
-        let t3 = daemon.tick().await;
-        assert!(
-            peer_polled(&t3, "work"),
-            "tick 3 polls the flagged active again"
-        );
-        assert_eq!(
-            noted(&daemon),
-            vec!["u-A".to_owned()],
-            "still one open episode: one line per episode"
-        );
-        assert_eq!(
-            sink.lines().len(),
-            1,
-            "a later flagged reading in the open episode writes no second line"
-        );
-    }
-
-    /// A roster reload that drops an account drops its absent-session-line entry with the rest of
-    /// its state (`reconcile_roster`), and a reload that drops ANOTHER account leaves the open
-    /// episode alone. Re-added while its replies are still weekly-only, the account opens a new
-    /// episode and its line is written again; a latch that kept the removed account's entry
-    /// would leave that first flagged reading silent.
-    #[tokio::test]
-    async fn a_roster_reload_that_drops_an_account_closes_its_absent_session_episode() {
-        let sink = SharedSink::default();
-        let mut daemon = three_account_daemon(
-            FakeRosterPoller::new()
-                .ok("u-A", 0.11, 0.10)
-                .ok_session_absent("u-B", 0.10)
-                .ok("u-C", 0.33, 0.10),
-        )
-        .await
-        .with_absent_session_line_out(Box::new(sink.clone()));
-        let t1 = daemon.tick().await;
-        assert!(peer_polled(&t1, "work"), "tick 1 polls the active");
-        let t2 = daemon.tick().await;
-        assert!(peer_polled(&t2, "spare"), "tick 2 polls the flagged peer");
-        assert_eq!(
-            sink.lines().len(),
-            1,
-            "its first flagged reading writes the line"
-        );
-        assert!(
-            daemon.state.absent_session_line_noted.contains("u-B"),
-            "and opens its episode"
-        );
-
-        assert_eq!(
-            daemon.reconcile_roster(
-                vec![account("u-A", "work"), account("u-B", "spare")],
-                ReloadIntent::Mutating,
-            ),
-            commands::ReconcileOutcome::Adopted,
-        );
-        assert!(
-            daemon.state.absent_session_line_noted.contains("u-B"),
-            "a reload that drops another account leaves the open episode alone"
-        );
-
-        assert_eq!(
-            daemon.reconcile_roster(vec![account("u-A", "work")], ReloadIntent::Mutating),
-            commands::ReconcileOutcome::Adopted,
-        );
-        assert!(
-            daemon.state.absent_session_line_noted.is_empty(),
-            "a reload that drops the account drops its entry with the rest of its state"
-        );
-
-        assert_eq!(
-            daemon.reconcile_roster(
-                vec![account("u-A", "work"), account("u-B", "spare")],
-                ReloadIntent::AppendOnly,
-            ),
-            commands::ReconcileOutcome::Adopted,
-        );
-        let mut polled_spare = false;
-        for _ in 0..4 {
-            let t = daemon.tick().await;
-            if peer_polled(&t, "spare") {
-                polled_spare = true;
-                break;
-            }
-        }
-        assert!(
-            polled_spare,
-            "the re-added account is polled within one schedule cycle"
-        );
-        let lines = sink.lines();
-        assert_eq!(
-            lines.len(),
-            2,
-            "the re-added account's first flagged reading opens a new episode and writes again: \
-             {lines:?}"
-        );
-        assert_absent_session_line(&lines[1], "spare");
-    }
-
-    /// Two roster accounts may share a label: validation keeps `account_uuid` unique but checks
-    /// a label only for emptiness. The absent-session-line latch keys on the uuid, so the peer's
-    /// unflagged polls neither open an episode of their own nor close the flagged account's:
-    /// that episode opens on its first poll and stays open, one entry across the cycles, and its
-    /// line is written exactly once. (Keyed by label, the two accounts would share one entry,
-    /// and the peer's reading would close the flagged account's episode every cycle, re-arming
-    /// its line into one per cycle.)
-    #[tokio::test]
-    async fn tick_keeps_an_absent_session_episode_open_past_an_unflagged_peer_sharing_its_label() {
-        // `u-A` (the active) answers weekly-only; its peer `u-B` carries the SAME label and answers
-        // with both windows. Built inline because every shared fixture gives distinct labels.
-        let roster = vec![account("u-A", "work"), account("u-B", "work")];
-        let store = store_holding(b"A-token").await;
-        let stash = stash_with(&[
-            ("Sessiometer/u-A", b"A-token", "u-A"),
-            ("Sessiometer/u-B", b"B-token", "u-B"),
-        ])
-        .await;
-        let (dir, json) = claude_json("u-A");
-        std::mem::forget(dir); // kept alive for the daemon's lifetime, as the shared fixtures do
-        let tun = tunables(95, 80, 0);
-        let sink = SharedSink::default();
-        let mut daemon: FakeDaemon = Daemon::new(
-            roster,
-            FakeRosterPoller::new()
-                .ok_session_absent("u-A", 0.10)
-                .ok("u-B", 0.22, 0.10),
-            store,
-            stash,
-            FakeClock::frozen(),
-            json,
-            &tun,
-        )
-        .with_absent_session_line_out(Box::new(sink.clone()));
-        let open_episodes = |daemon: &FakeDaemon| daemon.state.absent_session_line_noted.len();
-
-        for cycle in 1..=3 {
-            let _ = daemon.tick().await;
-            // The #366 interleave polls `[u-A, u-B]` each cycle: pinned before reading the latch
-            // off it, since both accounts print the same label on the tick diagnostics.
-            assert_eq!(
-                daemon.state.poll_schedule,
-                vec![0, 1],
-                "cycle {cycle}: the active `u-A` is polled first, then its peer `u-B`"
-            );
-            assert_eq!(
-                open_episodes(&daemon),
-                1,
-                "cycle {cycle}: the flagged account's episode is open after its poll"
-            );
-            assert_eq!(
-                sink.lines().len(),
-                1,
-                "cycle {cycle}: its line was written once, on its first poll, and not again"
-            );
-            let _ = daemon.tick().await;
-            assert_eq!(
-                open_episodes(&daemon),
-                1,
-                "cycle {cycle}: the unflagged peer sharing the label neither opens an episode \
-                 of its own nor closes the flagged account's"
-            );
-            assert_eq!(
-                sink.lines().len(),
-                1,
-                "cycle {cycle}: and the peer's poll writes no line"
-            );
-        }
-        assert_absent_session_line(&sink.lines()[0], "work");
-    }
-
-    // --- Issue #1613: one account moving between outcomes across ticks -------------------
-
-    /// The daemon the outcome-transition tests drive (issue #1613): ONE roster account (`work`
-    /// = `u-A`, the active), so with no peers the #366 schedule polls it on EVERY tick; a
-    /// [`SeamPoller`] whose shared cell lets a test move that account between the flagged,
-    /// unflagged and failed outcomes between ticks; the issue-#1613 line redirected to a sink;
-    /// and BOTH stores wired to a temp dir — the per-poll usage-sample collector and the stats
-    /// layer. Store safety: `with_stats` is always wired beside `with_stats_store_paths`, and a
-    /// test build refuses the operator's live store anyway (`Daemon::stats_store_pair` panics
-    /// rather than resolve the real `crate::paths` pair, which no environment variable
-    /// redirects).
+    /// The daemon the outcome-transition tests drive: ONE roster account (`work` = `u-A`, the
+    /// active), so with no peers the #366 schedule polls it on EVERY tick; a [`SeamPoller`]
+    /// whose shared cell lets a test move that account between a reading with its session
+    /// window absent, a two-window reading and a failed poll between ticks; and BOTH stores
+    /// wired to a temp dir — the per-poll usage-sample collector and the stats layer. Store
+    /// safety: `with_stats` is always wired beside `with_stats_store_paths`, and a test build
+    /// refuses the operator's live store anyway (`Daemon::stats_store_pair` panics rather than
+    /// resolve the real `crate::paths` pair, which no environment variable redirects).
     struct TransitionRig {
         daemon: Daemon<SeamPoller, FakeCredentialStore, FakeAccountStash, FakeClock>,
         outcomes: SeamOutcomes,
-        sink: SharedSink,
         samples_path: PathBuf,
         /// Keeps the temp store alive for the rig's lifetime.
         _dir: tempfile::TempDir,
@@ -20806,7 +20596,6 @@ mod tests {
             let tun = tunables(95, 80, 0);
             let outcomes: SeamOutcomes =
                 Rc::new(RefCell::new(HashMap::from([("u-A".to_owned(), first)])));
-            let sink = SharedSink::default();
             let daemon = Daemon::new(
                 roster,
                 SeamPoller {
@@ -20818,14 +20607,12 @@ mod tests {
                 json,
                 &tun,
             )
-            .with_absent_session_line_out(Box::new(sink.clone()))
             .with_usage_samples(samples_path.clone())
             .with_stats(RetentionPolicy::default())
             .with_stats_store_paths(samples_path.clone(), rollup_path);
             Self {
                 daemon,
                 outcomes,
-                sink,
                 samples_path,
                 _dir: dir,
             }
@@ -20866,12 +20653,6 @@ mod tests {
                 .advance(until.saturating_duration_since(now));
         }
 
-        fn episode_open(&self) -> bool {
-            self.daemon.state.absent_session_line_noted.contains("u-A")
-        }
-        fn lines(&self) -> usize {
-            self.sink.lines().len()
-        }
         fn stored(&self) -> usize {
             crate::usage_store::read_samples(&self.samples_path)
                 .unwrap()
@@ -20894,95 +20675,13 @@ mod tests {
             .collect()
     }
 
-    /// Flagged → unflagged → flagged: the unflagged reading closes the episode (and stores its
-    /// sample), and the next flagged reading opens a new one, so the line is due AGAIN. Pins
-    /// the re-arm through the poll loop, which only an unflagged READING performs.
+    /// Failed → a reading with its session window absent → failed: to the `usage_gap` tracker
+    /// such a reading is a READING, so it ends the account's gap streak although it stores no
+    /// sample; the failure after it opens a NEW streak and emits at once — a continuing streak
+    /// would have been rate-limited for `GAP_REEMIT_MIN_SECS`, which is the difference a poll
+    /// that skipped the stats layer would show.
     #[tokio::test]
-    async fn an_unflagged_reading_closes_the_absent_session_episode_and_the_next_flagged_one_reopens_it(
-    ) {
-        let mut rig = TransitionRig::new(Scripted::OkSessionAbsent(reading(0.0, 0.10))).await;
-
-        let t1 = rig.tick().await;
-        assert!(
-            rig.episode_open(),
-            "the first flagged reading opens the episode"
-        );
-        assert_eq!(rig.lines(), 1, "and writes the line once");
-        assert_eq!(rig.stored(), 0, "a flagged reading stores no sample");
-        assert!(
-            usage_gaps_for_work(&t1).is_empty(),
-            "a flagged reading is a reading, not a gap"
-        );
-
-        rig.script(Scripted::Ok(reading(0.30, 0.10)));
-        let t2 = rig.tick().await;
-        assert!(
-            !rig.episode_open(),
-            "an unflagged reading closes the episode"
-        );
-        assert_eq!(rig.lines(), 1, "and writes no line");
-        assert_eq!(rig.stored(), 1, "an unflagged reading stores its sample");
-        assert!(usage_gaps_for_work(&t2).is_empty());
-
-        rig.script(Scripted::OkSessionAbsent(reading(0.0, 0.10)));
-        let t3 = rig.tick().await;
-        assert!(
-            rig.episode_open(),
-            "the next flagged reading opens a new episode"
-        );
-        assert_eq!(rig.lines(), 2, "and the line is due again");
-        assert_eq!(rig.stored(), 1, "a flagged reading stores no sample");
-        assert!(usage_gaps_for_work(&t3).is_empty());
-    }
-
-    /// Flagged → failed → flagged: a failed poll has no reading, so it folds nothing into the
-    /// latch and leaves the episode OPEN; the flagged reading after the outage finds it still
-    /// open, so no second line. (The failed poll is a gap to the stats layer all the same.)
-    #[tokio::test]
-    async fn a_failed_poll_inside_an_absent_session_episode_leaves_it_open_so_no_second_line() {
-        let mut rig = TransitionRig::new(Scripted::OkSessionAbsent(reading(0.0, 0.10))).await;
-
-        let _t1 = rig.tick().await;
-        assert!(
-            rig.episode_open(),
-            "the first flagged reading opens the episode"
-        );
-        assert_eq!(rig.lines(), 1, "and writes the line once");
-
-        rig.script(Scripted::Transient);
-        let t2 = rig.tick().await;
-        assert!(rig.episode_open(), "a failed poll leaves the episode open");
-        assert_eq!(rig.lines(), 1, "and writes no line");
-        assert_eq!(
-            usage_gaps_for_work(&t2).len(),
-            1,
-            "a no-reading poll is a gap to the stats layer: usage_gap"
-        );
-        assert_eq!(rig.stored(), 0, "a failed poll stores nothing");
-
-        rig.clear_backoff();
-        rig.script(Scripted::OkSessionAbsent(reading(0.0, 0.10)));
-        let t3 = rig.tick().await;
-        assert!(rig.episode_open(), "the episode is still the same one");
-        assert_eq!(
-            rig.lines(),
-            1,
-            "the episode survived the outage, so no second line"
-        );
-        assert!(
-            usage_gaps_for_work(&t3).is_empty(),
-            "a flagged reading ends the gap streak"
-        );
-        assert_eq!(rig.stored(), 0, "a flagged reading stores no sample");
-    }
-
-    /// Failed → flagged → failed: to the `usage_gap` tracker a flagged reading is a READING, so
-    /// it ends the account's gap streak although it stores no sample; the failure after it
-    /// opens a NEW streak and emits at once — a continuing streak would have been rate-limited
-    /// for `GAP_REEMIT_MIN_SECS`, which is the difference a flagged poll that skipped the stats
-    /// layer would show. The episode, opened by the flagged reading, survives the failure.
-    #[tokio::test]
-    async fn a_flagged_reading_between_two_failed_polls_ends_the_gap_streak_and_the_next_failure_opens_a_new_one(
+    async fn a_reading_without_a_session_window_between_two_failed_polls_ends_the_gap_streak_and_the_next_failure_opens_a_new_one(
     ) {
         let mut rig = TransitionRig::new(Scripted::Transient).await;
 
@@ -20994,20 +20693,16 @@ mod tests {
             "the first failed poll opens a streak: usage_gap"
         );
         assert!(rig.gap_streak_open(), "the streak is carried");
-        assert!(!rig.episode_open(), "no reading, no episode");
-        assert_eq!(rig.lines(), 0, "and no line");
         assert_eq!(rig.stored(), 0, "a failed poll stores nothing");
 
         rig.clear_backoff();
-        rig.script(Scripted::OkSessionAbsent(reading(0.0, 0.10)));
+        rig.script(Scripted::Ok(usage_without_a_session_window(0.10)));
         let t2 = rig.tick().await;
         assert!(
             usage_gaps_for_work(&t2).is_empty(),
-            "a flagged reading is a reading to the gap tracker: no usage_gap"
+            "a reading with its session window absent is a reading to the gap tracker: no usage_gap"
         );
         assert!(!rig.gap_streak_open(), "and it ends the streak");
-        assert!(rig.episode_open(), "the flagged reading opens the episode");
-        assert_eq!(rig.lines(), 1, "and writes the line once");
         assert_eq!(rig.stored(), 0, "yet it stores no sample");
 
         rig.script(Scripted::Transient);
@@ -21024,8 +20719,6 @@ mod tests {
             "the new streak starts at or after the old one: {first:?} then {second:?}"
         );
         assert!(rig.gap_streak_open(), "the new streak is carried");
-        assert!(rig.episode_open(), "a failed poll leaves the episode open");
-        assert_eq!(rig.lines(), 1, "and writes no line");
         assert_eq!(rig.stored(), 0);
     }
 
@@ -21332,6 +21025,736 @@ mod tests {
         assert!(
             e3.iter().any(|e| matches!(e, Event::UsageRollup { .. })),
             "rolls again past the cadence"
+        );
+    }
+
+    // --- #1602: every decision arm names its move on an absent quota window ------------------
+
+    /// A weekly-only usage reading carrying its WEEKLY reset stamp (issue #1602): `session: None,
+    /// session_resets_at: None` — the account has no session window — beside a present weekly.
+    fn weekly_only_with_reset(weekly: f64, weekly_resets_at: Option<i64>) -> Usage {
+        Usage {
+            session: None,
+            weekly: Some(weekly),
+            weekly_resets_at,
+            session_resets_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_weekly_only_active_swaps_with_reason_weekly_and_arms_no_parked_landing() {
+        // Issue #1602 (rows 3 and 15): a reactive swap off a weekly-only active is attributed
+        // `Weekly` — `Session` is read only from a session window the reading CARRIES — with
+        // `session_pct: None`, rendered as an OMITTED `session_pct=` token (never a fabricated `0`,
+        // mutant M-a), and no `ParkedLanding` is armed: the watch is a session-tail watch, armed
+        // from the very `Some` the `Session` attribution matched.
+        let mut daemon = lifecycle_daemon_with(
+            FakeRosterPoller::new()
+                .ok_without_a_session_window("u-A", 0.99)
+                .ok("u-B", 0.10, 0.10),
+            tunables(95, 80, 0),
+        )
+        .await;
+        let outcome = warmed_tick(&mut daemon).await;
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+        let swap = outcome
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::Swap { .. }))
+            .expect("the tick logged its swap");
+        assert_eq!(
+            *swap,
+            Event::Swap {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+                reason: SwapReason::Weekly,
+                session_pct: None,
+                projection: None,
+            },
+            "reason=weekly with no session percent for a weekly-only active",
+        );
+        let line = swap.to_log_line(std::time::UNIX_EPOCH);
+        assert!(
+            line.contains("event=swap from=work to=spare reason=weekly"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("session_pct="),
+            "no `session_pct=` token for a window the account does not have: {line}",
+        );
+        assert!(
+            daemon.state.accounts[0].parked_landing.is_none(),
+            "a weekly swap arms no landing watch on the parked account",
+        );
+    }
+
+    #[tokio::test]
+    async fn velocity_swap_holds_when_the_active_session_window_is_absent() {
+        // Issue #1602 (row 4): the projective arm projects the SESSION window only, so a
+        // weekly-only active has nothing to project — `Held`, before any read of the velocity or
+        // the band, never a projection off a fabricated `1.0` (mutant M-h). The fleet is warmed with
+        // viable spares and the retained EMA climbs steeply, so every later gate would let the swap
+        // through: only the early return holds it.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok_without_a_session_window("u-A", 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(daemon.state.active, Some(0));
+        daemon.session_velocity_horizon_secs = 150;
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
+            rate: 0.01,
+            samples: 5,
+        });
+        let at = daemon.clock.now();
+        let readings = daemon.state.readings();
+        assert_eq!(
+            readings[0].and_then(|usage| usage.session),
+            None,
+            "fixture: the active's session window is absent",
+        );
+        let mut events = Vec::new();
+        let action = daemon
+            .velocity_swap(at, 0, 0.95, 0.97, &readings, &mut events)
+            .await;
+        assert!(
+            matches!(action, TickAction::Held),
+            "no session window → nothing to project → hold: {action:?}",
+        );
+        assert_eq!(daemon.state.active, Some(0), "no swap");
+        assert!(events.is_empty(), "no swap event emitted");
+    }
+
+    #[tokio::test]
+    async fn out_of_rotation_for_a_weekly_only_peer_keys_on_its_weekly_line_only() {
+        // Issue #1602 (row 5): a weekly-only peer is out of rotation on its weekly line alone — its
+        // absent session axis puts nothing out of rotation (mutant M-i, the session arm as
+        // `is_none_or`, arms the window at weekly 0.90). The slow-poll window arms at 0.98 (over
+        // the 0.97 rotation line) and clears at 0.90, each with its edge event.
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        daemon.state.active = Some(0);
+        let now = daemon.clock.now();
+        let now_secs = wall_clock_now_secs();
+        let far = Some(now_secs + 999_999);
+
+        daemon.state.accounts[1].last_reading = Some(weekly_only_with_reset(0.98, far));
+        let mut events = Vec::new();
+        daemon.note_exhausted_poll(1, Some(0), now, now_secs, &mut events);
+        assert!(
+            daemon.state.accounts[1]
+                .health
+                .exhausted_poll_until
+                .is_some(),
+            "over its weekly line the weekly-only peer is slow-polled",
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::ExhaustedSlowPoll { account, window_secs }
+                    if account == "u-B" && *window_secs == 3600
+            )),
+            "the ENTER edge, at the hourly ceiling (the reset is far): {events:?}",
+        );
+
+        daemon.state.accounts[1].last_reading = Some(weekly_only_with_reset(0.90, far));
+        let mut events = Vec::new();
+        daemon.note_exhausted_poll(1, Some(0), now, now_secs, &mut events);
+        assert!(
+            daemon.state.accounts[1]
+                .health
+                .exhausted_poll_until
+                .is_none(),
+            "below its weekly line the same peer is back in rotation — its absent session keeps nothing out",
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, Event::ExhaustedSlowPollCleared { account } if account == "u-B")
+            ),
+            "the EXIT edge: {events:?}",
+        );
+
+        // From a clean slate a weekly-only peer at 0.90 never arms at all.
+        daemon.state.accounts[2].last_reading = Some(weekly_only_with_reset(0.90, far));
+        let mut events = Vec::new();
+        daemon.note_exhausted_poll(2, Some(0), now, now_secs, &mut events);
+        assert!(daemon.state.accounts[2]
+            .health
+            .exhausted_poll_until
+            .is_none());
+        assert!(
+            events.is_empty(),
+            "no edge for a peer that was never out: {events:?}"
+        );
+    }
+
+    #[test]
+    fn exhausted_poll_window_ignores_an_absent_session_axis() {
+        // Issue #1602 (row 5): an axis the reading does not have is neither exhausted nor a window
+        // — it contributes no reset — so a weekly-only peer's window is keyed off its WEEKLY reset
+        // alone. That reset sits STRICTLY inside `poll_secs..exhausted_poll_secs` (60..3600) of
+        // `now`, so the clamp cannot decide the answer: mutant M-aa, which bails to the hourly
+        // ceiling whenever the session axis is absent, returns 3600 here instead of 1200.
+        let now = 1_000_000;
+        let exhausted = weekly_only_with_reset(0.98, Some(now + 1_200));
+        assert_eq!(
+            exhausted_poll_window(&exhausted, 0.97, 0.95, now, 3600, 60),
+            Duration::from_secs(1_200),
+            "exactly the seconds to the weekly reset — the absent session axis is ignored",
+        );
+        // Below the weekly line nothing is exhausted, so no reset contributes: the
+        // `exhausted_poll_secs` fallback — a `Duration`, never `None`.
+        let viable = weekly_only_with_reset(0.50, Some(now + 1_200));
+        assert_eq!(
+            exhausted_poll_window(&viable, 0.97, 0.95, now, 3600, 60),
+            Duration::from_secs(3600),
+        );
+    }
+
+    #[test]
+    fn all_exhausted_relief_names_a_weekly_hold_for_a_weekly_only_blocked_spare() {
+        // Issue #1602 (row 6): a weekly-only spare blocked on its weekly line is a POSITIVE relief
+        // case — `(Weekly, that spare, its weekly reset)` — never the nameless `(None, None)`
+        // fallthrough, and never "session-blocked" by a `0` or a `1.0` standing in for a window it
+        // does not have. Mutant M-j (`session_blocked` as `is_none_or`) then needs the session reset
+        // the reading lacks, so `spare_relief` yields `None` and the hint degrades to
+        // `(Weekly, that spare, None)`.
+        let readings = vec![
+            Some(reading(0.97, 0.40)),                     // the active (masked)
+            Some(weekly_only_with_reset(0.98, Some(500))), // the single spare, weekly-blocked
+        ];
+        let enabled = vec![true; 2];
+        assert_eq!(
+            all_exhausted_relief(0, &readings, &enabled, 0.80, 0.97),
+            (SwapReason::Weekly, 1, Some(500)),
+            "a weekly-only blocked spare names a weekly hold with its weekly reset",
+        );
+    }
+
+    #[tokio::test]
+    async fn next_swap_is_not_no_viable_target_while_a_weekly_only_spare_has_headroom() {
+        // Issue #1602 (row 6, AC-5 — #1604's in-process proxy): the `status` reply built from a
+        // fleet whose only spare is weekly-only at weekly 0.50 names that spare as the target —
+        // never `no_viable_target` ("out of capacity" while a spare has headroom) and never
+        // `AwaitingData` (the spare IS polled). Mutant M-k (M-f's session gate) excludes the only
+        // spare, so `next_swap` names no target.
+        let mut daemon = lifecycle_daemon_with(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.50, 0.40)
+                .ok_without_a_session_window("u-B", 0.50),
+            tunables(95, 80, 0),
+        )
+        .await;
+        let outcome = warmed_tick(&mut daemon).await;
+        assert_eq!(
+            outcome.action,
+            TickAction::Held,
+            "fixture: the active holds, so the preview is a forecast, not a swap report",
+        );
+        let target = Some(NextSwap::Target {
+            to: "spare".to_owned(),
+            reason: Some(NextSwapReason::OnlyCandidate),
+        });
+        assert_eq!(
+            outcome.snapshot.next_swap, target,
+            "the status reply names the weekly-only spare as the next target",
+        );
+        let readings = daemon.state.readings();
+        assert_eq!(
+            daemon.next_swap(Some(0), &readings),
+            target,
+            "the pure preview over the same readings agrees",
+        );
+    }
+
+    #[test]
+    fn blind_gate_armed_reads_false_on_an_absent_anchor_session() {
+        // Issue #1602 (row 7; D3's default): the two pure gate predicates take `Option<f64>` and
+        // read FALSE on an anchor whose session window does not apply — never armed off a `1.0`
+        // standing in for it (mutant M-l). Whether a weekly anchor should arm the gate is OAD-2.
+        assert!(
+            !blind_gate_armed(BLIND_GATE_SECS + 1, None),
+            "no session window on the anchor → the gate is not armed",
+        );
+        let climbing = Some(VelocityEma {
+            rate: 0.01,
+            samples: 3,
+        });
+        assert!(
+            !blind_velocity_projected_armed(BLIND_GATE_SECS + 1, None, climbing, 0.95),
+            "…and the velocity arm has nothing to project from",
+        );
+        // Controls: the same inputs WITH a session arm both — the `false` above is the absent
+        // window's, not the fixture's.
+        assert!(blind_gate_armed(
+            BLIND_GATE_SECS + 1,
+            Some(BLIND_GATE_RISK_BAND)
+        ));
+        assert!(blind_velocity_projected_armed(
+            BLIND_GATE_SECS + 1,
+            Some(0.29),
+            climbing,
+            0.95
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_weekly_only_blind_active_past_the_gate_fires_no_blind_swap_and_no_eligibility_event()
+    {
+        // Issue #1602 (row 7; D3's default, OAD-2 open): a weekly-only active blind past the gate
+        // with NO `Retry-After` hold falls through to the historical skip — the anchor arm reads
+        // not armed on an anchor without a session window in its own right (it compares against
+        // the config band and never calls `blind_gate_armed`; mutant M-n reads it `is_none_or` and
+        // fires) — and no `BlindGateEligible` event is emitted. The fleet is warmed with viable
+        // spares and `session_blind_swap_secs` sits below the blind duration, so only the absent
+        // window holds the swap.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok_without_a_session_window("u-A", 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(daemon.state.active, Some(0));
+        assert_eq!(
+            daemon.state.last_good.map(|a| (a.session, a.weekly)),
+            Some((None, Some(0.20))),
+            "fixture: the retained anchor has no session window",
+        );
+        // Blind the active with NO server directive, so only the anchor arm could fire.
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.accounts[0].last_reading.is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "an anchor without a session window never arms the gate: {:?}",
+            out.action,
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "u-A held — nothing to protect on a window it does not have"
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, Event::Swap { .. } | Event::BlindGateEligible { .. })),
+            "no swap and no eligibility event for a weekly-only blind active: {:?}",
+            out.events,
+        );
+        assert!(daemon.state.last_blind_preempt_swap.is_none());
+        // And `status` projects no `blind_active` block for it (D10; the pure seam is
+        // `blind_active_view_emits_no_block_for_a_weekly_only_blind_active_until_the_wire_can_say_so`).
+        assert_eq!(out.snapshot.accounts[0].blind_active, None);
+    }
+
+    #[tokio::test]
+    async fn a_weekly_only_active_entering_blindness_logs_near_limit_false_and_no_session_percent()
+    {
+        // Issue #1602 (rows 7 and 15): the `blind_enter` edge for a weekly-only active tags
+        // `near_limit: false` (it sat in no band it did not have), carries `session_pct: None`
+        // beside its present `weekly_pct`, and renders with `near_limit=false`, `weekly_pct=` and
+        // NO `session_pct=` token — never a fabricated `0` (mutant M-b).
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok_without_a_session_window("u-A", 0.30))
+                .await;
+        daemon.tick().await; // the live weekly-only reading that becomes the anchor
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        let entered = daemon.tick().await; // the 429 — the entry edge
+        let enter = entered
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::BlindEnter { .. }))
+            .expect("the entry edge records the episode");
+        assert_eq!(
+            *enter,
+            Event::BlindEnter {
+                account: "u-A".to_owned(),
+                session_pct: None,
+                weekly_pct: Some(30),
+                was_active: true,
+                near_limit: false,
+            },
+        );
+        let line = enter.to_log_line(std::time::UNIX_EPOCH);
+        assert!(
+            line.contains(" weekly_pct=30 ") && line.ends_with(" near_limit=false"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("session_pct="),
+            "no `session_pct=` token for a window the account does not have: {line}",
+        );
+    }
+
+    #[tokio::test]
+    async fn active_near_limit_reads_false_for_a_weekly_only_active() {
+        // Issue #1602 (row 8; D4's default, pinned so the behaviour is stated rather than
+        // accidental): the near-limit band is a SESSION-window band, so a weekly-only active reads
+        // false on both arms — the in-band floor and the sustained-EMA projection — and the fast-poll
+        // stays disengaged, however high its weekly window and however steep the retained EMA.
+        // Mutant M-o reads the floor off a `1.0` default and engages.
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok_without_a_session_window("u-A", 0.96)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(daemon.state.active, Some(0));
+        daemon.near_limit_poll_secs = 60; // enable the path (`tunables` ships it at 0)
+        daemon.session_velocity_horizon_secs = 150; // arm the projection arm
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma {
+            rate: 0.01,
+            samples: 3,
+        });
+        assert!(
+            !daemon.active_near_limit(0),
+            "no session window → no band to be in or to approach",
+        );
+        assert!(
+            !daemon.near_limit_fast_poll_engaged(),
+            "…so the near-limit fast-poll stays disengaged",
+        );
+        // Control: the same daemon with an in-band session reading engages — the `false` above is
+        // the absent window's.
+        daemon.state.accounts[0].last_reading = Some(reading(0.90, 0.96));
+        assert!(daemon.active_near_limit(0));
+        assert!(daemon.near_limit_fast_poll_engaged());
+    }
+
+    #[tokio::test]
+    async fn a_weekly_only_reading_ends_a_blind_episode_and_the_exit_event_carries_no_session_percent(
+    ) {
+        // Issue #1602 (rows 11 and 15): a served weekly-only reading is `Live` (row 11 — the
+        // classifier is unchanged), so it ENDS a blind episode opened on a two-window anchor. The
+        // `blind_exit` carries `session_at_recovery: None` beside `weekly_at_recovery: Some`, its
+        // line derives the weekly burn and no session burn, and the `blind_window` line for the
+        // same episode omits `session_at_recovery=`. Never a fabricated `0` at recovery (mutant
+        // M-s), which would read as a quiet session reset.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.29, 0.05)).await;
+        daemon.tick().await; // the two-window anchor: session 29 %, weekly 5 %
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await; // the 429 that blinds it — the entry edge
+        daemon.clock.advance(Duration::from_secs(300));
+        daemon.poller = FakeRosterPoller::new().ok_without_a_session_window("u-A", 0.17);
+        let mut recovered = Vec::new();
+        for _ in 0..4 {
+            recovered.extend(daemon.tick().await.events);
+            if daemon.state.accounts[0].last_reading.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            daemon.state.accounts[0]
+                .last_reading
+                .map(|usage| (usage.session, usage.weekly)),
+            Some((None, Some(0.17))),
+            "the weekly-only reading is served as a live reading — the episode is over",
+        );
+        let exit = recovered
+            .iter()
+            .find(|e| matches!(e, Event::BlindExit { .. }))
+            .expect("the recovery closes the episode");
+        assert_eq!(
+            *exit,
+            Event::BlindExit {
+                account: "u-A".to_owned(),
+                duration_secs: 300,
+                session_pct: Some(29),
+                session_at_recovery: None,
+                weekly_pct: Some(5),
+                weekly_at_recovery: Some(17),
+                was_active: true,
+                swapped_away: false,
+                near_limit: false,
+            },
+            "the exit carries the weekly recovery and no session recovery: {recovered:?}",
+        );
+        let exit_line = exit.to_log_line(std::time::UNIX_EPOCH);
+        assert!(
+            exit_line.contains(" weekly_burn_pct=12"),
+            "the weekly burn is derived: {exit_line}"
+        );
+        assert!(
+            !exit_line.contains("session_burn_pct=") && !exit_line.contains("session_at_recovery="),
+            "no session burn and no session recovery token: {exit_line}",
+        );
+        let window = recovered
+            .iter()
+            .find(|e| matches!(e, Event::BlindWindow { .. }))
+            .expect("the recovery edge closes the blind window too");
+        assert!(
+            matches!(
+                window,
+                Event::BlindWindow {
+                    duration_secs: 300,
+                    session_pct: Some(29),
+                    session_at_recovery: None,
+                    ..
+                }
+            ),
+            "{window:?}"
+        );
+        let window_line = window.to_log_line(std::time::UNIX_EPOCH);
+        assert!(
+            window_line.contains(" session_pct=29 ") && !window_line.contains("session_at_recovery="),
+            "the blind_window line keeps the anchor's percent and omits the recovery's: {window_line}",
+        );
+    }
+
+    /// [`blind_retry_after_daemon`]'s weekly-only twin (issue #1602): u-A active with a retained
+    /// anchor that has NO session window, then `429`'d carrying a long server `Retry-After`, with
+    /// BOTH peers at 10 % — two viable targets, because a session-less `Retry-After` swap is
+    /// speculative and the #582 reserve breaker holds it on a sole candidate (the committed
+    /// `the_retry_after_swap_never_spends_the_last_viable_target` builds that held case). Returned
+    /// blind, with the clock just past the gate bound, on the tick `blind_swap` decides.
+    async fn blind_retry_after_daemon_without_a_session_window(
+        retry_after: Duration,
+    ) -> FakeDaemon {
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok_without_a_session_window("u-A", 0.20)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        daemon.session_blind_swap_secs = BLIND_GATE_SECS;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert!(daemon.state.warmed_up);
+        assert_eq!(daemon.state.active, Some(0));
+        assert_eq!(
+            daemon.state.last_good.map(|a| a.session),
+            Some(None),
+            "fixture: the retained anchor has no session window",
+        );
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", Some(retry_after))
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        while daemon.state.accounts[0].last_reading.is_some() {
+            daemon.tick().await;
+        }
+        daemon
+            .clock
+            .advance(Duration::from_secs(BLIND_GATE_SECS + 1));
+        daemon
+    }
+
+    #[tokio::test]
+    async fn the_swap_line_omits_session_pct_for_a_blind_preempt_from_a_weekly_only_anchor() {
+        // Issue #1602 (rows 7 and 15): the #582 `Retry-After` arm never reads the session, so it
+        // fires for a session-less anchor exactly as before — `reason: BlindPreempt` with
+        // `session_pct: None`, the line carrying no `session_pct=` token (never a fabricated `0`,
+        // mutant M-e). What the swap retains for `status` is
+        // `a_retry_after_blind_preempt_from_a_weekly_only_anchor_retains_no_status_notice`'s to
+        // assert.
+        let mut daemon =
+            blind_retry_after_daemon_without_a_session_window(Duration::from_secs(3600)).await;
+        let swapped = daemon.tick().await;
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::PreemptivelySwapped { from: 0, .. }
+            ),
+            "the server directive swaps the blind weekly-only active away: {:?}",
+            swapped.action,
+        );
+        let swap = swapped
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::Swap { .. }))
+            .expect("the swap is logged");
+        assert!(
+            matches!(
+                swap,
+                Event::Swap {
+                    reason: SwapReason::BlindPreempt,
+                    session_pct: None,
+                    projection: None,
+                    ..
+                }
+            ),
+            "{swap:?}"
+        );
+        let line = swap.to_log_line(std::time::UNIX_EPOCH);
+        assert!(
+            line.contains("event=swap from=work to=") && line.contains(" reason=blind_preempt"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("session_pct="),
+            "no `session_pct=` token for an anchor without a session window: {line}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_landing_watch_releases_with_no_record_when_the_departed_account_reads_weekly_only(
+    ) {
+        // Issue #1602 (row 3): a `ParkedLanding` armed by a `reason=session` departure releases
+        // with NO landing record when the departed account's next served reading, strictly inside
+        // the landing window, carries no session window — an account without one cannot overshoot
+        // this swap's session tail. Mutant M-ac skips the absent reading and leaves the watch
+        // armed; a `0.0` default leaves it armed too (a `0` is no overshoot).
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        daemon.state.active = Some(0); // "work" active; "spare" (idx 1) is the parked account
+        let base = daemon.clock.now();
+        // Strictly INSIDE the landing window, so the elapsed-window disarm cannot stand in for
+        // the rule.
+        let inside = base + Duration::from_secs(1);
+        assert!(Duration::from_secs(1) < landing::LANDING_WINDOW);
+        let arm = |d: &mut FakeDaemon| {
+            d.state.accounts[1].parked_landing = Some(ParkedLanding {
+                armed_at: base,
+                decision_pct: 95,
+            });
+        };
+
+        arm(&mut daemon);
+        daemon.note_landing_overshoot(
+            1,
+            Some(0),
+            &Ok(usage_without_a_session_window(0.50)),
+            inside,
+        );
+        assert!(
+            daemon.state.accounts[1].parked_landing.is_none(),
+            "a weekly-only reading releases the watch",
+        );
+        assert!(
+            daemon.state.last_landing_overshoot.is_none(),
+            "…with no landing record — there is no session to have landed",
+        );
+
+        // Control: a two-window reading BELOW the ceiling at the same instant keeps the watch
+        // armed, so the release above is the absent window's, not the window elapsing.
+        arm(&mut daemon);
+        daemon.note_landing_overshoot(1, Some(0), &Ok(reading(0.98, 0.50)), inside);
+        assert!(daemon.state.accounts[1].parked_landing.is_some());
+        assert!(daemon.state.last_landing_overshoot.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_weekly_only_active_within_cooldown_gets_no_raw_ceiling_bypass() {
+        // Issue #1602 (row 3): the #611 raw-ceiling bypass is session-only and reads false on an
+        // active whose session window does not apply, so within cooldown a weekly-only active over
+        // its weekly threshold defers (`SkippedCooldown`) exactly as a two-window active whose
+        // session sits below the raw ceiling does. Mutant M-ad (`at_raw_ceiling` as `is_none_or`)
+        // bypasses the cooldown and swaps.
+        async fn action_within_cooldown(active: Usage) -> (TickAction, bool) {
+            let mut daemon = lifecycle_daemon_with(
+                FakeRosterPoller::new()
+                    .ok_reading("u-A", active)
+                    .ok("u-B", 0.05, 0.05), // wide open: only the cooldown can hold the swap
+                tunables(95, 80, 100), // raw ceiling 0.95, cooldown 100 s
+            )
+            .await;
+            daemon.state.active = Some(0);
+            // A swap 10 s ago: the 100 s cooldown is firmly armed and un-elapsed.
+            daemon.state.last_swap = Some(LastSwap {
+                at: daemon.clock.now(),
+            });
+            daemon.clock.advance(Duration::from_secs(10));
+            let action = warmed_tick(&mut daemon).await.action;
+            let canonical_a = daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token"));
+            (action, canonical_a)
+        }
+
+        let (weekly_only, canonical_a) =
+            action_within_cooldown(usage_without_a_session_window(0.99)).await;
+        assert_eq!(
+            weekly_only,
+            TickAction::SkippedCooldown,
+            "a weekly-only active has no raw session ceiling to be at — the cooldown holds",
+        );
+        assert!(canonical_a, "the deferred swap wrote nothing");
+
+        let (two_window, canonical_a) = action_within_cooldown(reading(0.50, 0.99)).await;
+        assert_eq!(
+            two_window,
+            TickAction::SkippedCooldown,
+            "exactly as a two-window active whose session sits below the raw ceiling",
+        );
+        assert!(canonical_a);
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_blind_preempt_from_a_weekly_only_anchor_retains_no_status_notice() {
+        // Issue #1602 (Specification § 4, D10's analogue — the transitional `1.14` interim; #1599
+        // retires this test when it restores the notice): a `Retry-After` blind-preempt swap off a
+        // session-less anchor FIRES and joins the #582 walk record, yet retains no
+        // `BlindPreemptSwapRecord` — its `last_known_session_pct` is a `u8` that cannot say
+        // "none" — so `status` carries no `recent_blind_preempt_swap` (encoded as an absent key by
+        // the committed `snapshot_frame_encodes_recent_blind_preempt_swap_only_when_present`).
+        // Mutant M-ae retains the record off a `0` default, and `status` would narrate
+        // "last-known 0%". The committed `blind_swap_fires_past_t_with_a_viable_target` keeps a
+        // two-window anchor's notice, with its percent, green beside this.
+        let mut daemon =
+            blind_retry_after_daemon_without_a_session_window(Duration::from_secs(3600)).await;
+        let swapped = daemon.tick().await;
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::PreemptivelySwapped { from: 0, .. }
+            ),
+            "the swap fires: {:?}",
+            swapped.action,
+        );
+        assert_ne!(
+            daemon.state.active,
+            Some(0),
+            "the active moved off the throttled u-A"
+        );
+        assert_eq!(
+            daemon.state.retry_after_swaps.len(),
+            1,
+            "the #582 walk record gains the swap",
+        );
+        assert!(
+            daemon.state.last_blind_preempt_swap.is_none(),
+            "no notice is retained for an anchor without a session window (1.14 interim)",
+        );
+        assert!(
+            swapped.snapshot.recent_blind_preempt_swap.is_none(),
+            "…so the same tick's status snapshot narrates nothing",
+        );
+        let readings = daemon.decision_readings(daemon.state.active);
+        assert!(
+            daemon
+                .snapshot(daemon.state.active, &readings, 0)
+                .recent_blind_preempt_swap
+                .is_none(),
+            "…and neither does a later one",
         );
     }
 

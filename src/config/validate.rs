@@ -81,19 +81,25 @@ impl Config {
         // unchecked reserve of 80 and then bricks after a render→parse round-trip, since
         // #398 renders the default as a live line; an equal reserve is inert per
         // ADR-0013). When present, its lower bound is 1 (an explicit 0 admits no
-        // target, silently disabling proactive swapping) and its upper bound is
-        // session_ceiling (a higher reserve could never admit a target), the latter a
-        // distinct cross-field error.
+        // target that has a session window, silently disabling proactive swapping) and
+        // its upper bound is session_ceiling (a higher reserve could never admit a
+        // target), the latter a distinct cross-field error.
         let target_max_session_usage = match t.target_max_session_usage {
             None => DEFAULT_TARGET_MAX_SESSION_USAGE.min(t.session_ceiling as u8),
             Some(value) => {
                 if value == 0 {
-                    // The swap predicate is `usage.session < target_max_session_usage`, so 0
-                    // admits NO account and silently disables proactive swapping (the
-                    // daemon just holds). 0 is the natural wrong guess for "no
-                    // restriction" — its exact opposite (#414) — so reject it with the
-                    // remedy spelled out, rather than let a live, hand-editable line
-                    // brick swapping in silence.
+                    // The swap predicate is `floor.is_none_or(|f| usage.session.is_none_or(|s|
+                    // s < f))` (issue #1602: a target whose reply carries no session window
+                    // passes the floor vacuously), so 0 admits NO account that has a session
+                    // window and silently disables proactive swapping among them (the daemon
+                    // just holds). 0 is the natural wrong guess for "no restriction" — its
+                    // exact opposite (#414) — so reject it with the remedy spelled out, rather
+                    // than let a live, hand-editable line brick swapping in silence. The
+                    // message's "no swap target" reads "no swap target that has a session
+                    // window"; its literal text is byte-pinned by the committed
+                    // `build/fixtures/config-set-reject-details.json` golden and the menu-bar
+                    // Swift parity test, so rewording it is a cross-language re-baseline of
+                    // its own, not this item's.
                     return Err(Error::ConfigInvalid(format!(
                         "target_max_session_usage = 0 admits no swap target and silently disables \
                          proactive swapping; it must be in 1..={}. Raise it toward \
@@ -735,8 +741,11 @@ mod tests {
 
     #[test]
     fn rejects_zero_target_max_naming_the_consequence() {
-        // #414: target_max_session_usage = 0 makes the swap predicate `usage.session < 0` admit no
-        // account, so proactive swapping is silently disabled and the daemon just holds.
+        // #414: target_max_session_usage = 0 makes the swap predicate
+        // `floor.is_none_or(|f| usage.session.is_none_or(|s| s < f))` admit no account that has
+        // a session window (a target whose reply carries no session window passes the floor
+        // vacuously, issue #1602), so proactive swapping is silently disabled among the accounts
+        // that have one and the daemon just holds.
         // Since #398 made target_max_session_usage a live, hand-editable line, 0 is the natural
         // (wrong) guess for "no restriction" — its exact opposite. validate must reject it
         // with a message that names the consequence AND points at the remedy (raise it
@@ -752,7 +761,8 @@ mod tests {
         }
 
         // The reject is precisely 0, not "any low value": 1 is the valid lower edge and
-        // still parses (inert-but-valid — admits only accounts at 0% session).
+        // still parses (valid and all but inert — it admits only accounts below 1 % session or
+        // without a session window, which the floor never binds).
         let one = Config::parse(&with_tunables(
             "target_max_session_usage = 1\nsession_ceiling = 90",
         ))
@@ -1909,8 +1919,8 @@ mod tests {
     #[test]
     fn accepts_inclusive_bounds() {
         // Each bound's edge is valid: trigger 50/99, target_max_session_usage 1 (the non-zero lower bound;
-        // 0 admits no target) and floor == trigger, poll 5/3600, cooldown 5/3600 (5 =
-        // the non-zero floor, #272), monitor 1/20.
+        // 0 admits no target that has a session window) and floor == trigger, poll 5/3600, cooldown
+        // 5/3600 (5 = the non-zero floor, #272), monitor 1/20.
         for fragment in [
             "session_ceiling = 50\ntarget_max_session_usage = 1",
             "session_ceiling = 99\ntarget_max_session_usage = 99", // target_max_session_usage == trigger is allowed

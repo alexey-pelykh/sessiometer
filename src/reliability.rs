@@ -256,12 +256,26 @@ pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// `p50`/`p95`: the population is LEFT-CENSORED at the daemon's entry edge, so they summarize
 /// breaches and not first-sight latency. See [`FirstSight`] before comparing either against the
 /// requirement's `GOAL`.
+/// Bumped `13 → 14` (issue #1602) when the per-window reading model let a `blind_window` line be
+/// emitted WITHOUT a session axis — for an account whose session window does not apply (a
+/// weekly-only account), or across a window that appeared or vanished mid-blindness — and
+/// `blind_projection_error` gained `n_without_session_window`, the disclosed bucket such a line
+/// lands in. ADDITIVE in KEYS (a new always-present field; every schema:13 key is byte-identical),
+/// the shape of `9 → 10` and `11 → 12`, and, like `8 → 9` and `10 → 11`, carrying a value-domain
+/// correction with no key change: a line lacking a `session_pct` / `session_at_recovery` token now
+/// counts `n_without_session_window`, where schema:13 counted it `n_malformed`. The partition
+/// `n_blind_windows == n_without_session_window + n_projectable + n_below_arm_gate +
+/// n_without_velocity + n_malformed` stays exact (issue #484), which is why the key is always
+/// present rather than omitted at `0`: a consumer summing the partition could otherwise mistake a
+/// schema:13 document for one with no session-less lines. No daemon before #1602 emitted such a
+/// line, so over an older log the correction moves no figure — diff a schema:13 and a schema:14
+/// readout of one log and only the added key differs.
 ///
 /// `pub(crate)` so the number [`crate::cli`]'s `RELIABILITY_USAGE` advertises to script authors is
 /// held against this one by a test instead of by hand (issue #913) — tied so the two cannot drift,
 /// the way [`LANDING_WINDOW_SECS`] ties the offline window to the runtime detector's. Nothing else
 /// outside this module reads it.
-pub(crate) const JSON_SCHEMA_VERSION: u32 = 13;
+pub(crate) const JSON_SCHEMA_VERSION: u32 = 14;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -654,18 +668,33 @@ impl RefreshTokenLossByMechanism {
 
 /// The complete classification of the `blind_window` lines in view (issue #636).
 ///
-/// Every line lands in EXACTLY ONE bucket — `total == projectable + below_arm_gate +
-/// without_velocity + malformed` — so no line can vanish between parse and render. That total
-/// invariant is the point: this readout's whole thesis is that a percentile without its denominator
-/// is a survivorship lie, and a silently-dropped line is exactly a missing denominator.
+/// Every line lands in EXACTLY ONE bucket — `total == without_session_window + projectable +
+/// below_arm_gate + without_velocity + malformed` — so no line can vanish between parse and render.
+/// That total invariant is the point: this readout's whole thesis is that a percentile without its
+/// denominator is a survivorship lie, and a silently-dropped line is exactly a missing denominator.
 ///
-/// The three non-projectable buckets are ordered to MIRROR
+/// The `without_session_window` bucket sits AHEAD of the arm's gates (issue #1602): a line without a
+/// session axis on both ends has nothing to project at any duration — the arm reads false on an
+/// anchor with no session, and a line without a recovery session has no actual to score. The three
+/// remaining non-projectable buckets are ordered to MIRROR
 /// [`crate::daemon`]'s `blind_velocity_projected_armed` gate order — duration first, then the
 /// sustained-EMA check — so "outside the arm's domain" here means the same thing it means there.
 #[derive(Debug, Default, PartialEq)]
 struct BlindWindowCensus {
     /// Every `blind_window` line in view, whatever its disposition.
     total: usize,
+    /// Lines a session axis is ABSENT from on either end — no `session_pct=` token, no
+    /// `session_at_recovery=` token, or neither (issue #1602). The daemon emits such a line on
+    /// purpose for an account whose session window does not apply (a weekly-only account), or for
+    /// an episode whose window appeared or vanished across the blindness: an omitted token means
+    /// "no such window", never "unknown", so the line is NOT corrupt. Nor is it projectable: the
+    /// arm reads false on an anchor with no session (nothing to project from), and a line without
+    /// a recovery session has no actual to score — so this bucket sits AHEAD of the arm's gates,
+    /// and a half-axis line lands here whatever its duration or ingredients. Its own disclosed
+    /// bucket, because the class #1590 exists to make visible must not hide inside `malformed`.
+    /// A line enters it only when its always-present `duration_secs` and `near_limit` tokens parse,
+    /// so a torn append stays `malformed` (D14 as ruled).
+    without_session_window: usize,
     /// Lines shorter than the arm's first gate ([`crate::daemon::BLIND_GATE_SECS`]).
     ///
     /// The arm returns `false` on these BEFORE computing any projection, so it never forecast here
@@ -687,8 +716,10 @@ struct BlindWindowCensus {
     /// retained EMA — this arm could not have armed here", never "unknown", so there is no
     /// projection to score. The arm's SECOND gate.
     without_velocity: usize,
-    /// Lines this reader could not classify: a missing or unparseable `session_pct` /
-    /// `session_at_recovery` / `duration_secs`, an unparseable or non-finite `rate=` / `inflation=`,
+    /// Lines this reader could not classify: a missing or unparseable `duration_secs` or
+    /// `near_limit` (the always-present tokens a torn append lacks, issue #1602), a
+    /// PRESENT-but-unparseable `session_pct` / `session_at_recovery` (an ABSENT one is
+    /// `without_session_window`, issue #1602), an unparseable or non-finite `rate=` / `inflation=`,
     /// a PRESENT-but-unparseable `session_high_water_pct=` (issue #670), or a projection that
     /// overflowed to non-finite. A CORRUPT record, distinct from a well-formed window the arm simply
     /// could not arm on — folding the two together would report corruption as coverage. The tolerant-drop precedent every sibling arm here uses, made VISIBLE.
@@ -1223,24 +1254,32 @@ fn record_reactivation_edge(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>, 
 /// `session_pct` stands; the anchor term still carries those fields' `u8` rounding (≤ ±0.5 pp),
 /// dominated by the rate term over any armed window.
 ///
-/// Classifies EVERY line into exactly one [`BlindWindowCensus`] bucket, applying the arm's OWN
-/// gates in the arm's OWN order — duration first, sustained EMA second — so "outside the arm's
-/// domain" means here exactly what it means there. Collapsing any two of these buckets would
-/// fabricate the survivorship story the SLI exists to guard:
+/// Classifies EVERY line into exactly one [`BlindWindowCensus`] bucket — the no-session-window
+/// bucket first (issue #1602), then the arm's OWN gates in the arm's OWN order (duration first,
+/// sustained EMA second) — so "outside the arm's domain" means here exactly what it means there.
+/// Collapsing any two of these buckets would fabricate the survivorship story the SLI exists to
+/// guard:
 ///
-/// 1. **Core fields unreadable** (`session_pct` / `session_at_recovery` / `duration_secs` missing or
-///    unparseable) ⇒ `malformed`. A corrupt record is not evidence of anything.
-/// 2. **`duration_secs <= BLIND_GATE_SECS`** ⇒ `below_arm_gate`. The arm returns `false` here BEFORE
+/// 1. **`duration_secs` or `near_limit` missing or unparseable (the line's always-present tokens —
+///    a torn append, cut after `duration_secs=N`, fails here; issue #1602, D14 as ruled), or a
+///    PRESENT-but-unparseable `session_pct` / `session_at_recovery`** ⇒ `malformed`. A corrupt
+///    record is not evidence of anything.
+/// 2. **`session_pct` or `session_at_recovery` ABSENT** ⇒ `without_session_window` (issue #1602).
+///    The daemon omits the token on purpose when that reading's session window did not apply, so
+///    the line is well-formed — and it has nothing to project at any duration: the arm reads false
+///    on an anchor with no session, and a line without a recovery session has no actual to score.
+///    Ahead of the arm's gates for that reason; a half-axis line lands here too.
+/// 3. **`duration_secs <= BLIND_GATE_SECS`** ⇒ `below_arm_gate`. The arm returns `false` here BEFORE
 ///    computing a projection, so there is no forecast to grade — even though the daemon does stamp
 ///    the ingredients on such a line.
-/// 3. **No `rate=` token** ⇒ `without_velocity`. Absent tokens mean "no SUSTAINED retained EMA", the
+/// 4. **No `rate=` token** ⇒ `without_velocity`. Absent tokens mean "no SUSTAINED retained EMA", the
 ///    arm's second gate — never "unknown".
-/// 4. **`rate=` / `inflation=` unreadable, a PRESENT `session_high_water_pct=` unreadable (issue
+/// 5. **`rate=` / `inflation=` unreadable, a PRESENT `session_high_water_pct=` unreadable (issue
 ///    #670), or the projection overflows to non-finite** ⇒ `malformed`. Publishing a non-finite
 ///    percentile would make the human text (`+inf`) and the `--json` wire (`null`, which this
 ///    schema defines as "empty population") disagree about the same episode; a garbage mark
 ///    silently reverted to the stale base would misreport the arm the same way.
-/// 5. **Complete** ⇒ a [`BlindProjection`]. The `session_at_recovery = 0` window-reset sentinel is
+/// 6. **Complete** ⇒ a [`BlindProjection`]. The `session_at_recovery = 0` window-reset sentinel is
 ///    carried through and excluded later, at aggregation, so the exclusion is COUNTED rather than
 ///    silently swallowed at parse.
 ///
@@ -1248,16 +1287,33 @@ fn record_reactivation_edge(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>, 
 fn record_blind_projection(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>) {
     let census = &mut inputs.blind_window_census;
     census.total = census.total.saturating_add(1);
-    let (Some(anchor), Some(arrived), Some(blind_secs)) = (
-        fields.get("session_pct").and_then(|v| v.parse::<u8>().ok()),
-        fields
-            .get("session_at_recovery")
-            .and_then(|v| v.parse::<u8>().ok()),
+    // A session token that is PRESENT must parse (corrupt otherwise); one that is ABSENT is the
+    // daemon saying "this reading had no session window" (issue #1602), never corruption. Outer
+    // `None` = unparseable, `Some(None)` = absent, `Some(Some(pct))` = read.
+    let session_token = |key: &str| -> Option<Option<u8>> {
+        match fields.get(key) {
+            None => Some(None),
+            Some(v) => v.parse::<u8>().ok().map(Some),
+        }
+    };
+    let (Some(anchor), Some(arrived), Some(blind_secs), Some(_near_limit)) = (
+        session_token("session_pct"),
+        session_token("session_at_recovery"),
         fields
             .get("duration_secs")
             .and_then(|v| v.parse::<u64>().ok()),
+        // Issue #1602 (D14 as ruled): the line's OTHER always-present token must parse too, so a
+        // torn append — cut after `duration_secs=N`, before or inside its `near_limit=` — stays
+        // `malformed` rather than entering the no-session-window bucket on its missing tokens.
+        fields
+            .get("near_limit")
+            .and_then(|v| v.parse::<bool>().ok()),
     ) else {
         census.malformed = census.malformed.saturating_add(1);
+        return;
+    };
+    let (Some(anchor), Some(arrived)) = (anchor, arrived) else {
+        census.without_session_window = census.without_session_window.saturating_add(1);
         return;
     };
     if blind_secs <= crate::daemon::BLIND_GATE_SECS {
@@ -2274,7 +2330,8 @@ struct FalseProjection {
 #[derive(Debug, PartialEq)]
 struct BlindProjectionError {
     /// Every `blind_window` line in view — the denominator the buckets below partition exactly:
-    /// `n_blind_windows == n_projectable + n_below_arm_gate + n_without_velocity + n_malformed`.
+    /// `n_blind_windows == n_without_session_window + n_projectable + n_below_arm_gate +
+    /// n_without_velocity + n_malformed`.
     n_blind_windows: usize,
     /// Windows inside the arm's domain that carried #634's velocity ingredients — the projectable
     /// population. Partitioned exactly by `n_reconcilable + n_sentinel_excluded`.
@@ -2296,6 +2353,12 @@ struct BlindProjectionError {
     /// Reported rather than silently dropped: an undisclosed drop is a missing denominator, which is
     /// precisely the survivorship failure the rest of this block guards against.
     n_malformed: usize,
+    /// Windows with no session axis on one or both ends (issue #1602): the daemon emitted them for
+    /// an account whose session window does not apply, or across a window that appeared or
+    /// vanished — well-formed, never `malformed`, and outside the arm's domain at any duration.
+    /// Its own disclosed bucket so the partition above stays exact and this class — the very one
+    /// #1590 exists to make visible — cannot hide inside `n_malformed` or vanish from the census.
+    n_without_session_window: usize,
     /// Episodes the daemon SWAPPED AWAY from before they recovered — structurally unrecordable by
     /// the active-scoped `blind_window`. POPULATED since issue #591 from [`BlindEpisodes`], the
     /// uncensored pair's census, which this SLI consumes rather than duplicates. `None` only when
@@ -2579,6 +2642,7 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
         n_below_arm_gate: inputs.blind_window_census.below_arm_gate,
         n_without_velocity: inputs.blind_window_census.without_velocity,
         n_malformed: inputs.blind_window_census.malformed,
+        n_without_session_window: inputs.blind_window_census.without_session_window,
         // The two censored tails, POPULATED (issue #591) from the uncensored pair this SLI consumes
         // rather than duplicates — the promise these fields' `None` has carried since issue #636.
         // Still `None` when the pair is absent from view: unobservable, not zero.
@@ -3058,11 +3122,12 @@ fn render_human(r: &Report) -> String {
         e.n_reconcilable, e.n_projectable, e.n_sentinel_excluded, e.n_blind_windows
     ));
     out.push_str(&format!(
-        "  outside the arm's domain: {} below the T={}s gate; {} with no retained velocity; {} malformed\n",
+        "  outside the arm's domain: {} below the T={}s gate; {} with no retained velocity; {} malformed; {} with no session window\n",
         e.n_below_arm_gate,
         crate::daemon::BLIND_GATE_SECS,
         e.n_without_velocity,
-        e.n_malformed
+        e.n_malformed,
+        e.n_without_session_window
     ));
     // The censoring disclosure, now QUANTIFIED where the uncensored pair supplies it (issue #591).
     // The percentiles above still score the recovered-only `blind_window` population — that has not
@@ -3126,7 +3191,7 @@ fn render_human(r: &Report) -> String {
     out
 }
 
-// --- rendering: JSON wire (schema:13) ---------------------------------------
+// --- rendering: JSON wire (schema:14) ---------------------------------------
 
 /// The stable `--json` document. Field names are OWNED by this wire contract (decoupled from
 /// the internal aggregate types), so an internal refactor cannot silently break the schema.
@@ -3489,8 +3554,9 @@ struct BlindEpisodesNearLimitWire {
 /// passing `0 pp` error).
 #[derive(serde::Serialize)]
 struct BlindProjectionErrorWire {
-    /// Every `blind_window` line in view. Partitioned EXACTLY by `n_projectable +
-    /// n_below_arm_gate + n_without_velocity + n_malformed`, so no line goes undisclosed.
+    /// Every `blind_window` line in view. Partitioned EXACTLY by `n_without_session_window +
+    /// n_projectable + n_below_arm_gate + n_without_velocity + n_malformed`, so no line goes
+    /// undisclosed.
     n_blind_windows: usize,
     /// In-domain windows carrying #634's velocity ingredients (`n_reconcilable +
     /// n_sentinel_excluded`).
@@ -3506,6 +3572,11 @@ struct BlindProjectionErrorWire {
     n_without_velocity: usize,
     /// Windows dropped as corrupt (unreadable fields, or a projection that overflowed).
     n_malformed: usize,
+    /// Windows with no session axis on one or both ends — emitted on purpose for an account whose
+    /// session window does not apply (issue #1602); well-formed, and outside the arm's domain at
+    /// any duration. Added at schema:14, always present, so the partition above sums on every
+    /// document.
+    n_without_session_window: usize,
     /// The arm's first gate in seconds, at TODAY's value — stamped here because it is NOT on the
     /// log line, so a consumer can tell which `T` this partition was computed with.
     arm_gate_secs: u64,
@@ -3726,6 +3797,7 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
             n_below_arm_gate: r.blind_projection_error.n_below_arm_gate,
             n_without_velocity: r.blind_projection_error.n_without_velocity,
             n_malformed: r.blind_projection_error.n_malformed,
+            n_without_session_window: r.blind_projection_error.n_without_session_window,
             arm_gate_secs: crate::daemon::BLIND_GATE_SECS,
             n_swapped_away: r.blind_projection_error.n_swapped_away,
             n_never_recovered: r.blind_projection_error.n_never_recovered,
@@ -4384,7 +4456,7 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
     /// the bump to a payload-shape change, so the two must be pinned together or a later edit can
     /// add a key and leave the version behind.
     #[test]
-    fn the_json_wire_carries_the_loss_block_under_schema_13() {
+    fn the_json_wire_carries_the_loss_block_under_schema_14() {
         let r = aggregate(
             &parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None),
             &[],
@@ -4392,7 +4464,7 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
         );
         let json: serde_json::Value =
             serde_json::from_str(&render_json(&r).expect("serializes")).expect("valid JSON");
-        assert_eq!(json["schema"], 13);
+        assert_eq!(json["schema"], 14);
         let loss = &json["refresh_token_loss"];
         assert_eq!(loss["accounts"], 3);
         assert_eq!(loss["observations"], 6);
@@ -5297,7 +5369,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "\n",
                 "blind-arm projection error (projected − session_at_recovery, pp; the BLIND_VELOCITY_RATE_INFLATION tuning input)\n",
                 "  reconcilable n=0 of 0 projectable (0 excluded: session_at_recovery=0 window-reset sentinel), from 3 blind windows\n",
-                "  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed\n",
+                "  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed; 0 with no session window\n",
                 "  censoring: RECOVERED-ONLY — excludes 1 swapped-away and 0 never-recovered episodes (counted from the uncensored blind_enter/blind_exit pair above)\n",
                 "  no reconcilable blind windows — percentiles withheld (an empty subject is not a 0 pp error)\n",
                 "\n",
@@ -5326,7 +5398,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
     }
 
     #[test]
-    fn json_render_is_stable_schema_13() {
+    fn json_render_is_stable_schema_14() {
         // The whole-log default: `window` is null and every field except the #635-renamed
         // velocity-projection key (`projective_swap_out_pct`, schema:6) is byte-identical to
         // schema:1–5 — the additive contract (#494/#539/#595/#608/#636/#591) plus the one #635
@@ -5376,7 +5448,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 13,\n",
+                "  \"schema\": 14,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -5470,6 +5542,12 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "    \"n_below_arm_gate\": 2,\n",
                 "    \"n_without_velocity\": 1,\n",
                 "    \"n_malformed\": 0,\n",
+                // schema:14 (issue #1602): `n_without_session_window`, the disclosed bucket for a
+                // `blind_window` line with no session axis — ADDITIVE (always present), with the
+                // value-domain correction that such a line no longer counts `n_malformed`.
+                // FIXTURE_LOG carries no such line, so it reads 0 and, against the schema:13
+                // expectation in git history, only this key and the version integer differ.
+                "    \"n_without_session_window\": 0,\n",
                 "    \"arm_gate_secs\": 300,\n",
                 "    \"n_swapped_away\": 1,\n",
                 "    \"n_never_recovered\": 0,\n",
@@ -5656,6 +5734,132 @@ ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=300 session_pc
         }
     }
 
+    /// Issue #1602 (D14, the census bucket): the daemon now emits a `blind_window` line WITHOUT a
+    /// session token on purpose — for an account whose session window does not apply (a
+    /// weekly-only account), or for an episode whose window appeared or vanished across the
+    /// blindness — so such a line is not corrupt. It lands in its own disclosed bucket, never in
+    /// `malformed` and never in `total` alone, so the #484 survivorship pairing (every line in
+    /// exactly one bucket) still closes. The two half-axis shapes are the ones the daemon really
+    /// emits: an anchor with a session and a weekly-only recovery (`session_pct=` alone), and its
+    /// mirror. A PRESENT-but-unparseable session token and a missing `duration_secs` stay corrupt.
+    /// The `blind_enter` / `blind_exit` and `usage_velocity` parsers read by key, so a pair and a
+    /// velocity line without session tokens parse and contribute no session figure — never a
+    /// fabricated `0` rate.
+    #[test]
+    fn a_blind_window_line_without_a_session_axis_is_censused_as_no_session_window_not_malformed() {
+        const LOG: &str = "\
+ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 near_limit=false
+ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=900 session_pct=55 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00
+ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=1800 session_at_recovery=52 near_limit=false rate=0.008000 inflation=1.75 ceiling=95.00
+ts=2026-07-11T00:40:00Z event=blind_window acct=u-D duration_secs=1200 session_pct=xx session_at_recovery=40 near_limit=false
+ts=2026-07-11T00:50:00Z event=blind_window acct=u-E session_pct=80 session_at_recovery=82 near_limit=false
+ts=2026-07-11T01:00:00Z event=blind_window acct=u-F duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=0.010000 inflation=1.75 ceiling=95.00
+ts=2026-07-11T01:10:00Z event=blind_enter acct=u-G weekly_pct=40 was_active=true near_limit=false
+ts=2026-07-11T01:20:00Z event=blind_exit acct=u-G duration_secs=600 weekly_burn_pct=3 weekly_pct=40 weekly_at_recovery=43 was_active=true swapped_away=false near_limit=false
+ts=2026-07-11T01:30:00Z event=usage_velocity acct=u-G weekly_pct_per_min=0.60 elapsed_secs=300 weekly_delta_pct=3
+";
+        let inputs = parse_events(LOG, None);
+        let census = &inputs.blind_window_census;
+        assert_eq!(census.total, 6);
+        assert_eq!(
+            census.without_session_window, 3,
+            "no session axis (u-A), anchor-only (u-B) and recovery-only (u-C) each land in the new \
+             bucket, whatever their duration or ingredients"
+        );
+        assert_eq!(
+            census.malformed, 2,
+            "a PRESENT-but-unparseable `session_pct=xx` (u-D) and a missing `duration_secs` (u-E) \
+             stay corrupt — the bucket never widens `malformed`'s meaning"
+        );
+        assert_eq!(census.below_arm_gate, 0);
+        assert_eq!(census.without_velocity, 0);
+        assert_eq!(
+            inputs.blind_projections.len(),
+            1,
+            "u-F is the one complete line"
+        );
+        // The pair without session tokens parses: those parsers read `ts`, `acct`, `near_limit`,
+        // `duration_secs` and `swapped_away` only.
+        assert_eq!(inputs.blind_entries.len(), 1);
+        assert_eq!(inputs.blind_exits.len(), 1);
+        assert_eq!(inputs.blind_pair_malformed, 0);
+        // A velocity line with no session axis contributes no session rate.
+        assert!(
+            inputs.session_velocities.is_empty(),
+            "no `session_delta_pct=` token → no session rate, never a fabricated 0: {:?}",
+            inputs.session_velocities
+        );
+
+        let r = aggregate(&inputs, &[], None);
+        let e = &r.blind_projection_error;
+        assert_eq!(e.n_blind_windows, 6);
+        assert_eq!(e.n_without_session_window, 3);
+        assert_eq!(e.n_malformed, 2);
+        assert_eq!(e.n_projectable, 1);
+        assert_eq!(
+            e.n_blind_windows,
+            e.n_without_session_window
+                + e.n_projectable
+                + e.n_below_arm_gate
+                + e.n_without_velocity
+                + e.n_malformed,
+            "every blind_window line must land in exactly one disclosed bucket"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&r).expect("serializes")).expect("valid JSON");
+        assert_eq!(json["schema"], 14);
+        assert_eq!(
+            json["blind_projection_error"]["n_without_session_window"],
+            3
+        );
+        assert_eq!(json["blind_projection_error"]["n_malformed"], 2);
+        let human = render_human(&r);
+        assert!(
+            human.contains(
+                "  outside the arm's domain: 0 below the T=300s gate; 0 with no retained velocity; 2 malformed; 3 with no session window\n"
+            ),
+            "the human render publishes the new bucket beside the others: {human}"
+        );
+    }
+
+    /// Issue #1602 (row 15, D14 as ruled): a line enters the no-session-window bucket only when its
+    /// other always-present tokens, `duration_secs` and `near_limit`, parse — so a torn append (a
+    /// line cut after `duration_secs=N`, before or inside its `near_limit=`) stays `malformed`
+    /// rather than reading as a well-formed weekly-only window on its missing session tokens. A
+    /// whole line without a session token still enters the bucket.
+    #[test]
+    fn a_blind_window_line_torn_before_near_limit_is_censused_as_malformed_not_no_session_window() {
+        const LOG: &str = "\
+ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600
+ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=600 near_limit=fals
+ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=600 near_limit=false
+";
+        let inputs = parse_events(LOG, None);
+        let census = &inputs.blind_window_census;
+        assert_eq!(census.total, 3);
+        assert_eq!(
+            census.malformed, 2,
+            "a line torn before its `near_limit=` (u-A) and one torn inside it (u-B) are corrupt, \
+             never weekly-only windows"
+        );
+        assert_eq!(
+            census.without_session_window, 1,
+            "the whole line without a session token (u-C) still enters the bucket"
+        );
+        let e = &aggregate(&inputs, &[], None).blind_projection_error;
+        assert_eq!(e.n_malformed, 2);
+        assert_eq!(e.n_without_session_window, 1);
+        assert_eq!(
+            e.n_blind_windows,
+            e.n_without_session_window
+                + e.n_projectable
+                + e.n_below_arm_gate
+                + e.n_without_velocity
+                + e.n_malformed,
+            "every blind_window line must land in exactly one disclosed bucket"
+        );
+    }
+
     #[test]
     fn blind_projection_error_publishes_cardinality_and_censoring_beside_the_percentiles() {
         let r = aggregate(&parse_events(BLIND_PROJECTION_LOG, None), &[], None);
@@ -5670,10 +5874,15 @@ ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=300 session_pc
         assert_eq!(e.n_below_arm_gate, 2);
         assert_eq!(e.n_without_velocity, 1);
         assert_eq!(e.n_malformed, 0);
+        assert_eq!(e.n_without_session_window, 0);
         assert_eq!(e.n_projectable, e.n_reconcilable + e.n_sentinel_excluded);
         assert_eq!(
             e.n_blind_windows,
-            e.n_projectable + e.n_below_arm_gate + e.n_without_velocity + e.n_malformed,
+            e.n_without_session_window
+                + e.n_projectable
+                + e.n_below_arm_gate
+                + e.n_without_velocity
+                + e.n_malformed,
             "every blind_window line must land in exactly one disclosed bucket"
         );
         // The two censored tails read `None` HERE for a precise reason: `BLIND_PROJECTION_LOG`
@@ -5784,14 +5993,20 @@ ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=300 session_pc
         // together would report corruption as coverage, and dropping it from both counters would
         // leave a silent hole in the denominator (the survivorship failure this block exists to
         // prevent: 40 truncated lines would render as a clean full-coverage readout over 60 % of the
-        // data). Six corruption shapes, each landing in `malformed` and none in `without_velocity` —
-        // the sixth (issue #670) a PRESENT-but-unreadable `session_high_water_pct`, which is part of
+        // data). Five corruption shapes, each landing in `malformed` and none in `without_velocity` —
+        // the fifth (issue #670) a PRESENT-but-unreadable `session_high_water_pct`, which is part of
         // the projection-reconstruction contract exactly like `rate` / `inflation`: silently
         // reverting it to the stale-low base would misreport the arm, so it drops as corruption.
-        // The seventh line pins the boundary of that contract: with NO `rate=` the arm's second gate
-        // classifies the line `without_velocity` BEFORE the mark is ever parsed (the census applies
-        // the arm's own gates in the arm's own order), so a garbage mark on a rate-less line is
-        // unconsumed coverage context — never corruption of a projection that was never recomputed.
+        // u-C — `session_pct=` with NO `session_at_recovery=` — counted corrupt until issue #1602,
+        // when the daemon began emitting exactly that shape on purpose (an episode that recovered on
+        // a weekly-only reading); it is a well-formed line with no session axis to score and lands
+        // in `without_session_window`, never `malformed`. u-D, with no `duration_secs`, stays
+        // corrupt: the bucket never widens or narrows `malformed`'s meaning beyond the session
+        // tokens. The seventh line pins the boundary of that contract: with NO `rate=` the arm's
+        // second gate classifies the line `without_velocity` BEFORE the mark is ever parsed (the
+        // census applies the arm's own gates in the arm's own order), so a garbage mark on a
+        // rate-less line is unconsumed coverage context — never corruption of a projection that
+        // was never recomputed.
         let inputs = parse_events(
             "\
 ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=600 session_pct=30 session_at_recovery=40 near_limit=false rate=oops inflation=1.75 ceiling=95.00
@@ -5806,7 +6021,11 @@ ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=600 session_pc
         );
         assert!(inputs.blind_projections.is_empty());
         assert_eq!(inputs.blind_window_census.total, 7);
-        assert_eq!(inputs.blind_window_census.malformed, 6);
+        assert_eq!(inputs.blind_window_census.malformed, 5);
+        assert_eq!(
+            inputs.blind_window_census.without_session_window, 1,
+            "a half-axis line (u-C) is a well-formed no-session-window line, not corruption (#1602)"
+        );
         assert_eq!(
             inputs.blind_window_census.without_velocity, 1,
             "a rate-less line is coverage context whatever its mark says — gate order"
@@ -5853,7 +6072,7 @@ ts=2026-07-11T01:10:00Z event=blind_window acct=u-G duration_secs=600 session_pc
         );
         assert!(
             human.contains(
-                "  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed\n"
+                "  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed; 0 with no session window\n"
             ),
             "the out-of-domain split must be published beside the percentiles: {human}"
         );
@@ -6183,8 +6402,8 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
         ))
         .expect("serializes");
         assert!(
-            out.contains("\"schema\": 13,"),
-            "schema bumped to 13: {out}"
+            out.contains("\"schema\": 14,"),
+            "schema bumped to 14: {out}"
         );
         assert!(
             out.contains(concat!(
@@ -7638,8 +7857,9 @@ ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct
     #[test]
     fn the_weekly_margin_covers_the_scaled_session_tail_down_to_its_breakeven() {
         // Issue #607. `WEEKLY_TAIL_MARGIN` is SCALED from the #595 session measurement, not
-        // measured: the committed tail is one fixed quantity of in-flight work billing BOTH
-        // windows, so `weekly_tail = session_tail / k` where `k = weekly_quota / session_quota`.
+        // measured: the committed tail is one fixed quantity of in-flight work billing every
+        // window the account has, so `weekly_tail = session_tail / k` where
+        // `k = weekly_quota / session_quota`.
         // This test states the breakeven that scaling implies, so the assumption is executable
         // rather than prose-only — it is NOT independent evidence for the tail's magnitude (only a
         // weekly landing SLI can supply that; see `swap::WEEKLY_TAIL_MARGIN`).
@@ -7888,7 +8108,7 @@ ts=2026-07-11T10:10:00Z event=swap from=held-from to=held-to reason=manual sessi
 
     /// The same ten landings on the JSON wire, where a script reads them.
     ///
-    /// `json_render_is_stable_schema_13` pins the whole document, but its fixture leaves every
+    /// `json_render_is_stable_schema_14` pins the whole document, but its fixture leaves every
     /// operator percentile `null`, `capacity_held` at `0`, and `swaps_total` equal to
     /// `n_unmeasured` — so a projection that transposed P50 with P90, or `swaps_total` with
     /// `n_unmeasured`, passes it. `the_populated_operator_landing_block_renders_each_figure_in_its_own_place`

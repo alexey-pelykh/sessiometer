@@ -216,10 +216,9 @@ next swap: spare
   window — *when the account fully frees up*), in that paired order —
   `session% session-reset`, then `weekly% weekly-reset`.
 - The percentages are the last-polled usage (`n/a` when the last poll for that
-  account failed — never a fabricated `0`). One exception while the issue #1613
-  hot-fix serves: an account whose usage reply carries no readable session window
-  beside a readable weekly one shows `0` as its session percentage. That `0` is a
-  stand-in, not a reading, and issue #1597 replaces it with `n/a`.
+  account failed — never a fabricated `0`). Transitionally, until issue #1599 lands
+  the wire's no-window key, an account whose usage reply carries no session window
+  shows `n/a` as its session percentage beside its weekly figures.
 - Each reset is the compact time until that window refills (e.g. `12m`, `2h`,
   `3d4h`), shown for **every** account, not only an exhausted one — `n/a` when that
   reset instant is unknown.

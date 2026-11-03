@@ -644,10 +644,10 @@ struct AccountStatusLine: Decodable, Equatable {
     let quarantined: Bool
     /// Whether a quarantined account is mid-recovery (issue #109). Defaults `false`.
     let recovering: Bool
-    /// Last-polled session-window usage percent (`0…100`); `nil` if the last poll failed. One
-    /// exception while the issue #1613 hot-fix serves: a reply that carried no readable session
-    /// window beside a readable weekly one reads `0` here, the idle value the daemon substitutes,
-    /// not a measurement. Issue #1597 sends `nil` for that case.
+    /// Last-polled session-window usage percent (`0…100`); `nil` if the last poll failed.
+    /// Transitionally, until issue #1599 lands the wire's no-window key, `nil` beside a non-nil
+    /// `weeklyPct` means the served reading carried no session window (a failed poll nils both
+    /// percents); #1599 deletes this sentence.
     let sessionPct: UInt8?
     /// Last-polled weekly-window usage percent (`0…100`).
     let weeklyPct: UInt8?

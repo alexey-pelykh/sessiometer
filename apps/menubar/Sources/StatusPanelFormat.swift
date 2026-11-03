@@ -860,10 +860,9 @@ enum StatusPanelFormat {
     // MARK: - Percentage cell (mirror `src/cli.rs` `pct`)
 
     /// A `0...100` percent as `N%`, or `n/a` when the last poll failed — never a fabricated `0`
-    /// (mirrors `src/cli.rs` `pct`). One exception while the issue #1613 hot-fix serves: a session
-    /// percent read from a reply with no readable session window beside a readable weekly one is the
-    /// idle `0` the daemon substitutes, not a measurement, so it renders `0%`. Issue #1597 sends `nil`
-    /// for that case, which renders `n/a`.
+    /// (mirrors `src/cli.rs` `pct`). Transitionally (see `session_pct`'s doc in
+    /// `src/daemon/snapshot.rs`), a served reading with no session window also renders `n/a` here,
+    /// beside its weekly figures.
     static func pct(_ percent: UInt8?) -> String {
         percent.map { "\($0)%" } ?? "n/a"
     }

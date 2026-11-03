@@ -126,8 +126,15 @@ pub(crate) enum SwapDecision {
 /// dimension below its own ceiling after that dimension's post-swap committed tail.
 /// This function stays a pure two-threshold predicate — which ceiling each threshold
 /// came from, and how far back it was derived, is the daemon's business.
+///
+/// A window the account does not have (`None`, issue #1602) is SKIPPED: it is compared against
+/// nothing, so only a window the reading carries can fire. A weekly-only active swaps on its
+/// weekly threshold alone and a weekly-less one on its session threshold alone — never on a
+/// fabricated `0`, which would read as idle headroom.
 pub(crate) fn decide(usage: &Usage, session_threshold: f64, weekly_threshold: f64) -> SwapDecision {
-    if usage.session >= session_threshold || usage.weekly >= weekly_threshold {
+    if usage.session.is_some_and(|s| s >= session_threshold)
+        || usage.weekly.is_some_and(|w| w >= weekly_threshold)
+    {
         SwapDecision::Swap
     } else {
         SwapDecision::Hold
@@ -172,8 +179,8 @@ pub(crate) fn effective_ceiling(ceiling: f64) -> f64 {
 /// argument the value rests on, stated so the assumption is auditable rather than buried.
 ///
 /// The committed tail is ONE fixed quantity of already-committed work `Δ` (issue #596 confirmed it
-/// is real in-flight drain, not a cache artifact). It bills BOTH windows, so it is the same `Δ`
-/// expressed against two different denominators:
+/// is real in-flight drain, not a cache artifact). It bills every window the account has, so
+/// it is the same `Δ` expressed against two different denominators:
 ///
 /// ```text
 /// weekly_tail_fraction = session_tail_fraction × (session_quota / weekly_quota)
@@ -639,7 +646,9 @@ impl SessionHighWater {
     ///
     /// - No `session_resets_at` on the reading → `None`: without a window identity no later drop can
     ///   be judged implausible, so carrying a mark forward would risk holding a floor across an
-    ///   unseen window roll.
+    ///   unseen window roll. A reading whose session window does not APPLY (`session: None`, issue
+    ///   #1602) carries no stamp either, so it releases the mark the same way, and the next reading
+    ///   that carries a session seeds a fresh one in its own window.
     /// - Same window as the current mark (within [`SESSION_WINDOW_MATCH_SECS`]) → the running
     ///   maximum, keeping the mark's ORIGINAL anchor stamp; a stale-low reading therefore leaves the
     ///   mark standing at the higher, plausible value instead of dragging the baseline down.
@@ -650,17 +659,18 @@ impl SessionHighWater {
     /// it must leave the mark untouched.
     pub(crate) fn fold(mark: Option<Self>, usage: &Usage) -> Option<Self> {
         let window = usage.session_resets_at?;
+        // Issue #1602: a reading whose session window does not apply carries no stamp (the parser's
+        // invariant: `session_resets_at` is `Some` only when `session` is), so the `?` above has
+        // already released the mark; this second `?` stands for the type, never for a `0.0`.
+        let session = usage.session?;
         Some(match mark {
             Some(prev) if prev.matches_window(window) => Self {
                 // The ORIGINAL anchor, not `window` — see the field doc: re-anchoring each fold would
                 // let the reference walk with the per-poll jitter.
                 window: prev.window,
-                session: prev.session.max(usage.session),
+                session: prev.session.max(session),
             },
-            _ => Self {
-                window,
-                session: usage.session,
-            },
+            _ => Self { window, session },
         })
     }
 
@@ -685,11 +695,13 @@ impl SessionHighWater {
 /// mark of the very window it claims to be in. Usage cannot fall within a window, so this is a
 /// stale / cache-lagged reading, not real drain.
 ///
-/// `None` mark, an unstamped reading, or a rolled window → `false` (no evidence of implausibility;
-/// see [`SessionHighWater`] § Bounded, and fail-safe when the evidence is missing).
+/// `None` mark, an unstamped reading, a rolled window, or a reading whose session window does not
+/// apply (`session: None`, issue #1602 — it carries no stamp, and nothing sits below a mark in a
+/// window it does not have) → `false` (no evidence of implausibility; see [`SessionHighWater`]
+/// § Bounded, and fail-safe when the evidence is missing).
 pub(crate) fn is_stale_low(mark: Option<SessionHighWater>, usage: &Usage) -> bool {
     mark.and_then(|m| m.applies_to(usage))
-        .is_some_and(|high_water| usage.session < high_water)
+        .is_some_and(|high_water| usage.session.is_some_and(|s| s < high_water))
 }
 
 /// `usage` with its SESSION fraction raised to the window's high-water mark (issue #614) — the
@@ -699,11 +711,14 @@ pub(crate) fn is_stale_low(mark: Option<SessionHighWater>, usage: &Usage) -> boo
 ///
 /// Only the `session` fraction is corrected. `weekly` has its own (weekly) window and is left
 /// verbatim, and the caller keeps the raw reading in its own carried state — the correction is
-/// applied to the swap DECISION, never written back over what the API actually reported.
+/// applied to the swap DECISION, never written back over what the API actually reported. A
+/// reading whose session window does not apply (`session: None`, issue #1602) is returned
+/// unchanged — `None` in, `None` out: there is no fraction to raise, and, carrying no stamp, no
+/// mark applies to it.
 pub(crate) fn plausible_session(mark: Option<SessionHighWater>, usage: &Usage) -> Usage {
-    match mark.and_then(|m| m.applies_to(usage)) {
-        Some(high_water) if high_water > usage.session => Usage {
-            session: high_water,
+    match (mark.and_then(|m| m.applies_to(usage)), usage.session) {
+        (Some(high_water), Some(session)) if high_water > session => Usage {
+            session: Some(high_water),
             ..*usage
         },
         _ => *usage,
@@ -714,6 +729,9 @@ pub(crate) fn plausible_session(mark: Option<SessionHighWater>, usage: &Usage) -
 /// blind-gate peer of [`plausible_session`]. Returns `anchor_session` raised to `mark`'s high-water
 /// fraction when it sits below it (the anchor's own pre-blind reading came back stale/cache-lagged),
 /// else `anchor_session` unchanged (a plausible anchor, a `None` mark → the pre-#619 value stands).
+/// An anchor whose session window does not APPLY (`None`, issue #1602 — a weekly-only account)
+/// passes through as `None`: there is nothing to correct, and every gate that reads the result
+/// treats `None` as not armed.
 ///
 /// The #450 anchor is the last reading before the active account went blind. If THAT reading was
 /// stale-low, keying the #452 bounded-blindness gate off it under-reads the account and declines an
@@ -742,11 +760,14 @@ pub(crate) fn plausible_session(mark: Option<SessionHighWater>, usage: &Usage) -
 /// NEW window whose mark still holds the OLD window's floor — is therefore unreachable here (`fold`'s
 /// own max keeps the mark from being dragged below the true high-water by the stale-low reading it
 /// corrects). Do NOT call this on a fresh reading; use [`plausible_session`], which window-matches.
-pub(crate) fn plausible_anchor_session(mark: Option<SessionHighWater>, anchor_session: f64) -> f64 {
-    match mark {
+pub(crate) fn plausible_anchor_session(
+    mark: Option<SessionHighWater>,
+    anchor_session: Option<f64>,
+) -> Option<f64> {
+    anchor_session.map(|anchor_session| match mark {
         Some(m) if m.session > anchor_session => m.session,
         _ => anchor_session,
-    }
+    })
 }
 
 /// The result of a completed [`swap`]. The token reroute (the swap proper)
@@ -1120,8 +1141,8 @@ mod tests {
     #[test]
     fn holds_when_both_dimensions_are_below_their_thresholds() {
         let usage = Usage {
-            session: 0.5,
-            weekly: 0.5,
+            session: Some(0.5),
+            weekly: Some(0.5),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1134,8 +1155,8 @@ mod tests {
         // AC #1 (regression preserved): session at its threshold → swap, even
         // with weekly far below its separate (higher) threshold.
         let usage = Usage {
-            session: 0.95,
-            weekly: 0.1,
+            session: Some(0.95),
+            weekly: Some(0.1),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1146,8 +1167,8 @@ mod tests {
     fn swaps_when_weekly_reaches_its_threshold_while_session_is_below() {
         // AC #2: weekly at its threshold while session sits below its own → swap.
         let usage = Usage {
-            session: 0.50,
-            weekly: 0.98,
+            session: Some(0.50),
+            weekly: Some(0.98),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1162,8 +1183,8 @@ mod tests {
         // weekly threshold is lowered to 0.95. Session is held below its threshold
         // throughout, isolating the weekly axis.
         let usage = Usage {
-            session: 0.50,
-            weekly: 0.96,
+            session: Some(0.50),
+            weekly: Some(0.96),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1558,8 +1579,8 @@ mod tests {
     /// parseable `resets_at`).
     fn reading(session: f64, window: Option<i64>) -> Usage {
         Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: window,
         }
@@ -1724,7 +1745,10 @@ mod tests {
         // is trusted as-is — the pre-#614 behaviour, deliberately retained rather than guessed at.
         let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
         assert!(!is_stale_low(mark, &reading(0.40, None)));
-        assert_eq!(plausible_session(mark, &reading(0.40, None)).session, 0.40);
+        assert_eq!(
+            plausible_session(mark, &reading(0.40, None)).session,
+            Some(0.40)
+        );
     }
 
     #[test]
@@ -1736,7 +1760,7 @@ mod tests {
         let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
         let stale = reading(0.40, Some(WINDOW));
         let corrected = plausible_session(mark, &stale);
-        assert_eq!(corrected.session, 0.88);
+        assert_eq!(corrected.session, Some(0.88));
         assert_eq!(corrected.weekly, stale.weekly);
         assert_eq!(corrected.session_resets_at, stale.session_resets_at);
         assert_eq!(corrected.weekly_resets_at, stale.weekly_resets_at);
@@ -1787,7 +1811,7 @@ mod tests {
         // so a cache-lagged reading arriving just before the account went blind cannot write a
         // below-band anchor that then cancels the otherwise-due preemptive swap.
         let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
-        assert_eq!(plausible_anchor_session(mark, 0.40), 0.88);
+        assert_eq!(plausible_anchor_session(mark, Some(0.40)), Some(0.88));
     }
 
     #[test]
@@ -1797,9 +1821,9 @@ mod tests {
         // `session_resets_at`, so `fold` never seeded one) leaves the anchor as-is: the pre-#619
         // value stands, never a fabricated raise off absent evidence.
         let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
-        assert_eq!(plausible_anchor_session(mark, 0.91), 0.91);
-        assert_eq!(plausible_anchor_session(mark, 0.88), 0.88);
-        assert_eq!(plausible_anchor_session(None, 0.40), 0.40);
+        assert_eq!(plausible_anchor_session(mark, Some(0.91)), Some(0.91));
+        assert_eq!(plausible_anchor_session(mark, Some(0.88)), Some(0.88));
+        assert_eq!(plausible_anchor_session(None, Some(0.40)), Some(0.40));
     }
 
     // --- the swap engine (#6) ---
@@ -2856,5 +2880,110 @@ mod tests {
             delete_keychain(&kc);
             absent_reads
         }
+    }
+
+    // --- #1602: an absent session window is SKIPPED, never read as `0` -------------------------
+
+    /// A weekly-only reading for the #1602 cases — `session: None, session_resets_at: None` (the
+    /// account has no session window) beside a present weekly window.
+    fn weekly_only_usage(weekly: f64) -> Usage {
+        Usage {
+            session: None,
+            weekly: Some(weekly),
+            weekly_resets_at: None,
+            session_resets_at: None,
+        }
+    }
+
+    #[test]
+    fn decide_swaps_a_weekly_only_active_on_its_weekly_threshold_alone() {
+        // Issue #1602 (row 3): `decide` SKIPS a window the reading does not carry — the session arm
+        // compares against nothing — so a weekly-only active holds below its weekly threshold and
+        // swaps at/over it, with `session: None` throughout. Thresholds 0.95 / 0.97: the live frame
+        // (the #597 session fire point, the #607 weekly rotation line). Mutant M-g (the session arm
+        // as `is_none_or`) swaps at weekly 0.96.
+        assert_eq!(
+            decide(&weekly_only_usage(0.96), 0.95, 0.97),
+            SwapDecision::Hold,
+            "below its weekly threshold a weekly-only active holds — the absent session fires nothing",
+        );
+        assert_eq!(
+            decide(&weekly_only_usage(0.98), 0.95, 0.97),
+            SwapDecision::Swap,
+            "at/over its weekly threshold it swaps on the weekly dimension alone",
+        );
+    }
+
+    #[test]
+    fn plausible_anchor_session_passes_an_absent_anchor_through() {
+        // Issue #1602 (row 7): the blind-gate correction is `Option -> Option` — an anchor whose
+        // session window does not apply passes through as `None` (nothing to raise, and every gate
+        // that reads the result treats `None` as not armed), while a stale-low anchor in the
+        // mark's window is still raised to the mark exactly as #619 pinned. Mutant M-m returns the
+        // mark for a `None` anchor.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        assert_eq!(
+            plausible_anchor_session(mark, None),
+            None,
+            "no session window on the anchor → `None`, never the mark standing in for it",
+        );
+        assert_eq!(
+            plausible_anchor_session(mark, Some(0.40)),
+            Some(0.88),
+            "a stale-low anchor is still raised to the mark, as before",
+        );
+    }
+
+    #[test]
+    fn stale_low_correction_never_fabricates_a_session_for_an_absent_window() {
+        // Issue #1602 (row 8): `plausible_session` keeps its `(Option<SessionHighWater>, &Usage) ->
+        // Usage` signature and returns `session: None` whenever the passed reading's is — there is
+        // no fraction to raise, and a reading without a session window carries no stamp for any
+        // mark to apply to — and `is_stale_low` reads false on it (nothing sits below a mark in a
+        // window the account does not have). Mutant M-p returns the mark's session for the absent
+        // one.
+        let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        let weekly_only = weekly_only_usage(0.20);
+        let corrected = plausible_session(mark, &weekly_only);
+        assert_eq!(
+            corrected.session, None,
+            "an absent session window stays absent through the correction",
+        );
+        assert_eq!(
+            corrected, weekly_only,
+            "every other field passes through verbatim"
+        );
+        assert!(
+            !is_stale_low(mark, &weekly_only),
+            "a reading without a session window is never stale-low",
+        );
+    }
+
+    #[test]
+    fn session_high_water_fold_yields_no_mark_for_an_absent_session_and_reseeds_when_one_appears() {
+        // Issue #1602 (row 9): a reading whose session window does not apply carries no stamp, so
+        // folding it RELEASES the retained mark (`None`) exactly as an unstamped reading does — no
+        // mark survives the disappearance of the window — and the next reading that carries a
+        // session seeds a fresh mark in its own window. Mutant M-q keeps the previous mark across
+        // the unstamped reading.
+        let prev = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
+        assert!(prev.is_some(), "fixture: a stamped reading seeds a mark");
+        let released = SessionHighWater::fold(prev, &weekly_only_usage(0.20));
+        assert_eq!(
+            released, None,
+            "a weekly-only reading releases the mark rather than carrying it forward",
+        );
+        // A session window appears again, freshly stamped: a mark at that reading, in that window.
+        let reseeded = SessionHighWater::fold(released, &reading(0.30, Some(WINDOW_NEXT)));
+        assert_eq!(
+            reseeded.and_then(|m| m.applies_to(&reading(0.30, Some(WINDOW_NEXT)))),
+            Some(0.30),
+            "the next stamped reading seeds a fresh mark at 0.30 in its own window",
+        );
+        assert_eq!(
+            reseeded.and_then(|m| m.applies_to(&reading(0.30, Some(WINDOW)))),
+            None,
+            "…and it applies only to that window",
+        );
     }
 }

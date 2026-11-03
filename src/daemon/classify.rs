@@ -116,12 +116,20 @@ pub(crate) fn backoff_signal(result: &Result<Usage>) -> Option<BackoffSignal> {
 /// shows for the same readings, and shares its rounding with the swap line (whose `session_pct`
 /// may since #614 carry a plausibility-corrected value on a stale-low tick — see
 /// `plausible_active_usage`). A difference of two `0..=100` percents lands in `-100..=100`, well
-/// inside `i16`. Positive ⇒ usage climbing; negative ⇒ a window reset dropped the reading. Pure,
-/// so the quantization is unit-tested without a daemon.
-pub(crate) fn usage_velocity(prev: &Usage, next: &Usage) -> (i16, i16) {
-    let session = i16::from(to_pct(next.session)) - i16::from(to_pct(prev.session));
-    let weekly = i16::from(to_pct(next.weekly)) - i16::from(to_pct(prev.weekly));
-    (session, weekly)
+/// inside `i16`. Positive ⇒ usage climbing; negative ⇒ a window reset dropped the reading. Per
+/// axis, `None` when EITHER reading lacks that window (issue #1602): a window the account does
+/// not have — or one that appeared or vanished between the two readings — has no delta, so the
+/// event omits that axis and the EMA fold skips it rather than diffing against a fabricated `0`.
+/// Pure, so the quantization is unit-tested without a daemon.
+pub(crate) fn usage_velocity(prev: &Usage, next: &Usage) -> (Option<i16>, Option<i16>) {
+    let delta = |prev: Option<f64>, next: Option<f64>| {
+        prev.zip(next)
+            .map(|(prev, next)| i16::from(to_pct(next)) - i16::from(to_pct(prev)))
+    };
+    (
+        delta(prev.session, next.session),
+        delta(prev.weekly, next.weekly),
+    )
 }
 
 /// Map a swap-engine failure to the redacted wire reason for a `swap` ack (issue #167). The two
@@ -220,8 +228,8 @@ mod tests {
     /// leaves both modules self-contained rather than coupling one test module to the other.
     fn live(session: f64, weekly: f64) -> Result<Usage> {
         Ok(Usage {
-            session,
-            weekly,
+            session: Some(session),
+            weekly: Some(weekly),
             weekly_resets_at: None,
             session_resets_at: None,
         })
@@ -311,17 +319,26 @@ mod tests {
         // with the percents `status` / the swap line show, and a difference of two `0..=100`
         // percents is a signed value in `-100..=100`.
         let r = |session: f64, weekly: f64| Usage {
-            session,
-            weekly,
+            session: Some(session),
+            weekly: Some(weekly),
             weekly_resets_at: None,
             session_resets_at: None,
         };
-        // Climbing: both dimensions POSITIVE.
-        assert_eq!(usage_velocity(&r(0.10, 0.20), &r(0.17, 0.22)), (7, 2));
+        // Climbing: every dimension the account has is POSITIVE.
+        assert_eq!(
+            usage_velocity(&r(0.10, 0.20), &r(0.17, 0.22)),
+            (Some(7), Some(2))
+        );
         // A window reset dropped the reading: NEGATIVE session delta.
-        assert_eq!(usage_velocity(&r(0.95, 0.40), &r(0.03, 0.40)), (-92, 0));
-        // Flat: zero in both dimensions (the no-op the emitter stays silent on).
-        assert_eq!(usage_velocity(&r(0.50, 0.50), &r(0.50, 0.50)), (0, 0));
+        assert_eq!(
+            usage_velocity(&r(0.95, 0.40), &r(0.03, 0.40)),
+            (Some(-92), Some(0))
+        );
+        // Flat: zero in every dimension the account has (the no-op the emitter stays silent on).
+        assert_eq!(
+            usage_velocity(&r(0.50, 0.50), &r(0.50, 0.50)),
+            (Some(0), Some(0))
+        );
     }
 
     // --- classify_swap_failure (engine error → redacted reason, issue #167) ---
@@ -415,6 +432,102 @@ mod tests {
         assert_eq!(
             classify_capture_failure(&Error::ConfigWriteLockBusy),
             CaptureRejection::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_velocity_skips_an_absent_axis() {
+        // Issue #1602 (rows 12 and 15): per axis, a window EITHER reading lacks has no delta —
+        // `None`, never a diff against a fabricated `0` (mutant M-d) — so the `usage_velocity` line
+        // omits that axis's rate and delta tokens (`reliability` reads `session_delta_pct=` by key
+        // and contributes no session rate for such a line), and the tick's session-EMA fold is
+        // skipped; the served reading with no session window then resets the slot to `None` (D7
+        // as ruled). The daemon half rides the shared fixtures (`crate::daemon::tests`), as
+        // `snapshot_build`'s tests do.
+        use crate::daemon::tests::*;
+
+        let two_window = Usage {
+            session: Some(0.40),
+            weekly: Some(0.20),
+            weekly_resets_at: None,
+            session_resets_at: None,
+        };
+        let weekly_only = Usage {
+            session: None,
+            weekly: Some(0.22),
+            weekly_resets_at: None,
+            session_resets_at: None,
+        };
+        assert_eq!(
+            usage_velocity(&two_window, &weekly_only),
+            (None, Some(2)),
+            "a session window that vanished between the readings has no delta; the weekly axis does",
+        );
+        assert_eq!(
+            usage_velocity(&weekly_only, &two_window),
+            (None, Some(-2)),
+            "…and one that appeared has none either (the mirror)",
+        );
+
+        // The rendered line carries the weekly axis and neither session token.
+        let line = Event::UsageVelocity {
+            account: "u-A".to_owned(),
+            session_delta_pct: None,
+            weekly_delta_pct: Some(2),
+            elapsed_secs: 60,
+        }
+        .to_log_line(std::time::UNIX_EPOCH);
+        assert!(
+            line.contains(" weekly_pct_per_min=2.00") && line.contains(" weekly_delta_pct=2"),
+            "the weekly axis renders: {line}",
+        );
+        assert!(
+            !line.contains("session_pct_per_min=") && !line.contains("session_delta_pct="),
+            "no session token for an absent axis: {line}",
+        );
+
+        // Through a real tick: the second reading drops the session window, so the event omits the
+        // session axis, and the retained session EMA is reset — the slot reads `None`.
+        let mut daemon = lifecycle_daemon_with(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.40, 0.20)
+                .ok("u-B", 0.10, 0.10),
+            tunables(95, 80, 0),
+        )
+        .await;
+        warmed_tick(&mut daemon).await;
+        let retained = VelocityEma {
+            rate: 0.001,
+            samples: 3,
+        };
+        daemon.state.accounts[0].session_velocity = Some(retained);
+        daemon.poller = FakeRosterPoller::new()
+            .ok_without_a_session_window("u-A", 0.22)
+            .ok("u-B", 0.10, 0.10);
+        daemon.clock.advance(Duration::from_secs(60));
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            events.extend(daemon.tick().await.events);
+            if daemon.state.accounts[0]
+                .last_reading
+                .is_some_and(|usage| usage.session.is_none())
+            {
+                break;
+            }
+        }
+        assert!(
+            events.contains(&Event::UsageVelocity {
+                account: "u-A".to_owned(),
+                session_delta_pct: None,
+                weekly_delta_pct: Some(2),
+                elapsed_secs: 60,
+            }),
+            "the tick's velocity event skips the absent session axis: {events:?}",
+        );
+        assert_eq!(
+            daemon.state.accounts[0].session_velocity, None,
+            "a served reading with no session window resets the retained session EMA: the slot \
+             reads None",
         );
     }
 }

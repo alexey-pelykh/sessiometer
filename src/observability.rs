@@ -98,9 +98,12 @@ use crate::paths;
 /// Why a swap happened — the `reason=` of an [`Event::Swap`].
 ///
 /// The two AUTONOMOUS reasons are re-derived at swap time from the readings (the
-/// binary [`crate::swap::decide`] does not carry which dimension fired); when BOTH
-/// dimensions are at/over their triggers, the daemon reports [`SwapReason::Session`]
-/// — session-first precedence. The two MANUAL reasons (issue #63) are operator-driven,
+/// binary [`crate::swap::decide`] does not carry which dimension fired): the daemon
+/// reports [`SwapReason::Session`] only when the reading CARRIES a session window
+/// at/over its trigger — session-first precedence when every dimension the account
+/// has is over — and [`SwapReason::Weekly`] otherwise, so a weekly-only active (its
+/// session window absent, issue #1602) is always attributed to Weekly. The two
+/// MANUAL reasons (issue #63) are operator-driven,
 /// NOT usage-triggered: [`SwapReason::Manual`] is a `sessiometer use <account>` whose
 /// pre-swap gate passed, and [`SwapReason::Forced`] is one whose policy gate was
 /// bypassed with `--force`. A manual swap records `session_pct=0` (it was not driven
@@ -1350,13 +1353,19 @@ pub(crate) enum Event {
     /// (issue #365); the marker is omitted otherwise, leaving the in-band swap line
     /// unchanged. It is a formatter-derived flag, not a stored field.
     ///
+    /// `session_pct` is `None` when the outgoing account's session window did not APPLY (a
+    /// weekly-only account, issue #1602): rendered as an OMITTED `session_pct=` token, which
+    /// means "no such window", never "unknown" — and never a fabricated `0`, which no reader
+    /// could tell from a measured idle window. The manual swap's documented `Some(0)` sentinel
+    /// ("not session-triggered") is unchanged.
+    ///
     /// `from`/`to` are HANDLES (operator labels), NOT roster indices — unlike the
     /// same-named fields of [`crate::daemon::TickAction::Swapped`].
     Swap {
         from: String,
         to: String,
         reason: SwapReason,
-        session_pct: u8,
+        session_pct: Option<u8>,
         /// The projection that fired a #539 velocity-preemptive swap (issue #634) — `Some` for
         /// `reason=velocity_preempt` (the arm cannot fire without one), `None` for every other
         /// reason, whose decision is fully described by the observed `session_pct` already.
@@ -2031,13 +2040,16 @@ pub(crate) enum Event {
     /// [`Event::UsageRollup`]); never emitted across a poll gap (a throttle / failure clears the
     /// prior reading AND its timestamp), so a delta always spans two real consecutive readings.
     /// `session_delta_pct` / `weekly_delta_pct` are POSITIVE when usage is rising and NEGATIVE when a
-    /// window reset dropped it. `account` is the account UUID (#15); both deltas are bare signed
-    /// percents (a difference of two `0..=100` values, so within `-100..=100`) and `elapsed_secs` a
-    /// bare duration, never a token.
+    /// window reset dropped it, and `None` for an axis that EITHER reading lacks (issue #1602): a
+    /// window the account does not have, or one that appeared or vanished between the two
+    /// readings. The line then omits that axis's rate and delta tokens — "no such window", never a
+    /// `0` — and fires on a non-zero delta in whichever axis is present. `account` is the
+    /// account UUID (#15); both deltas are bare signed percents (a difference of two `0..=100`
+    /// values, so within `-100..=100`) and `elapsed_secs` a bare duration, never a token.
     UsageVelocity {
         account: String,
-        session_delta_pct: i16,
-        weekly_delta_pct: i16,
+        session_delta_pct: Option<i16>,
+        weekly_delta_pct: Option<i16>,
         /// Whole seconds between the two readings this velocity spans (issue #449) — the interval
         /// [`to_log_line`](Event::to_log_line) divides the deltas by to render the %/min rate.
         /// Always `> 0` at emission (the daemon suppresses a zero / unknown interval), so the rate
@@ -2071,11 +2083,17 @@ pub(crate) enum Event {
     /// wasn't climbing — `session_at_recovery` dropped well below). The RAW recovery pct is recorded,
     /// NOT a baked classification: the necessary/wasted THRESHOLD is #451/#484's to derive against
     /// production, so this SLI supplies the ingredient and leaves the verdict a query-time view.
+    ///
+    /// `session_pct` / `session_at_recovery` are `None` — the token OMITTED — when that reading's
+    /// session window did not apply (issue #1602: a weekly-only account, or an episode whose window
+    /// appeared or vanished across the blindness); `near_limit` reads `false` on such an anchor.
+    /// An absent token means "no such window", never "unknown", and [`crate::reliability`]
+    /// censuses the line as `without_session_window`, never `malformed`.
     BlindWindow {
         account: String,
         duration_secs: u64,
-        session_pct: u8,
-        session_at_recovery: u8,
+        session_pct: Option<u8>,
+        session_at_recovery: Option<u8>,
         near_limit: bool,
         /// The retained #539 velocity signal in force through this blind window (issue #634), or
         /// `None` when no SUSTAINED EMA was retained — in which case the report-only blind
@@ -2122,16 +2140,18 @@ pub(crate) enum Event {
     /// neither suppress the entry nor drop the anchor the exit is measured from. `was_active` tags
     /// which case this was — it is CONTEXT for the episode, never a filter on it.
     ///
-    /// `session_pct` / `weekly_pct` are the pre-blind anchor's rounded usage in BOTH windows — the
-    /// baseline [`Event::BlindExit`] differences against to answer "did it burn behind the
-    /// blindness?". `near_limit` tags whether the anchor sat at/over the session trigger (the risk
-    /// band), matching [`Event::BlindWindow`]'s tag so the two families filter alike. `account` is
-    /// the account UUID (#15) — matching the usage-family `acct=` (never the free-form label);
-    /// every other field a bare number / bool, never a token or email.
+    /// `session_pct` / `weekly_pct` are the pre-blind anchor's rounded usage in every window the
+    /// account has — the baseline [`Event::BlindExit`] differences against to answer "did it burn
+    /// behind the blindness?" — and `None` (the token omitted, issue #1602) for a window it does
+    /// not have. `near_limit` tags whether the anchor sat at/over the session trigger (the risk
+    /// band), `false` for an anchor with no session window, matching [`Event::BlindWindow`]'s tag
+    /// so the two families filter alike. `account` is the account UUID (#15) — matching the
+    /// usage-family `acct=` (never the free-form label); every other field a bare number / bool,
+    /// never a token or email.
     BlindEnter {
         account: String,
-        session_pct: u8,
-        weekly_pct: u8,
+        session_pct: Option<u8>,
+        weekly_pct: Option<u8>,
         was_active: bool,
         near_limit: bool,
     },
@@ -2148,7 +2168,7 @@ pub(crate) enum Event {
     ///   daemon swaps off is unrecoverable even when the account later reads live as a peer. This
     ///   is measured from a per-account anchor no swap touches, so it fires for any account.
     ///   `swapped_away` tags the case `blind_window` structurally could not see.
-    /// - **Both usage windows, not just session.** `blind_window` carries session only. The session
+    /// - **Every usage window the account has, not just session.** `blind_window` carries session only. The session
     ///   window RESETS on its own 5 h cadence, so a session-only record reads a reset as
     ///   `29 -> 0` — indistinguishable from "never burned", and the exact reading that hid a real
     ///   +12 pp WEEKLY burn behind a 2 h blindness in production on 2026-07-17. Carrying the weekly
@@ -2168,13 +2188,18 @@ pub(crate) enum Event {
     /// blindness is precisely what made an episode invisible). `near_limit` carries the anchor's
     /// risk-band tag through from the entry. `account` is the account UUID (#15) — matching the
     /// usage-family `acct=`; every other field a bare number / bool, never a token or email.
+    ///
+    /// Each percent is `None` — its token omitted — for a window that reading did not have (issue
+    /// #1602), and a burn is derived only where BOTH ends carry the window: a weekly-only account's
+    /// exit line carries `weekly_burn_pct=` and no `session_burn_pct=`, never a `0` or a `-N`
+    /// across a window it never had.
     BlindExit {
         account: String,
         duration_secs: u64,
-        session_pct: u8,
-        session_at_recovery: u8,
-        weekly_pct: u8,
-        weekly_at_recovery: u8,
+        session_pct: Option<u8>,
+        session_at_recovery: Option<u8>,
+        weekly_pct: Option<u8>,
+        weekly_at_recovery: Option<u8>,
         was_active: bool,
         swapped_away: bool,
         near_limit: bool,
@@ -2606,7 +2631,7 @@ impl Event {
                 // ignore, mirroring the optional `resets_at` / `expires_*` fields —
                 // so a normal in-band swap line is byte-for-byte unchanged. A
                 // number-derived bool: no new field type, no new redaction surface (#15).
-                let late = if *session_pct >= 100 {
+                let late = if session_pct.is_some_and(|pct| pct >= 100) {
                     " late=true"
                 } else {
                     ""
@@ -2627,8 +2652,17 @@ impl Event {
                     ),
                     None => String::new(),
                 };
+                // Issue #1602: an outgoing account whose session window did not apply carries no
+                // `session_pct=` token at all — an ABSENT token means "no such window", never
+                // "unknown" (the `session_high_water_pct` precedent on `blind_window`), and never a
+                // fabricated `0`, which the offline readers could not tell from a measured idle
+                // window. The tolerant `key=val` parsers read by key, so every other token stands.
+                let session_pct = match session_pct {
+                    Some(pct) => format!(" session_pct={pct}"),
+                    None => String::new(),
+                };
                 format!(
-                    "ts={ts} event=swap from={from} to={to} reason={reason} session_pct={session_pct}{late}{projection}"
+                    "ts={ts} event=swap from={from} to={to} reason={reason}{session_pct}{late}{projection}"
                 )
             }
             Event::ReStash { account } => {
@@ -3091,10 +3125,24 @@ impl Event {
                 // matching the sibling `usage_backoff` line; a negative rate / delta renders its `-`
                 // sign, a `key=val` token existing parsers read as-is.
                 let minutes = *elapsed_secs as f64 / 60.0;
-                let session_pct_per_min = f64::from(*session_delta_pct) / minutes;
-                let weekly_pct_per_min = f64::from(*weekly_delta_pct) / minutes;
+                // Issue #1602: each axis renders only when the account HAS that window on both
+                // readings — an absent axis omits its rate AND its delta token (`reliability`
+                // reads `session_delta_pct=` by key and contributes no rate for such a line),
+                // never a `0`. Token order is unchanged where both axes are present.
+                let rate = |delta: &Option<i16>, key: &str| match delta {
+                    Some(delta) => format!(" {key}_pct_per_min={:.2}", f64::from(*delta) / minutes),
+                    None => String::new(),
+                };
+                let delta_token = |delta: &Option<i16>, key: &str| match delta {
+                    Some(delta) => format!(" {key}_delta_pct={delta}"),
+                    None => String::new(),
+                };
+                let session_rate = rate(session_delta_pct, "session");
+                let weekly_rate = rate(weekly_delta_pct, "weekly");
+                let session_delta = delta_token(session_delta_pct, "session");
+                let weekly_delta = delta_token(weekly_delta_pct, "weekly");
                 format!(
-                    "ts={ts} event=usage_velocity acct={account} session_pct_per_min={session_pct_per_min:.2} weekly_pct_per_min={weekly_pct_per_min:.2} elapsed_secs={elapsed_secs} session_delta_pct={session_delta_pct} weekly_delta_pct={weekly_delta_pct}"
+                    "ts={ts} event=usage_velocity acct={account}{session_rate}{weekly_rate} elapsed_secs={elapsed_secs}{session_delta}{weekly_delta}"
                 )
             }
             Event::BlindWindow {
@@ -3145,8 +3193,20 @@ impl Event {
                     Some(pct) => format!(" session_high_water_pct={pct}"),
                     None => String::new(),
                 };
+                // Issue #1602: the anchor's and the recovery's session percents render only when
+                // that reading HAD a session window — an omitted token means "no such window",
+                // never "unknown" (the `session_high_water_pct` precedent above), and `reliability`
+                // censuses such a line as `without_session_window`, never `malformed`.
+                let session_pct = match session_pct {
+                    Some(pct) => format!(" session_pct={pct}"),
+                    None => String::new(),
+                };
+                let session_at_recovery = match session_at_recovery {
+                    Some(pct) => format!(" session_at_recovery={pct}"),
+                    None => String::new(),
+                };
                 format!(
-                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs} session_pct={session_pct} session_at_recovery={session_at_recovery} near_limit={near_limit}{velocity}{high_water}"
+                    "ts={ts} event=blind_window acct={account} duration_secs={duration_secs}{session_pct}{session_at_recovery} near_limit={near_limit}{velocity}{high_water}"
                 )
             }
             Event::BlindEnter {
@@ -3158,11 +3218,21 @@ impl Event {
             } => {
                 // The blind-episode OPEN (issue #583) — emitted the moment the account goes dark, so
                 // a never-recovering episode is still durable. All bare numbers + bools (#15): the
-                // pre-blind anchor's usage in BOTH windows (the baseline `blind_exit` differences
-                // against), whether the account was the active one, and whether the anchor sat in the
-                // risk band. `acct=` is the UUID, matching the usage-family lines.
+                // pre-blind anchor's usage in every window the account has (the baseline `blind_exit`
+                // differences against), whether the account was the active one, and whether the
+                // anchor sat in the risk band. `acct=` is the UUID, matching the usage-family lines.
+                // Issue #1602: a window the account does not have omits its token — "no such
+                // window", never a `0`.
+                let session_pct = match session_pct {
+                    Some(pct) => format!(" session_pct={pct}"),
+                    None => String::new(),
+                };
+                let weekly_pct = match weekly_pct {
+                    Some(pct) => format!(" weekly_pct={pct}"),
+                    None => String::new(),
+                };
                 format!(
-                    "ts={ts} event=blind_enter acct={account} session_pct={session_pct} weekly_pct={weekly_pct} was_active={was_active} near_limit={near_limit}"
+                    "ts={ts} event=blind_enter acct={account}{session_pct}{weekly_pct} was_active={was_active} near_limit={near_limit}"
                 )
             }
             Event::BlindExit {
@@ -3178,7 +3248,7 @@ impl Event {
             } => {
                 // The blind-episode CLOSE (issue #583) — the uncensored counterpart of
                 // `blind_window`: fires for ANY account (not just the still-active one) and carries
-                // BOTH usage windows. The signed per-window burn is DERIVED here from the stored
+                // every usage window the account has. The signed per-window burn is DERIVED here from the stored
                 // anchor/recovery pairs and rendered FIRST — the same store-the-ingredients-
                 // derive-the-view idiom as `usage_velocity`'s %/min rate — so "did it burn behind the
                 // blindness?" reads straight off the line; the raw pcts trail it so the exact
@@ -3187,10 +3257,33 @@ impl Event {
                 // entirely when the 5 h session window resets mid-blindness. Both burns are signed —
                 // NEGATIVE across a window reset — and a `-` renders as a `key=val` token existing
                 // parsers read as-is. All bare numbers + bools (#15); `acct=` is the UUID.
-                let session_burn_pct = i16::from(*session_at_recovery) - i16::from(*session_pct);
-                let weekly_burn_pct = i16::from(*weekly_at_recovery) - i16::from(*weekly_pct);
+                // Issue #1602: a burn is DERIVED only where BOTH the anchor and the recovery carry
+                // that window; an axis absent on either end omits its burn token, and each absent
+                // percent omits its own token — "no such window", never a `0` that would read as a
+                // measured idle window, nor a `-N` burn across a window the account never had.
+                let burn = |anchor: &Option<u8>, recovered: &Option<u8>, key: &str| match anchor
+                    .zip(*recovered)
+                {
+                    Some((anchor, recovered)) => {
+                        format!(
+                            " {key}_burn_pct={}",
+                            i16::from(recovered) - i16::from(anchor)
+                        )
+                    }
+                    None => String::new(),
+                };
+                let pct = |value: &Option<u8>, key: &str| match value {
+                    Some(pct) => format!(" {key}={pct}"),
+                    None => String::new(),
+                };
+                let session_burn = burn(session_pct, session_at_recovery, "session");
+                let weekly_burn = burn(weekly_pct, weekly_at_recovery, "weekly");
+                let session_pct = pct(session_pct, "session_pct");
+                let session_at_recovery = pct(session_at_recovery, "session_at_recovery");
+                let weekly_pct = pct(weekly_pct, "weekly_pct");
+                let weekly_at_recovery = pct(weekly_at_recovery, "weekly_at_recovery");
                 format!(
-                    "ts={ts} event=blind_exit acct={account} duration_secs={duration_secs} session_burn_pct={session_burn_pct} weekly_burn_pct={weekly_burn_pct} session_pct={session_pct} session_at_recovery={session_at_recovery} weekly_pct={weekly_pct} weekly_at_recovery={weekly_at_recovery} was_active={was_active} swapped_away={swapped_away} near_limit={near_limit}"
+                    "ts={ts} event=blind_exit acct={account} duration_secs={duration_secs}{session_burn}{weekly_burn}{session_pct}{session_at_recovery}{weekly_pct}{weekly_at_recovery} was_active={was_active} swapped_away={swapped_away} near_limit={near_limit}"
                 )
             }
             Event::BlindGateEligible {
@@ -4196,7 +4289,7 @@ pub(crate) mod tests {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::Session,
-            session_pct: 97,
+            session_pct: Some(97),
             projection: None,
         }
         .to_log_line(at_epoch(0));
@@ -4215,7 +4308,7 @@ pub(crate) mod tests {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::Session,
-            session_pct: 100,
+            session_pct: Some(100),
             projection: None,
         }
         .to_log_line(at_epoch(0));
@@ -4234,7 +4327,7 @@ pub(crate) mod tests {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::Session,
-            session_pct: 99,
+            session_pct: Some(99),
             projection: None,
         }
         .to_log_line(at_epoch(0));
@@ -4251,7 +4344,7 @@ pub(crate) mod tests {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::Weekly,
-            session_pct: 40,
+            session_pct: Some(40),
             projection: None,
         }
         .to_log_line(at_epoch(0));
@@ -4275,7 +4368,7 @@ pub(crate) mod tests {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::VelocityPreempt,
-            session_pct: 92,
+            session_pct: Some(92),
             projection: None,
         }
         .to_log_line(at_epoch(0));
@@ -4303,7 +4396,7 @@ pub(crate) mod tests {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::VelocityPreempt,
-            session_pct: 70,
+            session_pct: Some(70),
             projection: Some(SwapProjection {
                 projected_pct: 96.3,
                 rate_pct_per_sec: 0.218333,
@@ -4346,7 +4439,7 @@ pub(crate) mod tests {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::BlindPreempt,
-            session_pct: 68,
+            session_pct: Some(68),
             // The blind-preempt swap carries no projection on its own line (issue #634): the
             // retained velocity rides the paired `blind_window` event instead.
             projection: None,
@@ -5352,7 +5445,7 @@ pub(crate) mod tests {
                     from: h(),
                     to: h(),
                     reason: SwapReason::Session,
-                    session_pct: 97,
+                    session_pct: Some(97),
                     projection: None,
                 },
                 &["from", "to"],
@@ -6755,7 +6848,7 @@ pub(crate) mod tests {
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
                 reason: SwapReason::Session,
-                session_pct: 97,
+                session_pct: Some(97),
                 projection: None,
             },
             // Issue #634: the projection-carrying + velocity-carrying variants ride the same
@@ -6764,7 +6857,7 @@ pub(crate) mod tests {
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
                 reason: SwapReason::VelocityPreempt,
-                session_pct: 70,
+                session_pct: Some(70),
                 projection: Some(SwapProjection {
                     projected_pct: 96.5,
                     rate_pct_per_sec: 0.221667,
@@ -6935,15 +7028,15 @@ pub(crate) mod tests {
             },
             Event::UsageVelocity {
                 account: "work".to_owned(),
-                session_delta_pct: 7,
-                weekly_delta_pct: -1,
+                session_delta_pct: Some(7),
+                weekly_delta_pct: Some(-1),
                 elapsed_secs: 300,
             },
             Event::BlindWindow {
                 account: "work".to_owned(),
                 duration_secs: 480,
-                session_pct: 29,
-                session_at_recovery: 61,
+                session_pct: Some(29),
+                session_at_recovery: Some(61),
                 near_limit: false,
                 velocity: Some(BlindVelocity {
                     rate_pct_per_sec: 0.05,
@@ -6956,18 +7049,18 @@ pub(crate) mod tests {
             },
             Event::BlindEnter {
                 account: "work".to_owned(),
-                session_pct: 82,
-                weekly_pct: 44,
+                session_pct: Some(82),
+                weekly_pct: Some(44),
                 was_active: true,
                 near_limit: true,
             },
             Event::BlindExit {
                 account: "work".to_owned(),
                 duration_secs: 480,
-                session_pct: 82,
-                session_at_recovery: 91,
-                weekly_pct: 44,
-                weekly_at_recovery: 46,
+                session_pct: Some(82),
+                session_at_recovery: Some(91),
+                weekly_pct: Some(44),
+                weekly_at_recovery: Some(46),
                 was_active: true,
                 swapped_away: true,
                 near_limit: true,
@@ -8341,7 +8434,7 @@ pub(crate) mod tests {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::Session,
-            session_pct: 97,
+            session_pct: Some(97),
             projection: None,
         })
         .unwrap();
@@ -8385,7 +8478,7 @@ pub(crate) mod tests {
             from: "work".to_owned(),
             to: "spare".to_owned(),
             reason: SwapReason::Session,
-            session_pct: 97,
+            session_pct: Some(97),
             projection: None,
         })
         .unwrap();
@@ -8523,7 +8616,7 @@ pub(crate) mod tests {
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
                 reason,
-                session_pct: 0,
+                session_pct: Some(0),
                 projection: None,
             }
             .to_log_line(at_epoch(0));
@@ -9135,8 +9228,8 @@ outcome=failed\n",
         // interval trail so the exact measurement stays recoverable for the #451 spike.
         let climbing = Event::UsageVelocity {
             account: "u-A".to_owned(),
-            session_delta_pct: 7,
-            weekly_delta_pct: 2,
+            session_delta_pct: Some(7),
+            weekly_delta_pct: Some(2),
             elapsed_secs: 300,
         }
         .to_log_line(at_epoch(0));
@@ -9149,8 +9242,8 @@ outcome=failed\n",
         // `-` sign (−92 / 1 min = −92.00), a `key=val` token existing parsers read as-is.
         let reset = Event::UsageVelocity {
             account: "u-A".to_owned(),
-            session_delta_pct: -92,
-            weekly_delta_pct: 0,
+            session_delta_pct: Some(-92),
+            weekly_delta_pct: Some(0),
             elapsed_secs: 60,
         }
         .to_log_line(at_epoch(0));
@@ -9167,15 +9260,15 @@ outcome=failed\n",
         // log now distinguishes a fast burn from a slow climb that a raw delta alone conflated.
         let fast = Event::UsageVelocity {
             account: "u-A".to_owned(),
-            session_delta_pct: 6,
-            weekly_delta_pct: 0,
+            session_delta_pct: Some(6),
+            weekly_delta_pct: Some(0),
             elapsed_secs: 60,
         }
         .to_log_line(at_epoch(0));
         let slow = Event::UsageVelocity {
             account: "u-A".to_owned(),
-            session_delta_pct: 6,
-            weekly_delta_pct: 0,
+            session_delta_pct: Some(6),
+            weekly_delta_pct: Some(0),
             elapsed_secs: 360,
         }
         .to_log_line(at_epoch(0));
@@ -9194,8 +9287,8 @@ outcome=failed\n",
         let line = Event::BlindWindow {
             account: "u-A".to_owned(),
             duration_secs: 480,
-            session_pct: 96,
-            session_at_recovery: 98,
+            session_pct: Some(96),
+            session_at_recovery: Some(98),
             near_limit: true,
             // No retained velocity and no stale-low mark — the line is byte-for-byte the pre-#634 /
             // pre-#670 shape (both are additive optional tokens).
@@ -9218,8 +9311,8 @@ outcome=failed\n",
         let line = Event::BlindWindow {
             account: "u-B".to_owned(),
             duration_secs: 90,
-            session_pct: 40,
-            session_at_recovery: 42,
+            session_pct: Some(40),
+            session_at_recovery: Some(42),
             near_limit: false,
             velocity: None,
             session_high_water_pct: None,
@@ -9245,8 +9338,8 @@ outcome=failed\n",
         let line = Event::BlindWindow {
             account: "u-A".to_owned(),
             duration_secs: 480,
-            session_pct: 29,
-            session_at_recovery: 61,
+            session_pct: Some(29),
+            session_at_recovery: Some(61),
             near_limit: false,
             velocity: Some(BlindVelocity {
                 rate_pct_per_sec: 0.05,
@@ -9288,8 +9381,8 @@ outcome=failed\n",
         let line = Event::BlindWindow {
             account: "u-A".to_owned(),
             duration_secs: 600,
-            session_pct: 20,
-            session_at_recovery: 55,
+            session_pct: Some(20),
+            session_at_recovery: Some(55),
             near_limit: false,
             velocity: Some(BlindVelocity {
                 rate_pct_per_sec: 0.05,
@@ -9324,8 +9417,8 @@ outcome=failed\n",
         let line = Event::BlindWindow {
             account: "u-B".to_owned(),
             duration_secs: 400,
-            session_pct: 20,
-            session_at_recovery: 55,
+            session_pct: Some(20),
+            session_at_recovery: Some(55),
             near_limit: false,
             velocity: None,
             session_high_water_pct: Some(50),
@@ -9347,8 +9440,8 @@ outcome=failed\n",
         // `blind_exit` differences against) and tags whether this was the active account.
         let line = Event::BlindEnter {
             account: "u-A".to_owned(),
-            session_pct: 96,
-            weekly_pct: 30,
+            session_pct: Some(96),
+            weekly_pct: Some(30),
             was_active: true,
             near_limit: true,
         }
@@ -9373,10 +9466,10 @@ outcome=failed\n",
         let line = Event::BlindExit {
             account: "u-A".to_owned(),
             duration_secs: 7512,
-            session_pct: 29,
-            session_at_recovery: 0,
-            weekly_pct: 5,
-            weekly_at_recovery: 17,
+            session_pct: Some(29),
+            session_at_recovery: Some(0),
+            weekly_pct: Some(5),
+            weekly_at_recovery: Some(17),
             was_active: true,
             swapped_away: true,
             near_limit: false,
@@ -9463,10 +9556,10 @@ outcome=failed\n",
         let line = Event::BlindExit {
             account: "u-B".to_owned(),
             duration_secs: 120,
-            session_pct: 40,
-            session_at_recovery: 40,
-            weekly_pct: 12,
-            weekly_at_recovery: 12,
+            session_pct: Some(40),
+            session_at_recovery: Some(40),
+            weekly_pct: Some(12),
+            weekly_at_recovery: Some(12),
             was_active: true,
             swapped_away: false,
             near_limit: false,
@@ -9476,6 +9569,90 @@ outcome=failed\n",
             line,
             format!(
                 "{TS0} event=blind_exit acct=u-B duration_secs=120 session_burn_pct=0 weekly_burn_pct=0 session_pct=40 session_at_recovery=40 weekly_pct=12 weekly_at_recovery=12 was_active=true swapped_away=false near_limit=false"
+            )
+        );
+    }
+
+    #[test]
+    fn session_only_reading_lines_omit_the_weekly_axis_tokens_and_keep_the_session_tokens() {
+        // The mirror of the weekly-only cases the daemon tests pin (issue #1602): a reading that
+        // carries a session window and no weekly window renders every session-axis token and NO
+        // weekly-axis token — never a fabricated `weekly_pct=0` that would read as a measured idle
+        // week — across the three event families whose weekly arm is rendered apart from the
+        // session one: `blind_enter`, `blind_exit` (anchor, recovery AND the derived burn) and
+        // `usage_velocity` (rate AND delta). Every `Some` below is a measured session reading.
+        let enter = Event::BlindEnter {
+            account: "u-A".to_owned(),
+            session_pct: Some(96),
+            weekly_pct: None,
+            was_active: true,
+            near_limit: true,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(
+            !enter.contains("weekly_pct="),
+            "weekly_pct= must be omitted: {enter}"
+        );
+        assert!(
+            enter.contains(" session_pct=96 "),
+            "session_pct= must stand: {enter}"
+        );
+        assert_eq!(
+            enter,
+            format!(
+                "{TS0} event=blind_enter acct=u-A session_pct=96 was_active=true near_limit=true"
+            )
+        );
+
+        let exit = Event::BlindExit {
+            account: "u-A".to_owned(),
+            duration_secs: 7512,
+            session_pct: Some(29),
+            session_at_recovery: Some(43),
+            weekly_pct: None,
+            weekly_at_recovery: None,
+            was_active: true,
+            swapped_away: true,
+            near_limit: false,
+        }
+        .to_log_line(at_epoch(0));
+        for token in ["weekly_burn_pct=", "weekly_pct=", "weekly_at_recovery="] {
+            assert!(!exit.contains(token), "{token} must be omitted: {exit}");
+        }
+        for token in [
+            "session_burn_pct=14",
+            "session_pct=29",
+            "session_at_recovery=43",
+        ] {
+            assert!(exit.contains(token), "{token} must stand: {exit}");
+        }
+        assert_eq!(
+            exit,
+            format!(
+                "{TS0} event=blind_exit acct=u-A duration_secs=7512 session_burn_pct=14 session_pct=29 session_at_recovery=43 was_active=true swapped_away=true near_limit=false"
+            )
+        );
+
+        let velocity = Event::UsageVelocity {
+            account: "u-A".to_owned(),
+            session_delta_pct: Some(7),
+            weekly_delta_pct: None,
+            elapsed_secs: 300,
+        }
+        .to_log_line(at_epoch(0));
+        for token in ["weekly_pct_per_min=", "weekly_delta_pct="] {
+            assert!(
+                !velocity.contains(token),
+                "{token} must be omitted: {velocity}"
+            );
+        }
+        for token in ["session_pct_per_min=1.40", "session_delta_pct=7"] {
+            assert!(velocity.contains(token), "{token} must stand: {velocity}");
+        }
+        assert_eq!(
+            velocity,
+            format!(
+                "{TS0} event=usage_velocity acct=u-A session_pct_per_min=1.40 elapsed_secs=300 session_delta_pct=7"
             )
         );
     }
@@ -9943,16 +10120,16 @@ outcome=failed\n",
             .to_log_line(at_epoch(0)),
             Event::UsageVelocity {
                 account: "u-A".to_owned(),
-                session_delta_pct: -5,
-                weekly_delta_pct: 1,
+                session_delta_pct: Some(-5),
+                weekly_delta_pct: Some(1),
                 elapsed_secs: 120,
             }
             .to_log_line(at_epoch(0)),
             Event::BlindWindow {
                 account: "u-A".to_owned(),
                 duration_secs: 300,
-                session_pct: 97,
-                session_at_recovery: 99,
+                session_pct: Some(97),
+                session_at_recovery: Some(99),
                 near_limit: true,
                 // Issue #634: the velocity ingredients ride this #15/#444 sweep too — bare numbers,
                 // no email/token/label surface added.
@@ -9966,8 +10143,8 @@ outcome=failed\n",
             .to_log_line(at_epoch(0)),
             Event::BlindEnter {
                 account: "u-A".to_owned(),
-                session_pct: 97,
-                weekly_pct: 40,
+                session_pct: Some(97),
+                weekly_pct: Some(40),
                 was_active: true,
                 near_limit: true,
             }
@@ -9975,10 +10152,10 @@ outcome=failed\n",
             Event::BlindExit {
                 account: "u-A".to_owned(),
                 duration_secs: 300,
-                session_pct: 97,
-                session_at_recovery: 99,
-                weekly_pct: 40,
-                weekly_at_recovery: 44,
+                session_pct: Some(97),
+                session_at_recovery: Some(99),
+                weekly_pct: Some(40),
+                weekly_at_recovery: Some(44),
                 was_active: true,
                 swapped_away: true,
                 near_limit: true,
