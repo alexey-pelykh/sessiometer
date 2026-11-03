@@ -705,7 +705,9 @@ Scenario: the module doc states the store's format, what an older and a newer bu
         folded before that field existed reads as not recorded, never as the bucket's `count` and never
         as `0`
     And on the head `git grep -c '#1604' -- src/usage_store.rs` prints a non-zero count while
-        `git grep -n 'replacing-the-running-daemon' -- src/usage_store.rs` prints nothing
+        `git grep -n 'replacing-the-running-daemon' -- src/usage_store.rs` prints nothing; the canary
+        through the same command, `git grep -c 'fn read_rollup' -- src/usage_store.rs`, prints
+        `src/usage_store.rs:1` on `origin/main` and on the head, so the empty result is an absence
     But NOT a sentence saying an older binary reads the count and drops it at its next rollup rewrite —
         AC-28's original wording, whose premise the fence made false: inside the envelope an older build
         refuses the whole rollup before it rewrites anything, so it never reads the count and never
