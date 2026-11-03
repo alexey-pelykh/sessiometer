@@ -297,6 +297,10 @@ Scenario: the note says what import's notice says, and never that anything was r
 ## 🟥 Open
 
 ### 1. `duplicate-label-policy` — warn or refuse (design § 12.2, PRD § 8.1)
+> **Ruling, 2026-11-03.** Refuse: the creating half, a save that would make a label name a second account, is a
+> rejected save rather than a notice, and the note keeps showing duplicates that already exist. Re-authored at
+> #1560's re-gate; the header's count predates the ruling.
+
 
 When a Settings save makes a label name a second account, does the daemon accept the write and report it (warn), or reject it before any write (refuse, with a new `label-in-use` rejection)? The design records no fallback for this one and says the answer fixes the assertion form of the oracles. The issue builds warn. An assertion of either branch would be a guess, so these are held as examples and are not scenarios:
 

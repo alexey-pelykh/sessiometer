@@ -292,6 +292,10 @@ Scenario: a Swift-only edit to ConfigWire.swift still runs the test job
 ## Open — two Red cards, and the examples they keep unwritten
 
 ### Red 1 — `duplicate-label-policy`: warn or refuse
+> **Ruling, 2026-11-03.** Refuse (PRD § 8.1, design § 12.2): the save is rejected with `label-in-use`, and whether
+> Settings offers an overwrite is #1558's and #1560's re-gate to settle. The examples this card kept unwritten are
+> written in the refuse form there. The header's count predates the ruling.
+
 
 When a `config-set` makes a label name a second account, does the daemon save it and say so in the
 `applied` acknowledgement (warn), or refuse before saving (refuse)? Neither the PRD (§ 8.1) nor the design

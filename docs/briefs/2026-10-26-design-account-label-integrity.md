@@ -16,7 +16,9 @@ label name a second account without saying so, a `login` can rename a different 
 operator meant, one credential can sit under two entries unnoticed, and nothing downstream — the status
 wire, the panel, usage history, swap lines — can tell two same-label accounts apart. This design makes
 each of those writes audible where it happens and gives the downstream surfaces an identity a relabel
-does not change, without enforcing uniqueness.
+does not change, without enforcing uniqueness at load time; at the four write paths the operator ruled on
+2026-11-03 that a write which would make a label name a second account is refused unless `--overwrite` is
+given (design § 12.2).
 
 ## Key Decisions
 

@@ -39,9 +39,9 @@ artifacts: {design-doc: docs/design/account-label-integrity-solution-design.md, 
 > and each cited line reads the same there as at `d9d75ba`. The line numbers that §§ 2.11 and 2.14
 > quote from other documents stay as those documents wrote them.
 
-**Version**: 1.3
+**Version**: 1.4
 **Created**: 2026-10-26
-**Last Updated**: 2026-11-02
+**Last Updated**: 2026-11-03
 **Status**: Draft — blocked from scoping by `dor_status: failed` (§ 14c); the run went past that verdict provisionally, under the scope brief's register row `proceed-past-failed-dor`, and § 14b lists the items it filed
 **Sources**: two of the operator's messages (§ 2.1); the `/investigate` report grounded at `99ab155` and
 the `/scope` seed of 2026-10-26, both machine-local scratch; the tree at `d9d75ba`; the private HQ
@@ -49,9 +49,38 @@ records quoted in § 2.13; the tracker items named in § 7, read 2026-10-26.
 
 ## 1. TL;DR
 
-> **Owed by the operator.** The TL;DR is one of the parts of a PRD that `/capture-requirements` never
-> composes. The operator could not be asked during this run, so this section stays empty until the
-> operator writes it.
+> **Pipeline-authored on 2026-11-03, ratification-pending like the rest of this document.** Composed from
+> the finished document after the scoping pull request merged, on the operator's ruling of 2026-11-03 that the
+> TL;DR is never theirs to write (the rule it replaces is tracked as `alexey-pelykh/.claude` issue 6464).
+
+Sessiometer identifies an account by its server-assigned identifier and lets the operator refer to it by a
+free label, and nothing keeps labels honest. CLI `capture`, CLI `login`, the socket `capture` and the Settings
+rename can each give one label to two accounts, or move a label onto a different account, without saying so.
+A `login` can rename a different account than the one the operator meant. One credential can sit under two
+roster entries unnoticed. The panel, the usage history, the `status` and `watch` output and the swap log then
+tell accounts apart by label alone, so a shared or moved label makes them merge or confuse the accounts behind
+it (§ 2).
+
+**Proposed solution.** Make every write that creates a collision, renames an account or stores a credential
+another entry already holds announce it on the surface that did the write (F1 to F3). Give every surface
+downstream of the roster an identity that a relabel does not change (F4). Check an import payload's own
+identities before writing (F5, F6). Measure the premises behind the identifier on real logins (F7). Record
+the decisions nobody has made: what makes two labels the same (F8) and what becomes of an orphaned keychain
+item (F10), and bring the documents that disagree with the code into line (F9).
+
+**Not in scope.** Enforcing unique labels at load time, which ratified AC-6 forbids; choosing between or
+disabling accounts that share a credential; an online identity check (§ 3).
+
+**Decisions.** Six were the operator's to make (§ 8.1 and § 8.3). Two are ruled as of 2026-11-03: a write that would
+make a label name a second account is refused unless `--overwrite` is given, and a `login` that would rename
+a different account than the label names is refused unless `--rename` is given. Four stay open: what makes
+two labels the same, how a malformed import is handled, what becomes of an orphan stash, and which
+identifier the wire carries.
+
+**Status.** Pipeline-authored from the operator's two messages (§ 2.1); 35 tracked items under #1550
+(§ 14b); `dor_status: failed` on approval grounds only (§ 14c), so nothing below is ratified yet. Appetite:
+one developer, one big batch (§ 3), with the scope brief's estimate of the must-have scope above it (its
+`stage37-appetite-overflow` row), reported rather than cut.
 
 ## 2. Problem Statement
 
@@ -452,8 +481,15 @@ The constraints that bind every feature are in § 10.11.
 
 ### Benefit hypothesis
 
-> **Owed by the operator.** The benefit hypothesis is the operator's to write, and this pipeline does
-> not compose it. It stays empty until the operator writes it.
+> **Pipeline-authored on 2026-11-03, ratification-pending.** Drafted by the `/scope` orchestrator for the
+> operator to accept or rewrite; it was left empty by the rule tracked as `alexey-pelykh/.claude` issue 6464.
+
+If a write that would share or move a label is refused unless the operator overrides it, every write that
+shares a credential says so, and every surface downstream of the roster keys on an identity a relabel does not
+change, then the operator never acts on the wrong account because of a label: a swap, a usage reading or an
+expiry read for "work" belongs to the account they mean, and a label that names two accounts is a state they
+chose at a write, or let in through an import or a hand edit, never one a capture or a login created behind their
+back.
 
 ### Serves
 
@@ -674,11 +710,13 @@ Ordering inside this PRD:
 
 ## 8. Open Questions
 
-### 8.1 Decisions only the operator can make — each kept open
+### 8.1 Decisions only the operator can make — each kept open until the operator rules; two ruled on 2026-11-03
 
 No requirement in § 10 assumes an answer to any of these, except REQ-DOC-B-003 (§ 10.9), whose wording
 takes the keep-rename option of `login-mismatch-policy` (the solution design's § 14.6 item 14 records the
-assumption). Each one names the requirements that read its answer.
+assumption). Each one names the requirements that read its answer. Two decisions were ruled by the operator on
+2026-11-03 and carry a Ruling paragraph below; REQ-DOC-B-003's keep-rename wording is falsified by the refuse
+ruling and is re-keyed with #1570 (§ 10.9).
 
 **`duplicate-label-policy`**: warn or refuse when `capture`, `login`, the socket `capture` or
 `config-set` creates a duplicate label.
@@ -690,6 +728,26 @@ assumption). Each one names the requirements that read its answer.
 
 Under every option, REQ-ROS-B-001 (never silent) and REQ-ROS-B-002 (the calibration) hold. The answer
 fixes the assertion form of REQ-ROS-C-002's oracles.
+
+**Ruling (the operator, 2026-11-03).** Refuse. The operator's words, verbatim, from the conversation that drove
+the scoping pull request to merge: "refuse unless `--rename` or `--force` is added, be defensive rather than
+'oh and btw we renamed shit'", and on this decision: "it's impossible to overwrite an existing ACC_1 with
+ACC_2 under same label w/o adding `--overwrite` or removing ACC_1 and alike. (or `--force`?)". Reading
+recorded by the `/scope` orchestrator, pipeline-authored and to be confirmed at ratification: a write that
+would make a label name a second account is refused before any write, on CLI `capture`, CLI `login`, the socket
+`capture` and `config-set`, with the `label-in-use` rejection. The override flag is `--overwrite`, the operator's own word, confirmed when they
+accepted the recommendation to prefer it over `--force` ("proceed as recommended and propagate/update",
+2026-11-03); the recommendation's ground was that the CLI's `use --force` already means "switch past the safety
+check" while its existing `import --overwrite` already means "replace what is there". Under `--overwrite` the new account replaces the existing
+holder of the label, read as that holder's roster row removed and its stash deleted in the same write, so
+that nothing is orphaned; the other way through is removing or relabelling the holder first. Consequences:
+AC-6 of `docs/requirements/migration-credential-portability.md` is re-ratified as narrowed (its amendment
+note of 2026-11-03), since the four write paths now enforce uniqueness; REQ-ROS-C-002's oracles assert the
+refusal; a refused `login` spends the interactive login, so the refusal precedes the stash write, as the
+option's cost line says. Open, carried in the scope brief's register as `duplicate-label-policy-ruling`: the
+replaced account's fate under `--overwrite`, which is the orchestrator's reading above; how the socket
+`capture` and `config-set` carry the override; and whether `import` follows the ruling, where AC-6 still
+answers warn-and-never-refuse.
 
 **`login-mismatch-policy`**: what `login <label>` does when the captured account is not the one the
 label names.
@@ -704,6 +762,20 @@ label names.
 REQ-IDN-B-001, which names the previous label, holds under every option, as the seed proposes; under
 the first option it is the only change. If the operator wants the reply itself unchanged, REQ-IDN-B-001
 is struck.
+
+**Ruling (the operator, 2026-11-03).** Refuse the renaming revive unless `--rename` is given. The operator's
+words are quoted under `duplicate-label-policy` above; `--rename` is their word for this case. Reading
+recorded by the `/scope` orchestrator, pipeline-authored and to be confirmed at ratification: a
+`login <label>` whose captured account is not the one the label names is refused before the stash write
+unless `--rename` is given, with the `relabels-another-account` rejection; with the flag, the revive renames
+the account and the reply discloses the previous label, so REQ-IDN-B-001 holds. A bare `login <label>` that
+lands on the account the label names refreshes it, so REQ-LGN-B-004's "refreshes it (idempotent)" holds for
+the same-label case; the deliberate rename path that `recapture_updates_the_label_when_a_new_one_is_given`
+pins stays reachable through the flag, so that test gains the flag rather than being struck. Open, carried
+in the scope brief's register as `login-mismatch-policy-ruling`: how the socket `capture` carries the
+override, since the socket has no `login` verb and relabels through its `capture` (#1559). A `login` that would
+both rename an account and make its label name a second account meets both rulings; which flags it needs is
+#1556's re-gate to settle.
 
 **`label-normalization-policy`**: what normalization means, if anything.
 
@@ -809,6 +881,9 @@ unratified requirements to a PRD whose requirements are ratified would blur that
     either kind; `docs/requirements/optional-quota-windows.md` (created 2026-11-01) uses the `{#feature-…}`
     heading form, so both forms are now in the tree.
 11. `prd-placement` (§ 8.1).
+12. The readings beside the operator's rulings in § 8.1 (2026-11-03): the replaced account's fate under
+    `--overwrite`, the socket paths' carriage of the override, and `import`'s standing. The rulings themselves, the
+    flag names included, are the operator's.
 
 ## 9. Object Model
 
@@ -1065,7 +1140,7 @@ is `login-mismatch-policy`'s to decide (§ 8.1).
 | REQ-IDN-I-001 | Optional | Where the socket `capture` command refreshes an account under a different label, the daemon shall carry the previous label as an additive field of the `refreshed` acknowledgement. | Must | `AI-inferred-expansion` | ASSUMED |
 | REQ-IDN-I-002 | Optional | Where the menu-bar app decodes a `refreshed` acknowledgement that carries a previous label, the app shall show both labels on the capture card. | Should | `AI-inferred-expansion` | ASSUMED: it waits on #1474 |
 | REQ-IDN-C-001 | Ubiquitous | The project shall author, before the change, a test in which `login X` lands on a rostered account labelled `Y` and the reply names `Y`, failing against the tree before the change. | Must | `AI-inferred-expansion` | ASSUMED |
-| REQ-IDN-C-002 | Optional | Where `login-mismatch-policy` selects a refusal, the system shall take that refusal before the credential stash is written, leaving no stash and no roster change. | Must, where chosen | `AI-inferred-expansion` | SPECULATIVE: it hangs on an open decision |
+| REQ-IDN-C-002 | Optional | Where `login-mismatch-policy` selects a refusal, the system shall take that refusal before the credential stash is written, leaving no stash and no roster change. | Must, where chosen | `AI-inferred-expansion` | SPECULATIVE until 2026-11-03; `login-mismatch-policy` now selects the refusal (§ 8.1), so this requirement applies |
 
 **AC-IDN-001 — REQ-IDN-B-001**
 
@@ -1417,7 +1492,7 @@ and the sites outside this repository are out of scope (§ 3).
 |---|---|---|---|---|---|
 | REQ-DOC-B-001 | Ubiquitous | The project shall amend ADR-0032 with a dated note, keeping its original text, stating that `SPAWN_ENV_REMOVE` has removed the refresh-token triple since commit `86ab6aa`. | Must | `AI-inferred-expansion` | VALIDATED: the drift is observed (§ 2.11) |
 | REQ-DOC-B-002 | Ubiquitous | The migration PRD's stale line anchors shall each cite the symbol they mean, as § 2.11 lists them, so that `scripts/check-doc-citation-rot.sh` checks each symbol against its number, unless #1476's policy is decided first and governs instead. | Must | `AI-inferred-expansion` | VALIDATED: the drift is observed (§ 2.11) |
-| REQ-DOC-B-003 | Ubiquitous | The `login` usage text, `LOGIN_USAGE`, shall say what a label given for an already-rostered account does, which is to rename that account, coordinated with #1379's edit of the same constant. | Must | `AI-inferred-expansion` | VALIDATED: the text says "a name for the new account" (§ 2.11) |
+| REQ-DOC-B-003 | Ubiquitous | The `login` usage text, `LOGIN_USAGE`, shall say what a label given for an already-rostered account does, which is to rename that account, coordinated with #1379's edit of the same constant. | Must | `AI-inferred-expansion` | VALIDATED: the text says "a name for the new account" (§ 2.11); the wording "which is to rename that account" predates the 2026-11-03 ruling, under which such a label is refused unless `--rename` is given, so the usage text and this requirement are re-keyed with #1570 (§ 8.1) |
 | REQ-DOC-B-004 | Ubiquitous | The migration PRD's A-1 shall be regraded, by a dated amendment, from "Validated" to an unmeasured assumption whose validation plan is F7's premise 2. | Should | `AI-inferred-expansion`; a same-class addition | VALIDATED: it rests on code comments (§ 2.9) |
 | REQ-DOC-C-001 | Ubiquitous | The project shall land every correction to ratified text as a dated amendment note that preserves the original wording, as #1116 records. | Must | `AI-inferred-expansion` | VALIDATED: #1116 is the precedent |
 
@@ -1616,8 +1691,8 @@ why. Where a state keeps today's presentation, the row says so rather than inven
 
 | Feature | Requirement IDs | Object sections | Entity coverage | CTA coverage | Specification depth | Open questions | Verdict |
 |---|---|---|---|---|---|---|---|
-| F1 `label-collision-notice` | REQ-ROS-B-001, REQ-ROS-B-002, REQ-ROS-I-001, REQ-ROS-I-002, REQ-ROS-C-001, REQ-ROS-C-002, REQ-ROS-Q-001 | RosterEntry, AccountLabel, OperatorNotice | 3 of 3 | 5 of 5 | EARS; GWT with BUT NOT; Planguage | `duplicate-label-policy` | **NEAR-COMPLETE**: the report's form waits on one decision; #1474 gates the socket half |
-| F2 `login-landing-disclosure` | REQ-IDN-B-001, REQ-IDN-I-001, REQ-IDN-I-002, REQ-IDN-C-001, REQ-IDN-C-002 | RosterEntry, CapturedIdentity, OperatorNotice | 3 of 3 | 5 of 5 | EARS; GWT with BUT NOT | `login-mismatch-policy` | **NEAR-COMPLETE**: disclosure holds under every option; the rest waits on one decision |
+| F1 `label-collision-notice` | REQ-ROS-B-001, REQ-ROS-B-002, REQ-ROS-I-001, REQ-ROS-I-002, REQ-ROS-C-001, REQ-ROS-C-002, REQ-ROS-Q-001 | RosterEntry, AccountLabel, OperatorNotice | 3 of 3 | 5 of 5 | EARS; GWT with BUT NOT; Planguage | `duplicate-label-policy` (ruled 2026-11-03: refuse) | **NEAR-COMPLETE**: the report's form waits on one decision; #1474 gates the socket half |
+| F2 `login-landing-disclosure` | REQ-IDN-B-001, REQ-IDN-I-001, REQ-IDN-I-002, REQ-IDN-C-001, REQ-IDN-C-002 | RosterEntry, CapturedIdentity, OperatorNotice | 3 of 3 | 5 of 5 | EARS; GWT with BUT NOT | `login-mismatch-policy` (ruled 2026-11-03: refuse) | **NEAR-COMPLETE**: disclosure holds under every option; the rest waits on one decision |
 | F3 `shared-credential-detection` | REQ-STSH-B-001, REQ-STSH-B-002, REQ-STSH-Q-001, REQ-STSH-Q-002, REQ-STSH-C-001, REQ-STSH-C-002, REQ-STSH-C-003 | StashedCredential, OperatorNotice, EventLogLine | 3 of 3 | 4 of 4 | EARS; GWT with BUT NOT; Planguage | DQ-5, DQ-6 | **NEAR-COMPLETE**: the start-up sweep and the daemon-side channel are design calls |
 | F4 `identity-keyed-surfaces` | REQ-WIRE-I-001, REQ-WIRE-C-001, REQ-WIRE-C-002, REQ-WIRE-C-003, REQ-ROW-B-001, REQ-ROW-C-001, REQ-ROW-C-002, REQ-USG-B-001, REQ-USG-C-001, REQ-USG-C-002, REQ-USG-C-003, REQ-EVT-B-001, REQ-NTC-B-001 | RosterEntry, AccountStatusLine, PanelAccountRow, UsageHistory, EventLogLine | 5 of 5 | 8 of 8 | EARS; GWT with BUT NOT | DQ-1, DQ-2, DQ-3, DQ-4, DQ-10 | **INCOMPLETE**: see the gap documentation below |
 | F5 `import-payload-uniqueness` | REQ-MIG-B-001, REQ-MIG-B-002, REQ-MIG-C-001, REQ-MIG-C-002 | MigrationArtifact, OperatorNotice | 2 of 2 | 2 of 2 | EARS; GWT with BUT NOT | `import-duplicate-uuid-policy` | **NEAR-COMPLETE**: refuse or warn waits on one decision |
@@ -1858,3 +1933,4 @@ sub-surfaces sit in the risk lane above.
 | 1.1 | 2026-10-27 | § 14b filled by `/scope` with the tracker items (#1550–#1585); § 2.2's quoted transcript rewritten with synthetic labels of the same shape (scope brief row `prd-privacy-synthetic-labels`, 2026-10-27 09:46Z) | the items existed, and issue #15 keeps addresses out of a committed record | none on the requirements; `dor_status: failed` stands |
 | 1.2 | 2026-10-30 | A-5's confidence and evidence cells updated after #1582's readiness gate (run 2026-10-28, re-run 2026-10-30) | the assumption was measured on a stand-in, not the real roster | none on the requirements |
 | 1.3 | 2026-11-02 | `file:line` citations re-resolved against `363698d`; pre-submit polish corrections: § 2.11 row 1 and § 2.14 row 4 (ADR-0032 line range), § 7's #1018 row, § 8.1's REQ-DOC-B-003 exception, § 8.4 items 9 and 10, § 11's view count, § 15's disclosure line; header Version and Last Updated advanced and rows 1.1–1.2 recorded | corrections found by the pre-submit review of the branch | none on the requirements |
+| 1.4 | 2026-11-03 | § 1 TL;DR and § 4 benefit hypothesis composed by the `/scope` orchestrator after the operator ruled the TL;DR is never theirs to write; § 8.1 records the operator's rulings on `duplicate-label-policy` (refuse unless `--overwrite`) and `login-mismatch-policy` (refuse unless `--rename`) with the orchestrator's readings marked as such; § 8.4 item 12 | the operator's words of 2026-11-03, recorded where the decisions live | AC-6 of the migration PRD narrowed by an amendment note; the items that built the warn or keep-rename default (#1556, #1558, #1559, #1560, #1561, #1570) re-enter the ready gate; `dor_status` unchanged |
