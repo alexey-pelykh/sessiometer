@@ -445,14 +445,30 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   observation, not a fabrication — and the doc comments say so. The tiers' per-axis stats have no
   production reader today beyond their keys (`read_rollup` at `src/stats.rs:215` feeds the window
   bounds), so this is a representation change with no consumer to move. **Version-skew asymmetry,
-  stated**: an older **daemon** silently drops a raw `"session":null` line and erases it on
-  compaction (R4) — `compact_and_roll`'s one production caller is the daemon's store maintenance
-  (`stats_events_for_poll` at `src/daemon.rs:839`) — while an older `stats` or `reliability` only reads and
-  deletes nothing: `stats` **loudly** refuses a rollup whose bucket omits a dimension (`read_rollup` at
-  `src/usage_store.rs:475-486` hard-errors with `UsageRollupMalformed`), and `reliability` leaves the
-  `null` lines out of its report in silence. An older daemon over such a rollup discards the compaction
-  error (`if let Ok(summary) = compact_and_roll(…)` at `src/daemon.rs:894`, no `else`), stops compacting
-  without a word and rewrites nothing. Loud is the better failure. The D6/D13 council ruling of 2026-11-02
+  stated**: only an older **daemon** could erase a raw `"session":null` line, because
+  `compact_and_roll`'s one production caller is the daemon's store maintenance
+  (`stats_events_for_poll` at `src/daemon.rs:839`) — and the rollup fence stops it before it does. On a
+  store a #1598 build has compacted, an older daemon's `read_rollup` fails on the format-2 envelope
+  (`read_rollup` at `src/usage_store.rs:475-486` hard-errors with `UsageRollupMalformed`), so its
+  `compact_and_roll` returns before it writes either file (`read_rollup` at `src/usage_store.rs:536` runs
+  before `write_rollup` and `write_samples` at `src/usage_store.rs:543-544`); the daemon discards that error
+  (`if let Ok(summary) = compact_and_roll(…)` at `src/daemon.rs:894`, no `else`), stops compacting without
+  a word, rewrites nothing and erases no `null` line — a stall of compaction on that store, which
+  ends when a #1598+ build runs again. Of the residuals the ruling accepts (PRD R4 records the
+  risk), an older daemon erases `null` lines in only these: lines appended before the first fenced
+  write, and a rollup deleted or moved by hand. The first poll after the deploy appends, then
+  compacts and writes the fence, so only a failed first pass leaves lines unfenced, for up to one
+  compaction cadence, an hour. After a rollup is deleted or moved by hand, an older build reads the
+  store as new and its compaction erases every `null` line (C6: the store files are never deleted or
+  moved). An older `stats` or `reliability` only reads and deletes nothing: `stats` **loudly**
+  refuses every fenced rollup with `UsageRollupMalformed` ("malformed usage rollup"), whatever its
+  buckets hold, and `reliability`, which never reads the rollup, leaves the `null` lines out of its
+  report in silence. That "malformed usage rollup" message from an older build is expected after
+  #1598 (C6). The ruling's other accepted residuals are `reliability`'s silent omission and, on each
+  machine that has run #1598, every pre-#1598 build's own `stats` and compaction stopping for good,
+  the fence's accepted cost. The store's compaction resumes as soon as a #1598+ build runs again,
+  while the older binary's own compaction never does. Loud is the better failure.
+  The D6/D13 council ruling of 2026-11-02
   (a comment on #1598) ratified this representation and amended it with a **rollup fence** #1598 builds —
   `usage-rollup.json` becomes `{"format":2,"rollup":{…}}`, which every pre-#1598 build fails to read, so
   its `compact_and_roll` returns before it rewrites the raw file — and with the deployment rule B-12
@@ -621,7 +637,7 @@ it moved no `STATUS_SCHEMA_VERSION` minor and had no track structure. The contra
 | `status` reply, transitional (`1.14`) | `session_pct: null` beside present weekly fields for a served weekly-only reading; no `blind_active` block for a weekly-only blind active; no `recent_blind_preempt_swap` notice for a `Retry-After` swap off a session-less anchor; doc comment amended | none | none — retired by the row above |
 | `stats --json` | `accounts[*].session`, `band`, `cap_hits` and `time_at_cap_secs` omittable (AD-13); in the same bump #1601 also makes `accounts[*].weekly` omittable (the weekly symmetry) and `velocity.session_pct_per_min` nullable, so a weekly-only account's weekly rate and runway reach the wire — both widenings pipeline-recommended, ratification-pending | `JSON_SCHEMA_VERSION` 1 → 2 | `wire-stats-basic.json` regenerated; the Swift `StatsWire` mirror optional for every omittable key; `statsBasic` fixture at schema 2 |
 | sample line `usage-samples.jsonl` | `"session":null` / `"weekly":null` written; the key never omitted | none (versionless) | readers tolerant; deploy order (B-12) |
-| rollup tiers `usage-rollup.json` | per-axis `HourStat`/`DayStat` omitted when the bucket has no reading on that axis | none (versionless; old reader fails loudly) | deploy order (B-12) |
+| rollup tiers `usage-rollup.json` | per-axis `HourStat`/`DayStat` omitted when the bucket has no reading on that axis; every present `HourStat`/`DayStat` records `samples: Option<u32>`, the number of samples it covers (D13 as ruled) | store generation 1 → 2 under #1598's `ROLLUP_FORMAT`: `usage-rollup.json` is written as `{"format":2,"rollup":{…}}`; a file with no `format` key reads as the legacy generation 1; every pre-#1598 build refuses the envelope before it rewrites either store file | deploy order (B-12) |
 | event log lines | per-window tokens omitted when the window is absent | none for `log` (`JSON_SCHEMA_VERSION` at `src/log.rs:167`); `reliability` (`JSON_SCHEMA_VERSION` at `src/reliability.rs:264`) moves 13 → 14 for the census's `n_without_session_window` | `reliability` parsers tolerate the absent token; the census keeps its exact partition |
 | `log --json` | unchanged: records carry the line's own tokens (`LogWire` at `src/log.rs:865`), so an omitted token reshapes nothing | none (`JSON_SCHEMA_VERSION` at `src/log.rs:167` stays 2) | — |
 | `reliability --json` | the blind-projection block gains `n_without_session_window` beside `n_malformed`, an always-present key, so the census keeps its exact #484 partition | `JSON_SCHEMA_VERSION` 13 → 14 (`src/reliability.rs:264`) | the three `build/fixtures/cli-renders/reliability-*.txt` goldens regenerated; `RELIABILITY_USAGE`'s `schema:` token; no Swift surface |
@@ -882,7 +898,7 @@ wrappers must be read for the `Some(0.0)` hazard; the `Option<Window>` refactor 
 | Product lens (`product-strategist` agent) | **APPROVE WITH CONCERNS** — "The design builds exactly the class and shape the operator's two messages ask for, covers all 46 PRD requirements (verified by ID set, not taken from the matrix), ships nothing the non-goals forbid, makes every scope extension compiler-forced and flagged, and returns the one appetite change (OAD-3) to the PRD; the concerns are about what the operator must see beside the author-chosen rows before ratifying, and none changes the work items Stage 3 would write." Six non-blocking concerns, all applied in this revision (below) |
 | UX lens (`ux-architect` agent) | **BLOCKING** on the first pass — "The structure, flows and D0 routing are sound and invent nothing on the panel, but § 9a's inventory misses one state S6 forces on the panel at compile time — the blind held block for a weekly-only blind active — so Stage 3 would scope S6 with an unclassified render decision inside it, the exact failure REQ-CEL-C-001 and the register rule exist to prevent; the fix is a row in § 9a and a sentence in OAD-1, and tranche 1 is unaffected." Revised as prescribed (§ 9a fifth cell, § 15, OAD-1, B-6, § 11); seven non-blocking concerns applied; re-dispatched once — second pass **APPROVE WITH CONCERNS**: "The blocking concern is resolved — § 9a now inventories the blind held block as the fifth RenderCell, § 15, OAD-1, AD-24, B-6 and § 16 route it to D0 under D15, and § 11 hands its spoken phrase over — so every panel state S6 forces is classified-pending rather than unrouted; one narrower gap remains in how S6's 'decode half lands, render half waits' split behaves while D0 is open, and it is a sentence to add, not a decision to make." That one non-blocking concern is applied (B-6 interim, § 9b (iii), DP-1, R-D9); all seven first-pass concerns confirmed addressed |
 | Maintainer decisions of 2026-11-01 | Three, quoted verbatim in AD-23: tranche 1's budget re-set and a hot-fix added as tranche 0 (#1613); that hot-fix to happen as soon as possible, with the local daemon rebuilt and restarted; the runbook text (#1603) moved to tranche 2, after the deploy. **Decided by the maintainer, not ratification-pending**; every other decision of this design stays pending |
-| Lock | **NOT LOCKED** — load-bearing questions stand (D0–D10, D11–D15); the brief carries `status: draft` |
+| Lock | **NOT LOCKED** — load-bearing questions stand (D0–D5, D7–D12, D14, D15; D6 and D13 were settled by council on 2026-11-02); the brief carries `status: draft` |
 
 ### Lens concerns and their disposition
 
@@ -927,7 +943,7 @@ reads the keychain).
 |---|---|---|---|---|---|---|
 | R-D1 | Open-PR contention: #1537 conflicts textually with B-1; #1588 with B-6's minor and goldens; #1538 with B-3 row 7 | 3 | 2 | 6 MEDIUM | AD-22: order stated, rebase rule stated; nothing re-scoped; the transitional state needs no minor | implementer |
 | R-D2 | A second `minor: 15` on `main` | 2 | 3 | 6 MEDIUM | AD-9: the minor is chosen at landing; the future-frame fixture moves with it | implementer |
-| R-D3 | An older daemon erases `null` lines (silent); an older `stats` refuses the fenced rollup (loud, by design) | 2 | 3 | 6 MEDIUM | AD-10/AD-11 state both; B-12's no-older-daemon rule and ancestry check; the rollup fence #1598 builds; D6 residual recorded | operator |
+| R-D3 | An older daemon stalls on the fenced rollup (silent: it discards the compaction error) and erases `null` lines only in the accepted residuals — lines appended before the first fenced write, or a rollup deleted or moved by hand; an older `stats` refuses the fenced rollup (loud, by design) | 2 | 3 | 6 MEDIUM | AD-10/AD-11 state both; B-12's no-older-daemon rule and ancestry check; the rollup fence #1598 builds; D6 residual recorded | operator |
 | R-D4 | Tests "fixed" by `Some(0.0)` wrappers; a consumer defaults silently (P-1, P-11) | 2 | 3 | 6 MEDIUM | AD-4; per-arm `None` tests (Cap-2); `MET-T-003`; review reads every wrapper | implementer, reviewer |
 | R-D5 | The transitional days render a weekly-only blind active as an ordinary failed-poll row on both surfaces (duration and percent lost; PRD § 11.1's Stale cell unmet) and silence its report arms; the healthy weekly-only row costs less than first stated, because a failed poll nulls both windows and the weekly cell discriminates (§ 6a flow 2) | 3 | 2 | 6 MEDIUM | AD-6 documents and dates it; the signpost: S6 lands by the end of tranche 1's budget (AD-23), or is pulled into tranche 1 under the extend-with-justification breaker, or D10 is re-ratified | operator (D10) |
 | R-D6 | Goldens regenerated with `--include-ignored`, re-sealing the frozen migration fixture | 1 | 3 | 3 LOW | AD-18; § 11 gate 7 says never | implementer |
@@ -1061,7 +1077,7 @@ the Testing track records that classification rather than binding them to a code
 | B-6t transitional state; no `blind_active` block (AD-6 sub-default) | wire contract | REQ-STL-B-001, REQ-ARM-B-007 | PRD § 10.6 (D10), § 10.3 | traced — author-chosen sub-default, flagged |
 | B-7 `Sample.session` optional, `null` written | artifact | REQ-SMP-B-001 | PRD § 10.7 | traced |
 | B-7 `Sample.weekly` optional (D12) | artifact | REQ-RDG-B-001 (both windows), REQ-RPL-B-002, REQ-SMP-B-001 by construction | PRD § 10.3, § 10.2, § 3.2 coupling 1 | traced — compiler-forced extension, flagged |
-| B-7 tier `Option<HourStat>` / `Option<DayStat>` (D13) | artifact | REQ-SMP-B-002 (fold without a fabricated statistic) | PRD § 10.7 | traced — author-chosen, flagged |
+| B-7 tier `Option<HourStat>` / `Option<DayStat>` (D13) | artifact | REQ-SMP-B-002 (fold without a fabricated statistic) | PRD § 10.7 | traced — settled by council (D13) |
 | B-7 canary move + round-trip + compaction tests | test | REQ-SMP-C-001, REQ-SMP-Q-001 | PRD § 10.7 | traced |
 | B-8 session-figure exclusion; census exclusion (D5) | mechanism | REQ-STS-B-001; ADR-0033 amendment (REQ-REC-B-002) | PRD § 10.8, § 8 D5 | traced |
 | B-8 wire: `session`/`band` omittable, schema 2, Swift optional, golden | wire contract | REQ-STS-B-001 (representation is Stage 2's) | PRD § 10.8 | traced — field set author-chosen, flagged |
@@ -1090,4 +1106,4 @@ the Testing track records that classification rather than binding them to a code
 | Dual-lens ratification | product lens APPROVE WITH CONCERNS (six, all applied); UX lens BLOCKING on the first pass, revised as prescribed, re-dispatched once — second pass APPROVE WITH CONCERNS (one non-blocking concern, applied; § 14); the design's author supplied neither verdict |
 | Readiness | `dor_status: failed`, acknowledged by the orchestrator on the operator's behalf — the operator's own ratification is still owed |
 
-What the operator should read first: § 12's **author-chosen** rows (AD-4b's weekly-less arms, AD-6's omitted block and its signpost, AD-7's key, AD-10's weekly half, AD-11's tiers, AD-13's field set with the cap counts, AD-14's events, AD-22's landing order), the three open stubs, and D15 — the one question this design found that the PRD did not carry, now covering the Stats-tab cell, its spoken summary and the blind held block.
+What the operator should read first: § 12's **author-chosen** rows (AD-4b's weekly-less arms, AD-6's omitted block and its signpost, AD-7's key, AD-10's weekly half, AD-13's field set with the cap counts, AD-14's events, AD-22's landing order), the three open stubs, and D15 — the one question this design found that the PRD did not carry, now covering the Stats-tab cell, its spoken summary and the blind held block.
