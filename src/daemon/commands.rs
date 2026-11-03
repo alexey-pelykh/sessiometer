@@ -3633,8 +3633,8 @@ mod tests {
         // would do to `u-B`. Unseeded, that write clears `None` to `None` and the fifth of the
         // five writes named above is asserted by a comparison that cannot fail.
         let anchor = LastGood {
-            session: 0.42,
-            weekly: 0.17,
+            session: Some(0.42),
+            weekly: Some(0.17),
             at: Instant::now(),
         };
         daemon.state.last_good = Some(anchor);
@@ -3792,15 +3792,15 @@ mod tests {
             account.session_high_water = swap::SessionHighWater::fold(
                 None,
                 &Usage {
-                    session: 0.30 + k / 100.0,
-                    weekly: 0.40,
+                    session: Some(0.30 + k / 100.0),
+                    weekly: Some(0.40),
                     weekly_resets_at: None,
                     session_resets_at: Some(5_000 + i as i64),
                 },
             );
             account.blind_anchor = Some(BlindAnchor {
-                session: 0.50 + k / 100.0,
-                weekly: 0.60 + k / 100.0,
+                session: Some(0.50 + k / 100.0),
+                weekly: Some(0.60 + k / 100.0),
                 at: t0 + Duration::from_secs(200 + i as u64),
                 was_active: i.is_multiple_of(2),
                 near_limit: i.is_multiple_of(3),
@@ -6127,8 +6127,8 @@ mod tests {
         daemon.note_poll_outcome(
             0,
             &Ok(Usage {
-                session: 0.10,
-                weekly: 0.10,
+                session: Some(0.10),
+                weekly: Some(0.10),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),

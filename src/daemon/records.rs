@@ -192,10 +192,14 @@ pub(super) struct LastSwap {
 /// account handle of its own.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct LastGood {
-    /// Session-window fraction (`[0.0, 1.0]`) of the retained pre-blind reading.
-    pub(super) session: f64,
-    /// Weekly-window fraction (`[0.0, 1.0]`) of the retained pre-blind reading.
-    pub(super) weekly: f64,
+    /// Session-window fraction (`[0.0, 1.0]`) of the retained pre-blind reading, or `None`
+    /// when the account has no session window — "does not apply", never a fabricated `0`: a
+    /// weekly-only active retains an anchor whose session is `None`, which is what lets the
+    /// blind gate read "nothing to protect" honestly (issue #1597).
+    pub(super) session: Option<f64>,
+    /// Weekly-window fraction (`[0.0, 1.0]`) of the retained pre-blind reading, or `None`
+    /// when the account has no weekly window.
+    pub(super) weekly: Option<f64>,
     /// When the reading was observed — monotonic ([`Instant`]), so #452 measures
     /// `blind_elapsed` against the SAME clock as the swap cooldown ([`LastSwap::at`]).
     /// Process-local: never serialized (an [`Instant`] is meaningless across the socket).
@@ -215,15 +219,19 @@ pub(super) struct LastGood {
 /// active resolution. Keeping the two separate leaves #450/#452's anchor semantics byte-for-byte
 /// unchanged, exactly as `last_good` itself is kept separate from the account's `last_reading`.
 ///
-/// Carries BOTH usage windows: the session window resets on its own 5 h cadence, so a session-only
-/// anchor cannot distinguish a mid-blindness reset from a quiet account — the failure that hid a real
-/// weekly burn in production (see [`Event::BlindExit`]).
+/// Carries every usage window the account has (a window the account lacks is `None`): the session
+/// window resets on its own 5 h cadence, so a session-only anchor cannot distinguish a mid-blindness
+/// reset from a quiet account — the failure that hid a real weekly burn in production (see
+/// [`Event::BlindExit`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct BlindAnchor {
-    /// Session-window fraction (`[0.0, 1.0]`) of the last reading before the account went blind.
-    pub(super) session: f64,
-    /// Weekly-window fraction (`[0.0, 1.0]`) of the last reading before the account went blind.
-    pub(super) weekly: f64,
+    /// Session-window fraction (`[0.0, 1.0]`) of the last reading before the account went blind,
+    /// or `None` when the account has no session window — "does not apply", never a fabricated
+    /// `0` (issue #1597).
+    pub(super) session: Option<f64>,
+    /// Weekly-window fraction (`[0.0, 1.0]`) of the last reading before the account went blind,
+    /// or `None` when the account has no weekly window.
+    pub(super) weekly: Option<f64>,
     /// When that reading was observed — monotonic ([`Instant`]), carried over from the account's
     /// `last_reading_at` slot, so the episode duration is measured against the SAME clock as the
     /// #450 anchor and the swap cooldown. Process-local: never serialized.
@@ -573,14 +581,25 @@ mod tests {
     }
 
     #[test]
+    fn the_lifted_reading_types_stay_copy() {
+        // Issue #1597 (M2): a compile-time pin of the derive on the two anchors. `Option<f64>`
+        // is `Copy`, so the lift leaves both anchors carried by value — every
+        // `if let Some(anchor) = self.state.last_good` and the `AnchorArmInputs` pass-through
+        // keep working. The `Usage` half of this pin sits in `usage::tests`.
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<LastGood>();
+        assert_copy::<BlindAnchor>();
+    }
+
+    #[test]
     fn blind_active_view_projects_ok_below_the_gate_and_degraded_past_it() {
         // Issue #479: the bounded-blindness projection is a PURE function of the retained anchor,
         // the blind predicate, the quarantine flag, and the monotonic clock. A base instant + fixed
         // deltas make `blind_elapsed` deterministic regardless of wall time.
         let base = Instant::now();
         let near_band = LastGood {
-            session: 0.70,
-            weekly: 0.20,
+            session: Some(0.70),
+            weekly: Some(0.20),
             at: base,
         };
 
@@ -633,8 +652,8 @@ mod tests {
         // never arm on it. (Issue #582 adds the server arm below; absent a directive the below-band
         // account is still nominally protected, so this half of the old invariant stands.)
         let below_band = LastGood {
-            session: BLIND_GATE_RISK_BAND - 0.01,
-            weekly: 0.10,
+            session: Some(BLIND_GATE_RISK_BAND - 0.01),
+            weekly: Some(0.10),
             at: base,
         };
         let ok_below = blind_active_view(
@@ -700,8 +719,8 @@ mod tests {
     fn blind_active_view_is_none_when_not_bounded_blindness() {
         let base = Instant::now();
         let anchor = LastGood {
-            session: 0.70,
-            weekly: 0.20,
+            session: Some(0.70),
+            weekly: Some(0.20),
             at: base,
         };
         let past_t = base + Duration::from_secs(BLIND_GATE_SECS + 1);
@@ -733,8 +752,8 @@ mod tests {
         let trigger = 0.95;
         // The 2026-07-17 incident shape: anchor 0.29, well below the 0.60 band, no server hold, climbing.
         let below_band = LastGood {
-            session: 0.29,
-            weekly: 0.10,
+            session: Some(0.29),
+            weekly: Some(0.10),
             at: base,
         };
         // A SUSTAINED climb (samples >= MIN_VELOCITY_SAMPLES), ~3 %/min = 0.0005 session-fraction/s.
@@ -824,16 +843,16 @@ mod tests {
         let base = Instant::now();
         let past_t = base + Duration::from_secs(BLIND_GATE_SECS + 1);
         let stale_low = LastGood {
-            session: BLIND_GATE_RISK_BAND - 0.20, // raw, below the band
-            weekly: 0.20,
+            session: Some(BLIND_GATE_RISK_BAND - 0.20), // raw, below the band
+            weekly: Some(0.20),
             at: base,
         };
         // The window's TRUE high-water (an earlier plausible reading), in-band.
         let mark = swap::SessionHighWater::fold(
             None,
             &Usage {
-                session: BLIND_GATE_RISK_BAND + 0.10,
-                weekly: 0.20,
+                session: Some(BLIND_GATE_RISK_BAND + 0.10),
+                weekly: Some(0.20),
                 weekly_resets_at: None,
                 session_resets_at: Some(WINDOW),
             },
@@ -879,7 +898,7 @@ mod tests {
         // The DISPLAYED last-known pct stays the RAW measurement — only the arm decision is corrected.
         assert_eq!(
             corrected.last_known_session_pct,
-            to_pct(stale_low.session),
+            to_pct(stale_low.session.expect("session window present")),
             "the displayed last-known % is the raw anchor, never the synthesized correction",
         );
     }
@@ -899,8 +918,8 @@ mod tests {
         // arm (`blind_gate_armed`: session >= BLIND_GATE_RISK_BAND) never fires and the velocity arm
         // is what this test isolates.
         let stale_low = LastGood {
-            session: BLIND_GATE_RISK_BAND - 0.40, // 0.20 raw, well below the band
-            weekly: 0.20,
+            session: Some(BLIND_GATE_RISK_BAND - 0.40), // 0.20 raw, well below the band
+            weekly: Some(0.20),
             at: base,
         };
         // The window's TRUE high-water (an earlier plausible reading) — a real lower bound, itself
@@ -908,8 +927,8 @@ mod tests {
         let mark = swap::SessionHighWater::fold(
             None,
             &Usage {
-                session: BLIND_GATE_RISK_BAND - 0.10, // 0.50, the corrected base — below the band
-                weekly: 0.20,
+                session: Some(BLIND_GATE_RISK_BAND - 0.10), // 0.50, the corrected base — below the band
+                weekly: Some(0.20),
                 weekly_resets_at: None,
                 session_resets_at: Some(WINDOW),
             },
@@ -981,14 +1000,14 @@ mod tests {
         assert!(
             !blind_gate_armed(
                 past_t.saturating_duration_since(base).as_secs(),
-                swap::plausible_anchor_session(mark, stale_low.session),
+                swap::plausible_anchor_session(mark, stale_low.session.expect("session window present")),
             ),
             "fixture guard: the corrected anchor stays below the band, so the anchor arm is disarmed",
         );
         // The DISPLAYED last-known pct stays the RAW measurement — only the arm decision is corrected.
         assert_eq!(
             corrected.last_known_session_pct,
-            to_pct(stale_low.session),
+            to_pct(stale_low.session.expect("session window present")),
             "the displayed last-known % is the raw anchor, never the synthesized correction",
         );
     }

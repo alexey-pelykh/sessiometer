@@ -220,8 +220,8 @@ mod tests {
     /// leaves both modules self-contained rather than coupling one test module to the other.
     fn live(session: f64, weekly: f64) -> Result<Usage> {
         Ok(Usage {
-            session,
-            weekly,
+            session: Some(session),
+            weekly: Some(weekly),
             weekly_resets_at: None,
             session_resets_at: None,
         })
@@ -311,8 +311,8 @@ mod tests {
         // with the percents `status` / the swap line show, and a difference of two `0..=100`
         // percents is a signed value in `-100..=100`.
         let r = |session: f64, weekly: f64| Usage {
-            session,
-            weekly,
+            session: Some(session),
+            weekly: Some(weekly),
             weekly_resets_at: None,
             session_resets_at: None,
         };

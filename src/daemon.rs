@@ -6396,8 +6396,8 @@ mod tests {
             self.readings.insert(
                 uuid.to_owned(),
                 Scripted::Ok(Usage {
-                    session,
-                    weekly,
+                    session: Some(session),
+                    weekly: Some(weekly),
                     weekly_resets_at: None,
                     session_resets_at: None,
                 }),
@@ -6417,8 +6417,8 @@ mod tests {
             self.readings.insert(
                 uuid.to_owned(),
                 Scripted::Ok(Usage {
-                    session,
-                    weekly,
+                    session: Some(session),
+                    weekly: Some(weekly),
                     weekly_resets_at: Some(weekly_resets_at),
                     session_resets_at: None,
                 }),
@@ -6438,8 +6438,8 @@ mod tests {
             self.readings.insert(
                 uuid.to_owned(),
                 Scripted::Ok(Usage {
-                    session,
-                    weekly,
+                    session: Some(session),
+                    weekly: Some(weekly),
                     weekly_resets_at: None,
                     session_resets_at: Some(session_resets_at),
                 }),
@@ -6455,6 +6455,12 @@ mod tests {
                 uuid.to_owned(),
                 Scripted::Ok(usage_without_a_session_window(weekly)),
             );
+            self
+        }
+        /// Script an arbitrary reading verbatim — for shapes the typed builders above do not
+        /// cover (issue #1597: a weekly-only reading that carries its weekly reset stamp).
+        pub(super) fn ok_reading(mut self, uuid: &str, usage: Usage) -> Self {
+            self.readings.insert(uuid.to_owned(), Scripted::Ok(usage));
             self
         }
         pub(super) fn failing(mut self, uuid: &str) -> Self {
@@ -7224,8 +7230,8 @@ mod tests {
     /// A carried usage reading for seeding an account's `last_reading` in the reconcile tests.
     pub(super) fn reading(session: f64, weekly: f64) -> Usage {
         Usage {
-            session,
-            weekly,
+            session: Some(session),
+            weekly: Some(weekly),
             weekly_resets_at: None,
             session_resets_at: None,
         }
@@ -7236,7 +7242,7 @@ mod tests {
     pub(super) fn usage_without_a_session_window(weekly: f64) -> Usage {
         Usage {
             session: None,
-            weekly,
+            weekly: Some(weekly),
             weekly_resets_at: None,
             session_resets_at: None,
         }
@@ -7287,8 +7293,8 @@ mod tests {
 
     pub(super) fn live(session: f64, weekly: f64) -> Result<Usage> {
         Ok(Usage {
-            session,
-            weekly,
+            session: Some(session),
+            weekly: Some(weekly),
             weekly_resets_at: None,
             session_resets_at: None,
         })
@@ -7470,8 +7476,8 @@ mod tests {
     /// the shape the #11 weekly-wide branch is built on.
     fn weekly_exhausted(weekly_resets_at: Option<i64>) -> Option<Usage> {
         Some(Usage {
-            session: 0.0,
-            weekly: 0.99,
+            session: Some(0.0),
+            weekly: Some(0.99),
             weekly_resets_at,
             session_resets_at: None,
         })
@@ -7537,22 +7543,22 @@ mod tests {
         let readings = vec![
             // idx 0: the exhausted active account — skipped (active == 0).
             Some(Usage {
-                session: 0.99,
-                weekly: 0.99,
+                session: Some(0.99),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(500),
                 session_resets_at: Some(500),
             }),
             // idx 1: weekly-viable, session-blocked; first seen → the naming fallback.
             Some(Usage {
-                session: 0.90,
-                weekly: 0.10,
+                session: Some(0.90),
+                weekly: Some(0.10),
                 weekly_resets_at: None,
                 session_resets_at: Some(300),
             }),
             // idx 2: weekly-viable, session-blocked; resets SOONEST → the winner.
             Some(Usage {
-                session: 0.85,
-                weekly: 0.20,
+                session: Some(0.85),
+                weekly: Some(0.20),
                 weekly_resets_at: None,
                 session_resets_at: Some(150),
             }),
@@ -7578,22 +7584,22 @@ mod tests {
         let readings = vec![
             // idx 0: the exhausted active — masked (active == 0).
             Some(Usage {
-                session: 0.99,
-                weekly: 0.99,
+                session: Some(0.99),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(9_000),
                 session_resets_at: Some(9_000),
             }),
             // idx 1: weekly-EXHAUSTED, session-viable → returns at its weekly reset, SOONEST.
             Some(Usage {
-                session: 0.0,
-                weekly: 0.98,
+                session: Some(0.0),
+                weekly: Some(0.98),
                 weekly_resets_at: Some(3_600),
                 session_resets_at: None,
             }),
             // idx 2: weekly-viable, session-BLOCKED → returns at its session reset, LATER.
             Some(Usage {
-                session: 0.96,
-                weekly: 0.53,
+                session: Some(0.96),
+                weekly: Some(0.53),
                 weekly_resets_at: None,
                 session_resets_at: Some(10_800),
             }),
@@ -7617,22 +7623,22 @@ mod tests {
         let readings = vec![
             // idx 0: the exhausted active — masked.
             Some(Usage {
-                session: 0.99,
-                weekly: 0.99,
+                session: Some(0.99),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(9_000),
                 session_resets_at: Some(9_000),
             }),
             // idx 1: session-blocked AND weekly-exhausted → returns at max(1_000, 8_000).
             Some(Usage {
-                session: 0.90,
-                weekly: 0.99,
+                session: Some(0.90),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(8_000),
                 session_resets_at: Some(1_000),
             }),
             // idx 2: session-blocked only → returns at 5_000, the true fleet soonest.
             Some(Usage {
-                session: 0.85,
-                weekly: 0.10,
+                session: Some(0.85),
+                weekly: Some(0.10),
                 weekly_resets_at: None,
                 session_resets_at: Some(5_000),
             }),
@@ -7664,8 +7670,8 @@ mod tests {
         let tie = vec![
             readings[0], // idx 0: the active — masked.
             Some(Usage {
-                session: 0.90,
-                weekly: 0.99,
+                session: Some(0.90),
+                weekly: Some(0.99),
                 weekly_resets_at: Some(4_000),
                 session_resets_at: Some(4_000),
             }),
@@ -8159,14 +8165,14 @@ mod tests {
         // The `next_swap` preview reads the same effective line → the same WEEKLY cause.
         let readings = [
             Some(Usage {
-                session: 0.10,
-                weekly: 0.99,
+                session: Some(0.10),
+                weekly: Some(0.99),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
-                session: 0.85,
-                weekly: 0.975,
+                session: Some(0.85),
+                weekly: Some(0.975),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -8195,8 +8201,8 @@ mod tests {
         let daemon = three_account_daemon(FakeRosterPoller::new()).await;
         let usage = |session: f64, weekly: f64| {
             Some(Usage {
-                session,
-                weekly,
+                session: Some(session),
+                weekly: Some(weekly),
                 weekly_resets_at: None,
                 session_resets_at: None,
             })
@@ -8445,13 +8451,13 @@ mod tests {
             daemon.state.accounts[0]
                 .last_reading
                 .map(|r| (r.session, r.weekly)),
-            Some((0.68, 0.40)),
+            Some((Some(0.68), Some(0.40))),
         );
         let anchor = daemon
             .state
             .last_good
             .expect("a clean active poll sets last_good");
-        assert_eq!((anchor.session, anchor.weekly), (0.68, 0.40));
+        assert_eq!((anchor.session, anchor.weekly), (Some(0.68), Some(0.40)));
 
         // The active now `429`s. Drive to its next scheduled poll — the #366 interleave
         // re-observes the active on tick 3 (`[active, peer, active, peer]`).
@@ -8467,8 +8473,58 @@ mod tests {
         // …but the pre-blind anchor is retained intact.
         assert_eq!(
             daemon.state.last_good.map(|g| (g.session, g.weekly)),
-            Some((0.68, 0.40)),
+            Some((Some(0.68), Some(0.40))),
             "a 429 must not disturb the retained last-good anchor",
+        );
+    }
+
+    #[tokio::test]
+    async fn last_good_retains_a_weekly_only_reading_with_its_session_absent() {
+        // Issue #1597 (M3): the retained pre-blind anchor copies the reading's absence through.
+        // A weekly-only active — its served reading carries no session window (issue #1596) —
+        // retains an anchor whose session is `None`, "does not apply", never a fabricated `0`;
+        // and a following `429` leaves that anchor standing exactly as it leaves a two-window
+        // one (the #450 retention above). What the blind gate does with a `None` anchor is the
+        // decision-arms item's (#1602 row 7), not this seam's. The three ticks sit inside the
+        // warm-up hold (every account polled once first), so the 90 % weekly reading never
+        // triggers a swap-away that would reset the anchor for an unrelated reason.
+        let weekly_only = Usage {
+            session: None,
+            weekly: Some(0.90),
+            // The captured reply's weekly reset, 2026-11-06T22:59:59Z.
+            weekly_resets_at: Some(1_794_005_999),
+            session_resets_at: None,
+        };
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok_reading("u-A", weekly_only)
+                .ok("u-B", 0.05, 0.05)
+                .ok("u-C", 0.05, 0.05),
+        )
+        .await;
+
+        daemon.tick().await; // tick 1 polls the active `work` — the weekly-only reading
+        let anchor = daemon
+            .state
+            .last_good
+            .expect("a served weekly-only active poll sets last_good");
+        assert_eq!(
+            (anchor.session, anchor.weekly),
+            (None, Some(0.90)),
+            "the absent session window copies through as None beside the present weekly",
+        );
+
+        daemon.poller = FakeRosterPoller::new()
+            .rate_limited("u-A", None)
+            .ok("u-B", 0.05, 0.05)
+            .ok("u-C", 0.05, 0.05);
+        daemon.tick().await; // tick 2 — peer `spare`
+        daemon.tick().await; // tick 3 — active `work` 429s
+        assert_eq!(daemon.state.accounts[0].last_reading, None);
+        assert_eq!(
+            daemon.state.last_good.map(|g| (g.session, g.weekly)),
+            Some((None, Some(0.90))),
+            "a 429 must not disturb the retained weekly-only anchor",
         );
     }
 
@@ -8489,7 +8545,7 @@ mod tests {
             .state
             .last_good
             .expect("the first active poll sets the anchor");
-        assert_eq!((first.session, first.weekly), (0.20, 0.10));
+        assert_eq!((first.session, first.weekly), (Some(0.20), Some(0.10)));
 
         // A later active poll reads higher, at a later time.
         daemon.poller = FakeRosterPoller::new()
@@ -8503,7 +8559,7 @@ mod tests {
         let second = daemon.state.last_good.expect("the anchor is still set");
         assert_eq!(
             (second.session, second.weekly),
-            (0.50, 0.30),
+            (Some(0.50), Some(0.30)),
             "the anchor tracks the latest active reading",
         );
         assert!(
@@ -10373,8 +10429,8 @@ mod tests {
         // window's high-water mark (`mark_session`) — an earlier plausible reading `fold`'s max kept.
         let anchor_at = daemon.clock.now();
         daemon.state.last_good = Some(LastGood {
-            session: anchor_session,
-            weekly: 0.20,
+            session: Some(anchor_session),
+            weekly: Some(0.20),
             at: anchor_at,
         });
         seed_high_water(&mut daemon, mark_session);
@@ -11442,8 +11498,8 @@ mod tests {
     fn active_session_reading(daemon: &FakeDaemon, session: f64) -> Vec<Option<Usage>> {
         let mut readings = daemon.state.readings();
         readings[0] = Some(Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: None,
         });
@@ -11613,8 +11669,8 @@ mod tests {
     ) -> Vec<Option<Usage>> {
         let mut readings = daemon.state.readings();
         readings[0] = Some(Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: window,
         });
@@ -11627,8 +11683,8 @@ mod tests {
         daemon.state.accounts[0].session_high_water = swap::SessionHighWater::fold(
             None,
             &Usage {
-                session,
-                weekly: 0.20,
+                session: Some(session),
+                weekly: Some(0.20),
                 weekly_resets_at: None,
                 session_resets_at: Some(WINDOW),
             },
@@ -11699,7 +11755,7 @@ mod tests {
         // written back over what the API reported (so `status` / telemetry stay honest).
         assert_eq!(
             readings[0].expect("active reading").session,
-            stale,
+            Some(stale),
             "the decision-path correction does not mutate the carried reading",
         );
     }
@@ -11843,8 +11899,8 @@ mod tests {
             swap::SessionHighWater::fold(
                 None,
                 &Usage {
-                    session: 0.94,
-                    weekly: 0.20,
+                    session: Some(0.94),
+                    weekly: Some(0.20),
                     weekly_resets_at: None,
                     session_resets_at: Some(WINDOW)
                 }
@@ -12064,7 +12120,7 @@ mod tests {
             daemon.tick().await;
             if daemon.state.accounts[0]
                 .last_reading
-                .is_some_and(|u| u.session == session)
+                .is_some_and(|u| u.session == Some(session))
             {
                 return;
             }
@@ -12082,8 +12138,8 @@ mod tests {
         // cross-signal sweep is `reconcile_roster_rekeys_every_per_account_signal_by_uuid_not_by_index`;
         // this focused case narrates the high-water stake specifically.)
         let stamped = |session: f64| Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: Some(WINDOW),
         };
@@ -12177,15 +12233,15 @@ mod tests {
         let base = Instant::now();
         let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
         daemon.state.accounts[0].blind_anchor = Some(BlindAnchor {
-            session: 0.96,
-            weekly: 0.40,
+            session: Some(0.96),
+            weekly: Some(0.40),
             at: base,
             was_active: true,
             near_limit: true,
         });
         daemon.state.accounts[1].blind_anchor = Some(BlindAnchor {
-            session: 0.30,
-            weekly: 0.10,
+            session: Some(0.30),
+            weekly: Some(0.10),
             at: base,
             was_active: false,
             near_limit: false,
@@ -12210,8 +12266,8 @@ mod tests {
         assert_eq!(
             daemon.state.accounts[0].blind_anchor,
             Some(BlindAnchor {
-                session: 0.30,
-                weekly: 0.10,
+                session: Some(0.30),
+                weekly: Some(0.10),
                 at: base,
                 was_active: false,
                 near_limit: false,
@@ -12222,6 +12278,31 @@ mod tests {
         assert!(
             daemon.state.accounts[1].blind_anchor.is_none(),
             "the onboarded account starts inside no episode",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blind_entry_anchor_for_a_weekly_only_account_carries_no_session_fraction() {
+        // Issue #1597 (M4): the per-slot pre-blind anchor (#583) copies the reading's absence
+        // through on the live→blind ENTRY edge of `note_blind_episode`. A weekly-only account —
+        // its served reading carries no session window (issue #1596) — that then fails its poll
+        // anchors `session: None` beside its present weekly: "does not apply", never a
+        // fabricated `0`. The anchor's `near_limit` tag for a `None` session is the
+        // decision-arms item's (#1602 row 7) to assert, not this seam's.
+        let (_dir, mut daemon) =
+            rate_limit_daemon(FakeRosterPoller::new().ok_without_a_session_window("u-A", 0.30))
+                .await;
+        daemon.tick().await; // the live weekly-only reading that becomes the anchor
+
+        daemon.poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        daemon.tick().await; // the 429 that blinds it — the entry edge
+        let anchor = daemon.state.accounts[0]
+            .blind_anchor
+            .expect("the entry edge anchors the last live reading");
+        assert_eq!(
+            (anchor.session, anchor.weekly),
+            (None, Some(0.30)),
+            "the absent session window copies through as None beside the present weekly",
         );
     }
 
@@ -12591,8 +12672,8 @@ mod tests {
         // early reset. (Base triggers: weekly 0.98, session 0.95.)
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now + 7_200),
             session_resets_at: None,
         };
@@ -12608,8 +12689,8 @@ mod tests {
         // than the ceiling: a window that elapses sooner than an hour is caught promptly.
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now + 1_800),
             session_resets_at: None,
         };
@@ -12624,8 +12705,8 @@ mod tests {
         let now = 1_000_000;
         // Reset 10 s away (< the 60 s floor) → floored to poll_secs, not a sub-cadence re-poll.
         let imminent = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now + 10),
             session_resets_at: None,
         };
@@ -12636,8 +12717,8 @@ mod tests {
         // Reset already PAST but the account still reads exhausted (rare server lateness) →
         // floored to poll_secs, so a persistently-late reset never busy-polls every tick.
         let past = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now - 500),
             session_resets_at: None,
         };
@@ -12652,8 +12733,8 @@ mod tests {
         // No parseable reset for the exhausted dimension → the plain hourly ceiling (#537).
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.10,
-            weekly: 0.99,
+            session: Some(0.10),
+            weekly: Some(0.99),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -12670,8 +12751,8 @@ mod tests {
         // (here absent, but even if present) weekly reset does not key the window.
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.96,
-            weekly: 0.10,
+            session: Some(0.96),
+            weekly: Some(0.10),
             weekly_resets_at: Some(now + 100), // must be IGNORED — weekly is not exhausted
             session_resets_at: Some(now + 1_200),
         };
@@ -12687,8 +12768,8 @@ mod tests {
         // the SOONER applicable reset governs, catching relief at the earliest opportunity.
         let now = 1_000_000;
         let reading = Usage {
-            session: 0.96,
-            weekly: 0.99,
+            session: Some(0.96),
+            weekly: Some(0.99),
             weekly_resets_at: Some(now + 900),
             session_resets_at: Some(now + 2_400),
         };
@@ -13060,7 +13141,10 @@ mod tests {
                 .ok("u-C", 0.33, 0.10),
         )
         .await;
-        let sessions = |d: &FakeDaemon| -> Vec<Option<f64>> {
+        // The outer `Option` is "polled yet?" (the slot holds no reading); the inner one is the
+        // reading's own session window (issue #1597: `None` when the account has none). Kept
+        // nested rather than flattened, so the two absences stay distinguishable here too.
+        let sessions = |d: &FakeDaemon| -> Vec<Option<Option<f64>>> {
             d.state
                 .accounts
                 .iter()
@@ -13071,25 +13155,25 @@ mod tests {
         daemon.tick().await;
         assert_eq!(
             sessions(&daemon),
-            vec![Some(0.11), None, None],
+            vec![Some(Some(0.11)), None, None],
             "tick 1 polls only the active work; spare/backup are still unread"
         );
         daemon.tick().await;
         assert_eq!(
             sessions(&daemon),
-            vec![Some(0.11), Some(0.22), None],
+            vec![Some(Some(0.11)), Some(Some(0.22)), None],
             "tick 2 adds spare, carrying work's earlier reading"
         );
         daemon.tick().await;
         assert_eq!(
             sessions(&daemon),
-            vec![Some(0.11), Some(0.22), None],
+            vec![Some(Some(0.11)), Some(Some(0.22)), None],
             "tick 3 RE-polls the interleaved active work (#366); backup is still unread"
         );
         daemon.tick().await;
         assert_eq!(
             sessions(&daemon),
-            vec![Some(0.11), Some(0.22), Some(0.33)],
+            vec![Some(Some(0.11)), Some(Some(0.22)), Some(Some(0.33))],
             "tick 4 adds backup — the schedule's last peer — so every account is now carried"
         );
     }
@@ -14612,8 +14696,8 @@ mod tests {
         daemon.near_limit_poll_secs = 60; // enable the path (the `tunables` fixture ships it at 0)
         daemon.session_velocity_horizon_secs = 150; // arm the #539 projection horizon
         let usage = |session: f64| Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -14728,8 +14812,8 @@ mod tests {
         daemon.session_velocity_horizon_secs = 0; // projection OFF → isolate the OBSERVED-band arm
         daemon.state.accounts[0].session_velocity = None; // no velocity → only the reading can carry the band
         let stale = Usage {
-            session: 0.40,
-            weekly: 0.20,
+            session: Some(0.40),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: Some(WINDOW),
         };
@@ -19769,8 +19853,8 @@ mod tests {
         let samples_path = dir.path().join("usage-samples.jsonl");
         let reading = Ok(PolledReading {
             usage: Usage {
-                session: 0.42,
-                weekly: 0.88,
+                session: Some(0.42),
+                weekly: Some(0.88),
                 weekly_resets_at: Some(1_700_600_000),
                 session_resets_at: Some(1_700_003_600),
             },
@@ -19819,8 +19903,8 @@ mod tests {
         let samples_path = dir.path().join("usage-samples.jsonl");
         let reading = Ok(PolledReading {
             usage: Usage {
-                session: 0.42,
-                weekly: 0.88,
+                session: Some(0.42),
+                weekly: Some(0.88),
                 weekly_resets_at: Some(1_700_600_000),
                 session_resets_at: Some(1_700_003_600),
             },
@@ -19857,8 +19941,8 @@ mod tests {
         let samples_path = dir.path().join("usage-samples.jsonl");
         let reading = Ok(PolledReading {
             usage: Usage {
-                session: 0.1,
-                weekly: 0.2,
+                session: Some(0.1),
+                weekly: Some(0.2),
                 weekly_resets_at: None,
                 session_resets_at: None,
             },
@@ -19894,8 +19978,8 @@ mod tests {
         // A gap AFTER a real sample adds nothing — the earlier reading stands alone.
         let ok = Ok(PolledReading {
             usage: Usage {
-                session: 0.3,
-                weekly: 0.4,
+                session: Some(0.3),
+                weekly: Some(0.4),
                 weekly_resets_at: None,
                 session_resets_at: None,
             },
@@ -19930,7 +20014,7 @@ mod tests {
             Ok(PolledReading {
                 usage: Usage {
                     session,
-                    weekly: 0.90,
+                    weekly: Some(0.90),
                     weekly_resets_at: Some(1_700_600_000),
                     session_resets_at: None,
                 },
@@ -19974,8 +20058,8 @@ mod tests {
             .join("usage-samples.jsonl");
         let reading = Ok(PolledReading {
             usage: Usage {
-                session: 0.5,
-                weekly: 0.6,
+                session: Some(0.5),
+                weekly: Some(0.6),
                 weekly_resets_at: None,
                 session_resets_at: None,
             },

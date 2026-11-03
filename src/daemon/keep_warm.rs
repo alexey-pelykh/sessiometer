@@ -1132,8 +1132,8 @@ mod tests {
         let readings = vec![
             None,
             Some(Usage {
-                session: 0.10,
-                weekly: 0.10,
+                session: Some(0.10),
+                weekly: Some(0.10),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -1176,8 +1176,8 @@ mod tests {
         let readings = vec![
             None,
             Some(Usage {
-                session: 0.85,
-                weekly: 0.10,
+                session: Some(0.85),
+                weekly: Some(0.10),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -1215,14 +1215,14 @@ mod tests {
         // The active account polled live (recovering); the spare is also available.
         let readings = vec![
             Some(Usage {
-                session: 0.10,
-                weekly: 0.10,
+                session: Some(0.10),
+                weekly: Some(0.10),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
             Some(Usage {
-                session: 0.10,
-                weekly: 0.10,
+                session: Some(0.10),
+                weekly: Some(0.10),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),
@@ -1507,8 +1507,8 @@ mod tests {
             None,
             Some(Usage {
                 // Over the 98% weekly ceiling `tunables` configures → weekly-exhausted.
-                session: 0.10,
-                weekly: 0.99,
+                session: Some(0.10),
+                weekly: Some(0.99),
                 weekly_resets_at: None,
                 session_resets_at: None,
             }),

@@ -1120,8 +1120,8 @@ mod tests {
     #[test]
     fn holds_when_both_dimensions_are_below_their_thresholds() {
         let usage = Usage {
-            session: 0.5,
-            weekly: 0.5,
+            session: Some(0.5),
+            weekly: Some(0.5),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1134,8 +1134,8 @@ mod tests {
         // AC #1 (regression preserved): session at its threshold → swap, even
         // with weekly far below its separate (higher) threshold.
         let usage = Usage {
-            session: 0.95,
-            weekly: 0.1,
+            session: Some(0.95),
+            weekly: Some(0.1),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1146,8 +1146,8 @@ mod tests {
     fn swaps_when_weekly_reaches_its_threshold_while_session_is_below() {
         // AC #2: weekly at its threshold while session sits below its own → swap.
         let usage = Usage {
-            session: 0.50,
-            weekly: 0.98,
+            session: Some(0.50),
+            weekly: Some(0.98),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1162,8 +1162,8 @@ mod tests {
         // weekly threshold is lowered to 0.95. Session is held below its threshold
         // throughout, isolating the weekly axis.
         let usage = Usage {
-            session: 0.50,
-            weekly: 0.96,
+            session: Some(0.50),
+            weekly: Some(0.96),
             weekly_resets_at: None,
             session_resets_at: None,
         };
@@ -1558,8 +1558,8 @@ mod tests {
     /// parseable `resets_at`).
     fn reading(session: f64, window: Option<i64>) -> Usage {
         Usage {
-            session,
-            weekly: 0.20,
+            session: Some(session),
+            weekly: Some(0.20),
             weekly_resets_at: None,
             session_resets_at: window,
         }
@@ -1724,7 +1724,10 @@ mod tests {
         // is trusted as-is — the pre-#614 behaviour, deliberately retained rather than guessed at.
         let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
         assert!(!is_stale_low(mark, &reading(0.40, None)));
-        assert_eq!(plausible_session(mark, &reading(0.40, None)).session, 0.40);
+        assert_eq!(
+            plausible_session(mark, &reading(0.40, None)).session,
+            Some(0.40)
+        );
     }
 
     #[test]
@@ -1736,7 +1739,7 @@ mod tests {
         let mark = SessionHighWater::fold(None, &reading(0.88, Some(WINDOW)));
         let stale = reading(0.40, Some(WINDOW));
         let corrected = plausible_session(mark, &stale);
-        assert_eq!(corrected.session, 0.88);
+        assert_eq!(corrected.session, Some(0.88));
         assert_eq!(corrected.weekly, stale.weekly);
         assert_eq!(corrected.session_resets_at, stale.session_resets_at);
         assert_eq!(corrected.weekly_resets_at, stale.weekly_resets_at);

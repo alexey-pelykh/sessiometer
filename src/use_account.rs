@@ -1371,8 +1371,8 @@ mod tests {
             match self.probe {
                 Probe::Live { weekly } => Ok(PolledReading {
                     usage: Usage {
-                        session: 0.10,
-                        weekly,
+                        session: Some(0.10),
+                        weekly: Some(weekly),
                         weekly_resets_at: None,
                         session_resets_at: None,
                     },

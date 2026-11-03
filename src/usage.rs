@@ -11,10 +11,11 @@
 //! anthropic-beta: oauth-2025-04-20
 //! ```
 //!
-//! and projects the response into a [`Usage`] reading (both windows) for the swap
-//! decision. The bearer is the `accessToken` inside the stored
-//! `Claude Code-credentials` blob — read through the existing [`CredentialStore`]
-//! seam ([`crate::keychain`]); the poller never re-reads or re-mints a token.
+//! and projects the response into a [`Usage`] reading (every quota window the
+//! account has; a window the reply did not carry is `None`) for the swap decision.
+//! The bearer is the `accessToken` inside the stored `Claude Code-credentials`
+//! blob — read through the existing [`CredentialStore`] seam
+//! ([`crate::keychain`]); the poller never re-reads or re-mints a token.
 //!
 //! ## Transport: the `curl` CLI, not an HTTP crate
 //!
@@ -77,18 +78,27 @@ const BETA_HEADER: &str = "anthropic-beta: oauth-2025-04-20";
 /// poll loop. Comfortably below the default 300 s (5 min) poll interval.
 const POLL_TIMEOUT_SECS: u32 = 30;
 
-/// A point-in-time usage reading for one account, across both quota windows.
+/// A point-in-time usage reading for one account, across every quota window the
+/// account has.
 ///
 /// The swap decision compares each dimension against its OWN threshold (issue
 /// #41: session vs `session_ceiling`, weekly vs the separate `weekly_ceiling`),
-/// so the reading carries both fractions and projects neither to a single
-/// worst-case scalar.
+/// so the reading carries each present fraction and projects neither to a single
+/// worst-case scalar. A window the served reply did not carry is `None` — "does
+/// not apply to this account" (since 2026-10-30 the state of a verified Ultra
+/// account's session window) — never a fabricated `0`: a present `0.0` is a measured
+/// idle window. Invariant I-1, pinned at the parser (issue #1596) and carried here
+/// as a documented contract with no runtime check: a `*_resets_at` is `Some` only
+/// when its window's fraction is `Some`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Usage {
-    /// Fraction in `[0.0, 1.0]` of the rolling 5-hour session window consumed.
-    pub(crate) session: f64,
-    /// Fraction in `[0.0, 1.0]` of the weekly window consumed.
-    pub(crate) weekly: f64,
+    /// Fraction in `[0.0, 1.0]` of the rolling 5-hour session window consumed, or
+    /// `None` when the account has no session window.
+    pub(crate) session: Option<f64>,
+    /// Fraction in `[0.0, 1.0]` of the weekly window consumed, or `None` when the
+    /// account has no weekly window (no observed instance; the operator's stated
+    /// future case).
+    pub(crate) weekly: Option<f64>,
     /// Epoch seconds at which the WEEKLY window resets, when the API reported a
     /// parseable timestamp; `None` otherwise. The all-exhausted terminal logic
     /// (issue #11) consumes it: when every account is weekly-exhausted the daemon
@@ -1955,6 +1965,79 @@ mod tests {
         assert_eq!(usage.session_resets_at, None);
     }
 
+    #[test]
+    fn to_usage_copies_an_absent_window_through_as_none() {
+        // Issue #1597 (M1): the captured weekly-only reply's report — its session window
+        // absent, its weekly window present with its reset — projects to a reading whose
+        // session is `None`, "does not apply to this account". Nothing between the parser
+        // and the reading turns that absence into a number: a present `0.0` would be a measured
+        // idle window, a different fact (REQ-RDG-B-001).
+        let report = UsageReport {
+            session: None,
+            weekly: Some(0.90),
+            session_resets_at: None,
+            weekly_resets_at: Some("2026-11-06T22:59:59.916061+00:00".to_owned()),
+            session_severity: None,
+            weekly_severity: None,
+        };
+        let usage = report.to_usage();
+        assert_eq!(
+            usage.session, None,
+            "an absent session window copies through as None, never a fabricated fraction"
+        );
+        let weekly = usage.weekly.expect("the weekly window is present");
+        assert!(
+            (weekly - 0.90).abs() < 1e-9,
+            "the present weekly fraction copies through: {weekly}"
+        );
+        assert_eq!(
+            usage.session_resets_at, None,
+            "no session window, no session reset"
+        );
+        assert!(
+            usage.weekly_resets_at.is_some(),
+            "the weekly reset is projected beside its window"
+        );
+    }
+
+    #[test]
+    fn to_usage_copies_an_absent_weekly_window_through_as_none() {
+        // Issue #1597 (M6), M1's weekly-axis sibling: the session-only body of #1591's
+        // Oracle D — a session window present, no weekly window, neither reset — projects to
+        // a reading whose weekly is `None`. The lift is per window and symmetric (the
+        // operator's stated direction), so the projection is graded on both axes.
+        let report = UsageReport {
+            session: Some(0.42),
+            weekly: None,
+            session_resets_at: None,
+            weekly_resets_at: None,
+            session_severity: None,
+            weekly_severity: None,
+        };
+        let usage = report.to_usage();
+        assert_eq!(
+            usage.weekly, None,
+            "an absent weekly window copies through as None, never a fabricated fraction"
+        );
+        let session = usage.session.expect("the session window is present");
+        assert!(
+            (session - 0.42).abs() < 1e-9,
+            "the present session fraction copies through: {session}"
+        );
+        assert_eq!(usage.session_resets_at, None);
+        assert_eq!(usage.weekly_resets_at, None);
+    }
+
+    #[test]
+    fn the_lifted_reading_types_stay_copy() {
+        // Issue #1597 (M2): a compile-time pin of the derive. `Option<f64>` is `Copy`, so the
+        // lift leaves `Usage` the lean by-value decision type it was — every
+        // `let (prev, next) = (*a, *b)` and `if let Some(reading) = slot` keeps working. The
+        // `LastGood` / `BlindAnchor` half of this pin sits in `daemon::records::tests`.
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<Usage>();
+    }
+
     // --- access_token_from_blob (pure) ---
 
     #[test]
@@ -2115,8 +2198,10 @@ mod tests {
             r#"{"limits":[{"kind":"session","percent":30},{"kind":"weekly_all","percent":70}]}"#;
         let src = source(vec![FakeUsageTransport::ok(200, body)]);
         let reading = src.usage().await.unwrap();
-        assert!((reading.usage.session - 0.30).abs() < 1e-9);
-        assert!((reading.usage.weekly - 0.70).abs() < 1e-9);
+        let session = reading.usage.session.expect("session window present");
+        assert!((session - 0.30).abs() < 1e-9);
+        let weekly = reading.usage.weekly.expect("weekly window present");
+        assert!((weekly - 0.70).abs() < 1e-9);
         // No `severity` on either limit → the reading carries none (issue #156).
         assert_eq!(reading.severity, None);
     }
