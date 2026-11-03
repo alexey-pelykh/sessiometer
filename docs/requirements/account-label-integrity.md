@@ -61,8 +61,10 @@ roster entries unnoticed. The panel, the usage history, the `status` and `watch`
 tell accounts apart by label alone, so a shared or moved label makes them merge or confuse the accounts behind
 it (§ 2).
 
-**Proposed solution.** Make every write that creates a collision, renames an account or stores a credential
-another entry already holds announce it on the surface that did the write (F1 to F3). Give every surface
+**Proposed solution.** Refuse, before any write, a write that would create a collision or rename an account,
+unless the operator consents on the CLI with `--overwrite` or `--rename` (ruled 2026-11-03, § 8.1 and design
+§ 12.3), and make a write that stores a credential another entry already holds announce it on the surface
+that did the write (F1 to F3). Give every surface
 downstream of the roster an identity that a relabel does not change (F4). Check an import payload's own
 identities before writing (F5, F6). Measure the premises behind the identifier on real logins (F7). Record
 the decisions nobody has made: what makes two labels the same (F8) and what becomes of an orphaned keychain
@@ -523,8 +525,9 @@ lands.
 #### MET-T-002: Relabel disclosure
 
 - **TAG**: RelabelDisclosure
-- **SCALE**: share of relabelling revives — a `capture`, `login` or socket `capture` that matches a
-  rostered account and gives it a different label — whose reply names both the previous label and the
+- **SCALE**: share of relabelling revives — since 2026-11-03 a CLI `capture` or `login` made with `--rename` that
+  matches a rostered account and gives it a different label, a socket `capture` refusing the relabel
+  (design § 12.3 C-3, C-6) — whose reply names both the previous label and the
   new one
 - **METER**: hermetic tests over each caller of `plan_capture`
 - **PAST**: 0% at `d9d75ba`; the reply names only the new label (§ 2.4)
@@ -950,11 +953,11 @@ feature column of `—` marks an existing CTA that no feature here changes.
 
 | Object | CTA | Feature | Variants | Precondition | Outcome |
 |---|---|---|---|---|---|
-| RosterEntry | Create | F1 | CLI `capture`, CLI `login`, socket `capture`, `import` | a harvested or imported uuid the roster does not hold | the entry is appended under its label; a collision it creates is reported |
+| RosterEntry | Create | F1 | CLI `capture`, CLI `login`, socket `capture`, `import` | a harvested or imported uuid the roster does not hold | the entry is appended under its label; a collision it creates is reported (since 2026-11-03: on the three governed paths a collision is refused before the write, and `import` keeps its own rule, design § 12.3 C-1, C-2) |
 | RosterEntry | Edit (relabel) | F1 ! F2 | a revive with a label through `capture`, `login` or socket `capture`; `config-set` | the entry exists | the label is replaced only with rename consent, and never onto a label another account carries (design § 12.3, C-3, C-4); on a CLI revive made with `--rename` the previous label is named (F2); a socket revive that would relabel is refused (C-6) |
 | RosterEntry | View | F4 | `list`, `status`, the panel | the daemon serves `status` | one line or row per entry, keyed on an identity a relabel does not change |
 | RosterEntry | Delete | — | `remove` | a query that resolves to one entry | the entry is removed, then its stash is deleted; F10 covers the orphan a failure leaves |
-| AccountLabel | Compare (exact) | F1 | the before-and-after bearer count | a write that sets a label | a collision is detected when REQ-ROS-B-002 counts one |
+| AccountLabel | Compare (exact) | F1 | the before-and-after bearer count | a write that sets a label | a collision is detected when REQ-ROS-B-002 counts one (since 2026-11-03, per account on the governed write paths, design § 12.3 Terms) |
 | AccountLabel | Compare (confusable) | F8 | the rule F8's record adopts | the record adopts detection | a confusable pair is detected |
 | CapturedIdentity | Match | F2 | `plan_capture`'s uuid lookup | a completed capture or login | the matched entry, or a new one |
 | CapturedIdentity | View (disclose) | F2 | the reply on a relabelling revive | a match whose label changes | the previous label is named on a CLI revive made with `--rename`; a socket relabel is refused (design § 12.3, C-3, C-6) |
@@ -965,10 +968,10 @@ feature column of `—` marks an existing CTA that no feature here changes.
 | StashedCredential | Delete (reap) | F10 | the reaper | the policy is to reap | orphan items are deleted |
 | MigrationArtifact | Import (payload check) | F5 | before the swap lock | an artifact is read | a duplicate or unmatched credential entry is reported |
 | MigrationArtifact | Import (entry identity check) | F6 | per entry | an entry carries a credential | a mismatched entry is refused |
-| OperatorNotice | Create (collision) | F1 | CLI line; socket acknowledgement | F1 detects a collision | the operator is told |
+| OperatorNotice | Create (collision) | F1 | CLI line; socket acknowledgement | F1 detects a collision | the operator is told (since 2026-11-03: the write is refused, and the CLI refusal names the holder, design § 12.3 C-9) |
 | OperatorNotice | View (collision) | F1 | terminal; panel | a report was emitted | the label is shown |
 | OperatorNotice | Create (relabel) | F2 | CLI reply; `refreshed` acknowledgement | a relabelling revive | the previous label is carried in the CLI reply only; the `refreshed` acknowledgement never carries one (design § 12.3, C-6) |
-| OperatorNotice | View (relabel) | F2 | terminal; panel, once #1474 lands | a disclosure was emitted | both labels are shown |
+| OperatorNotice | View (relabel) | F2 | terminal; panel, once #1474 lands | a disclosure was emitted | both labels are shown (since 2026-11-03: only on a CLI revive made with `--rename`; the panel never shows a previous label, design § 12.3 C-6, C-8) |
 | OperatorNotice | Create (shared credential) | F3 | the writing surface | F3 detects a pair | the operator is told |
 | OperatorNotice | Create (payload) | F5 | `import`'s report | F5 detects a duplicate or unmatched entry | the operator is told |
 | OperatorNotice | Create (identity mismatch) | F6 | `import`'s per-account report | F6 refuses an entry | the account is reported failed |
@@ -1057,7 +1060,9 @@ claim; the resolution for each follows the table.
 - **RosterEntry Edit, claimed by F1 and F2.** One relabelling revive can both create a collision and
   rename a different account. Resolved as one CTA with conditional behaviour: the one reply carries
   F1's report when REQ-ROS-B-002 counts a collision, and F2's previous label when the revive changed
-  the label.
+  the label. Since 2026-11-03 such a write is refused instead unless the CLI consents, `--overwrite` for the
+  collision and `--rename` for the rename in two steps (design § 12.3 C-4), so a completed reply carries
+  F2's previous label only, never F1's report.
 - **StashedCredential Create, claimed by F3 and F6.** Resolved by order: F6 decides before the write,
   so a refused import entry writes nothing and F3 never compares it; F3 compares every credential that
   is written.
@@ -1160,7 +1165,7 @@ is `login-mismatch-policy`'s to decide (§ 8.1).
 | ID | EARS pattern | Statement | Priority | Origin | Confidence |
 |---|---|---|---|---|---|
 | REQ-IDN-B-001 | Event-driven | When a `capture`, a `login` or a socket `capture` command matches an already-rostered account and gives it a label different from the one it carried, the system shall name in its reply both the label the account carried before the write and the label it carries after it. | Must | `AI-inferred-expansion`; `capture` and the socket `capture` are a same-class addition | VALIDATED: the reply cannot show the previous label (§ 2.4) |
-| REQ-IDN-I-001 | Optional | Where the socket `capture` command refreshes an account under a different label, the daemon shall carry the previous label as an additive field of the `refreshed` acknowledgement. | Must | `AI-inferred-expansion` | VACUOUS since 2026-11-03: the socket `capture` never completes a rename (design § 12.3, C-6), so this condition never holds; the refusal's card names the current label instead (C-9) |
+| REQ-IDN-I-001 | Optional | Where the socket `capture` command refreshes an account under a different label, the daemon shall carry the previous label as an additive field of the `refreshed` acknowledgement. | Must | `AI-inferred-expansion` | VACUOUS since 2026-11-03: the socket `capture` never completes a rename (design § 12.3, C-6), so this condition never holds; the refusal's card names no label (C-6, C-9) |
 | REQ-IDN-I-002 | Optional | Where the menu-bar app decodes a `refreshed` acknowledgement that carries a previous label, the app shall show both labels on the capture card. | Should | `AI-inferred-expansion` | VACUOUS since 2026-11-03, with REQ-IDN-I-001 (design § 12.3, C-6). Before that: ASSUMED: it waits on #1474 |
 | REQ-IDN-C-001 | Ubiquitous | The project shall author, before the change, a test in which `login X` lands on a rostered account labelled `Y` and the reply names `Y`, failing against the tree before the change. | Must | `AI-inferred-expansion` | ASSUMED |
 | REQ-IDN-C-002 | Optional | Where `login-mismatch-policy` selects a refusal, the system shall take that refusal before the credential stash is written, leaving no stash and no roster change. | Must, where chosen | `AI-inferred-expansion` | SPECULATIVE until 2026-11-03; `login-mismatch-policy` now selects the refusal (§ 8.1), so this requirement applies |

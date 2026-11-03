@@ -353,7 +353,7 @@ Scenario: the note says what import's notice says, and never that anything was r
 | Output conforms to `apps/menubar/design/menubar-preview.html` | manual (§ Not scenarios) |
 | The repo's Swift gates | manual (§ Not scenarios) |
 
-Changed with the warn form on 2026-11-03, because no save creates a collision for an announcement to report: `announcement-sentence` and `announce-is-wired` are retired, and `oracle-a-save-that-creates-a-collision-announces-it-once` and `quiet-saves-announce-nothing` are replaced by `oracle-a-colliding-save-is-refused-and-its-rows-marked` and `only-a-refusal-marks-rows`.
+Changed from the warn form on 2026-11-03, because no save creates a collision for an announcement to report: `announcement-sentence` and `announce-is-wired` are retired, and `oracle-a-save-that-creates-a-collision-announces-it-once` and `quiet-saves-announce-nothing` are replaced by `oracle-a-colliding-save-is-refused-and-its-rows-marked` and `only-a-refusal-marks-rows`.
 
 ## 🟥 Open
 

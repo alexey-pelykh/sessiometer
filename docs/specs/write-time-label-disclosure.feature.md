@@ -462,7 +462,7 @@ Scenario: a socket capture shares the plan, so it refuses the same writes before
 > A new account captured or logged in with no label takes its uuid as its label
 > (`derive_label`, src/capture.rs:621), and REQ-LGN-B-003 and D-LGN-6 forbid that path to hard-error
 > or prompt. Where
-> another account already carries that exact string, which only a deliberate relabel can produce, the
+> another account already carries that exact string, which a deliberate relabel, an import, a restore or a hand edit can produce (design § 12.3, C-2), the
 > derivation appends `-2`, `-3` and so on, and takes the first label no account carries. The write is
 > never refused for a derived label and never completes a collision, and its reply prints the label it
 > chose, as every capture and login reply already does. This is the orchestrator's reading in design

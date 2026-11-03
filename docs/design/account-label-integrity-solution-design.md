@@ -184,8 +184,9 @@ keychain delete to undo it, and that delete can fail and leave an orphan (PM-14)
 
 Every new operator-facing string is a named template in one module, registered with the #160 scanner
 under the advisory audience (#1123); none is an inline literal (PM-13). The CLI renders the templates.
-Socket acknowledgements carry structured facts — labels, the bearers' uuids, a previous label — and never
-rendered prose; the app renders its own strings, scanned by a Swift test that reads
+Socket acknowledgements carry structured facts — labels, the bearers' uuids, a previous label (since
+2026-11-03 the refusal tags carry no data and no acknowledgement carries a previous label, § 12.3 C-6,
+C-12) — and never rendered prose; the app renders its own strings, scanned by a Swift test that reads
 `src/framing_vocabulary.rs` the way `NotificationDeliveryTests` already does.
 
 An account is named by its label. Its uuid is added only where the label alone is ambiguous, meaning it
@@ -426,7 +427,8 @@ terminal.
 4. The roster is saved under its own config-write lock (#1445); the daemon is told to reload, best-effort.
 5. Outside both locks: F3 compares the written credential with each other entry's stash (D-4).
 6. The reply prints the confirmation line (verb, label, previous label when it changed, the enabled count),
-   then one line per notice: collision, shared credential. A detected pair also appends one
+   then one line per notice: collision, shared credential (since 2026-11-03 no completed write creates a
+   collision, so only the shared-credential notice remains, § 12.3 C-8). A detected pair also appends one
    `credential_shared` line, best-effort like the login audit line (`emit_login_event`, `src/capture.rs:359`).
 
 **Socket `capture`** (panel): the same steps run inside
@@ -567,7 +569,7 @@ lines and the import lines stand.
 | `log --json` | lines carried verbatim; new event name | none |
 | `reliability --json` | none | none |
 | migration artifact | none | none (`FORMAT_VERSION` frozen) |
-| CLI text | notices; previous label; enabled count | none (no machine contract) |
+| CLI text | notices; previous label (since 2026-11-03 only on a revive made with `--rename`, § 12.3 C-8); enabled count | none (no machine contract) |
 
 ## 9. UX Architecture — menu-bar surfaces
 
@@ -786,7 +788,7 @@ Every string avoids the #160 banned tokens and is scanned (REQ-NTC-C-002).
 | Element | Text (draft) | Ownership |
 |---|---|---|
 | Outcome line, capture card | Captured ‘work’. · Refreshed ‘work’ (was ‘spare’). (the “was” form is the CLI's, on a revive made with `--rename`, since 2026-11-03; the card never shows it, § 12.3 C-6) | Developer |
-| Collision line, capture card | ‘work’ now names 2 accounts: this one is work 2 of 2 (<uuid-B>), the other work 1 of 2 (<uuid-A>). Until one is renamed, you can't switch to either from the panel. Rename one in Settings. | Developer |
+| Collision line, capture card | ‘work’ now names 2 accounts: this one is work 2 of 2 (<uuid-B>), the other work 1 of 2 (<uuid-A>). Until one is renamed, you can't switch to either from the panel. Rename one in Settings. (Retired 2026-11-03: no completed capture creates a collision, § 12.3 C-8; the refused card's copy is #1559's and #1561's.) | Developer |
 | Shared line, capture card | ‘work’ and ‘spare’ hold the same credential. | Copywriter review |
 | Shared line, one side shared | ‘spare’ and work 2 of 2 (<uuid-B>) hold the same credential. | Copywriter review |
 | Shared line, equal labels | This one, work 2 of 2 (<uuid-B>), and work 1 of 2 (<uuid-A>) hold the same credential. | Copywriter review |
@@ -797,7 +799,7 @@ Every string avoids the #160 banned tokens and is scanned (REQ-NTC-C-002).
 | After-click refusal, the fallback | Can’t switch — another account has this label. Rename one in Settings. (replaces “Two accounts share that label — rename one, then switch.”) | Developer |
 | Callout, shared target | → work 2 of 2 · spoken “Next swap to work, 2 of 2 accounts named work” · older daemon: “one of 2 accounts named work” | Developer |
 | Spoken cue, row and Settings field | “work, 2 of 2 accounts named work” · Settings: “Label, 2 of 2”, then the field's value | Developer |
-| Status-message announcement | “‘work’ now names 2 accounts; this one is 2 of 2.” | Developer |
+| Status-message announcement | “‘work’ now names 2 accounts; this one is 2 of 2.” (Retired 2026-11-03 with the collision line, § 12.3 C-8, C-9.) | Developer |
 | Header | “3 accounts · work 2 of 2 active” | Developer |
 | Swap result | the acknowledgement's labels, unchanged: “Switched work → spare” | Developer |
 | Row uuid line, Settings | the row's uuid under the label field, only if `settings-row-shows-uuid` is answered yes | Developer |
@@ -837,9 +839,9 @@ and note read `config-get`, which already lists the roster in order and keys eac
 | PanelAccountRow | Entity | REQ-ROW-B-001 | PRD § 9.1 | — |
 | AccountStatusLine | Entity | REQ-WIRE-I-001 | PRD § 9.1 | — |
 | OperatorNotice | Entity | REQ-ROS-I-002 | PRD § 9.1 | also REQ-IDN-I-002, REQ-STSH-B-002 |
-| Collision line and note | Entity | REQ-ROS-I-002 | PRD § 9.3, OperatorNotice View (collision) | ordinals, the bearers' uuids and a warn's cost, at parity with § 8.5; the Settings note follows state (UX-11) |
+| Collision line and note | Entity | REQ-ROS-I-002 | PRD § 9.3, OperatorNotice View (collision) | ordinals, the bearers' uuids and a warn's cost, at parity with § 8.5; the Settings note follows state (UX-11); since 2026-11-03 the collision line is retired and the note stands (§ 12.3 C-8) |
 | Settings row uuid line, only if answered yes | Entity | none | PRD § 9.4, `account_uuid` "where a label is ambiguous" | net-new, conditional: UX-9; not built until `settings-row-shows-uuid` is answered (§ 14.6 item 10b) |
-| Relabel in the outcome line | Entity | REQ-IDN-I-002 | PRD § 9.3, OperatorNotice View (relabel) | waits on #1474; folded into the outcome line (UX-6) |
+| Relabel in the outcome line | Entity | REQ-IDN-I-002 | PRD § 9.3, OperatorNotice View (relabel) | waits on #1474; folded into the outcome line (UX-6); since 2026-11-03 CLI-only, on a revive made with `--rename` (§ 12.3 C-6, C-8) |
 | Shared-credential line | Entity | REQ-STSH-B-002 | PRD § 9.3, OperatorNotice Create (shared credential) | DQ-6: both channels |
 | Ordinal badge and spoken cue, on every surface | Entity | REQ-ROW-C-002, REQ-ROS-I-002 | DQ-4 (#939) | the non-colour cue and the duplicate set's one handle (UX-3) |
 | Duplicate-set colour tie-break | Entity | REQ-ROW-C-002 | DQ-4; PM-10 | — |
@@ -901,7 +903,8 @@ backfill leaves samples keyless and retries at the next start.
 Quality-pillar finding, closed in § 9.1 as UX-8. Rows sharing a label carry a non-colour cue (WCAG 1.4.1)
 and an accessible name with their ordinal (4.1.2); a duplicate Settings label field carries its ordinal in
 its accessible label, so two fields named "Label" stay distinct (2.4.6). Notice lines are announced as
-status messages without taking focus (4.1.3); the announcement carries the ordinal sentence, and the uuids
+status messages without taking focus (4.1.3; since 2026-11-03 the collision line is retired and the
+Settings refusal is not announced, § 12.3 C-8, C-9); the announcement carries the ordinal sentence, and the uuids
 stay in the visible text, read as characters only on demand. The spoken distinction is the ordinal, never a
 full uuid; if the Settings row's uuid line is built (UX-9), it belongs to its row's accessibility container
 (1.3.1) and is spoken as a short prefix. A blocked switch states its reason to VoiceOver before any click
@@ -1025,7 +1028,7 @@ break the rule and the F3 compare once each and watch the suite fail. No propert
 | UX-3 duplicate set | the ordinal as the one handle on every surface; colour slots no other row uses; spoken cue (author-chosen) | re-seed every row from the identifier; the uuid as the handle | two-way; visible |
 | UX-9 uuid where ambiguous | notices name a uuid only beside an ambiguous label; a Settings row's own uuid only on an explicit answer (author-chosen) | uuid-free notices; the row's uuid by default | two-way; visible; returns to the PRD (§ 14.6 items 10a, 10b) |
 | UX-10 shared-label switch | blocked before the click, with its reason and remedy (author-chosen) | switch by identifier; the refusal after the click, as today | two-way; returns to the PRD (§ 14.6 item 15) |
-| UX-11 Settings note | derived from the roster's state; announced only for a save that created a collision (author-chosen) | tied to the save's acknowledgement | two-way |
+| UX-11 Settings note | derived from the roster's state; announced only for a save that created a collision (author-chosen; superseded 2026-11-03: a colliding save is refused and not announced, § 12.3 C-7, C-9) | tied to the save's acknowledgement | two-way |
 | SEC-3 orphan advice | recommend `report` over `reap` (author-chosen) | — | advice only |
 
 ### 12.2 Open decision stubs — context and options filled, decision left open
@@ -1591,7 +1594,7 @@ Likelihood and impact run from 1 to 3; their product reads 7–9 HIGH, 4–6 MED
 | RK-03 | a reaper deletes an in-flight stash or the witness (PM-22, T-03) | 2 | 3 | 6 MED | implementer | `report` recommended; if `reap`, SP-2 and the grace window |
 | RK-04 | the detector is inert and zero detections read as "no sharing" (PM-3) | 2 | 2 | 4 MED | implementer, operator | the mutation pass; MET-R-003's reading names the blind spot; SP-1 premise 1 |
 | RK-05 | #1457 and F4 claim one minor (PM-8) | 2 | 2 | 4 MED | the second to merge | the number is read at merge; goldens regenerated after rebase |
-| RK-06 | #1474 has not landed, so `refreshed` notices cannot reach the panel | 2 | 2 | 4 MED | implementer | Rust fields first; `captured`'s collision line does not wait |
+| RK-06 | #1474 has not landed, so `refreshed` notices cannot reach the panel | 2 | 2 | 4 MED | implementer | Rust fields first; `captured`'s collision line does not wait (retired 2026-11-03: no completed capture creates a collision, § 12.3 C-8; the refusal tags do not wait on #1474 either) |
 | RK-07 | F7's walk never happens | 2 | 2 | 4 MED | operator | MET-R-001's gate; one walk serves #1020, #1542 and #1546 |
 | RK-08 | F4 overruns | 2 | 2 | 4 MED | implementer | separate items (§ 4), the decision-free ones first; the other features land alone |
 | RK-09 | a shared-path change breaks the uncompiled Linux build (PM-20) | 2 | 2 | 4 MED | implementer | no platform call added; G-LINUX |
