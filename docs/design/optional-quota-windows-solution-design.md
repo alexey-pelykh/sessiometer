@@ -454,7 +454,7 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   before `write_rollup` and `write_samples` at `src/usage_store.rs:543-544`); the daemon discards that error
   (`if let Ok(summary) = compact_and_roll(…)` at `src/daemon.rs:894`, no `else`), stops compacting without
   a word, rewrites nothing and erases no `null` line — a stall of that store's compaction, which ends
-  when a #1598+ build runs again, while the older binary's own compaction never resumes. An older
+  when a #1598+ build runs again; residual (4) below covers the older binary's own compaction. An older
   `stats` or `reliability` only reads and deletes nothing: `stats` **loudly** refuses every fenced
   rollup with `UsageRollupMalformed` ("malformed usage rollup"), whatever its buckets hold, and
   `reliability`, which never reads the rollup, leaves the `null` lines out of its report in silence.
@@ -465,9 +465,10 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   deploy appends, then compacts and writes the fence, so only a failed first pass leaves lines
   unfenced, for up to one compaction cadence, an hour; (2) a rollup deleted or moved by hand, after
   which an older build reads the store as new and its compaction erases every `null` line — C6 says
-  the store files are never deleted or moved; (3) `reliability`'s silent omission of `null` lines from
-  its report; (4) on each machine that has run #1598, every pre-#1598 build's own `stats` and
-  compaction stopping for good — the loud failure the fence exists for. Loud is the better failure.
+  the store files are never deleted or moved; (3) an older `reliability`'s silent omission of `null`
+  lines from its report; (4) every pre-#1598 build's own `stats` and compaction, stopped for good on
+  each machine that has run #1598. That stop is the loud failure the fence exists for, and only its
+  `stats` half is loud: an older daemon's compaction stops in silence, as above. Loud is the better failure.
   The D6/D13 council ruling of 2026-11-02
   (a comment on #1598) ratified this representation and amended it with a **rollup fence** #1598 builds —
   `usage-rollup.json` becomes `{"format":2,"rollup":{…}}`, which every pre-#1598 build fails to read, so
@@ -636,7 +637,7 @@ it moved no `STATUS_SCHEMA_VERSION` minor and had no track structure. The contra
 | `status` reply, tranche 0 (hot-fix #1613, `1.14`) | `session_pct: 0` beside present weekly fields for a served weekly-only reading, with no session reset stamp; no sample line is written for it (§ 1b) | none | none — replaced by the transitional row below at tranche 1's deploy |
 | `status` reply, transitional (`1.14`) | `session_pct: null` beside present weekly fields for a served weekly-only reading; no `blind_active` block for a weekly-only blind active; no `recent_blind_preempt_swap` notice for a `Retry-After` swap off a session-less anchor; doc comment amended | none | none — retired by the row above |
 | `stats --json` | `accounts[*].session`, `band`, `cap_hits` and `time_at_cap_secs` omittable (AD-13); in the same bump #1601 also makes `accounts[*].weekly` omittable (the weekly symmetry) and `velocity.session_pct_per_min` nullable, so a weekly-only account's weekly rate and runway reach the wire — both widenings pipeline-recommended, ratification-pending | `JSON_SCHEMA_VERSION` 1 → 2 | `wire-stats-basic.json` regenerated; the Swift `StatsWire` mirror optional for every omittable key; `statsBasic` fixture at schema 2 |
-| sample line `usage-samples.jsonl` | `"session":null` / `"weekly":null` written; the key never omitted | none (versionless) | readers tolerant; the rollup fence (next row) is what keeps a pre-#1598 compaction from rewriting this file, because a pre-#1598 `Sample` refuses `null` and its compaction rewrites the file from what it decoded; deploy order (B-12) |
+| sample line `usage-samples.jsonl` | `"session":null` / `"weekly":null` written; the key never omitted | none (versionless) | readers tolerant; a pre-#1598 build's `Sample` refuses `null`, and its compaction rewrites this file from what it decoded; the rollup fence (the rollup tiers row) stops that compaction before the rewrite; deploy order (B-12) |
 | rollup tiers `usage-rollup.json` | per-axis `HourStat`/`DayStat` omitted when the bucket has no reading on that axis; every present `HourStat`/`DayStat` records `samples: Option<u32>`, the number of samples it covers (D13 as ruled) | store generation 1 → 2 under #1598's `ROLLUP_FORMAT`: `usage-rollup.json` is written as `{"format":2,"rollup":{…}}`; a file with no `format` key reads as the legacy generation 1; every pre-#1598 build refuses the envelope before it rewrites either store file | deploy order (B-12) |
 | event log lines | per-window tokens omitted when the window is absent | none for `log` (`JSON_SCHEMA_VERSION` at `src/log.rs:167`); `reliability` (`JSON_SCHEMA_VERSION` at `src/reliability.rs:264`) moves 13 → 14 for the census's `n_without_session_window` | `reliability` parsers tolerate the absent token; the census keeps its exact partition |
 | `log --json` | unchanged: records carry the line's own tokens (`LogWire` at `src/log.rs:865`), so an omitted token reshapes nothing | none (`JSON_SCHEMA_VERSION` at `src/log.rs:167` stays 2) | — |
