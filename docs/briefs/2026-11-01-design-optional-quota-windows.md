@@ -58,8 +58,19 @@ orchestrator on the operator's behalf, and the design is carried as provisional.
    and **author-chosen**: `Sample.weekly` takes the same shape because the writer is compiler-forced
    to decide the weekly axis too (AD-10 / D12).
 10. **Rollup tiers carry per-axis `Option<HourStat>` / `Option<DayStat>`, omitted when no sample in
-    the bucket carried that window**, so the fold never reaches `-∞`; counts stay counts. Stated
-    asymmetry: an older *daemon* drops a raw `null` line silently and erases it on compaction, while an older `stats` refuses such a rollup loudly and deletes nothing — **author-chosen** (AD-11 / D13), settled by council on 2026-11-02: ratified and amended with a per-axis `samples` count (#1610 absorbed into #1598).
+    the bucket carried that window**, so the fold never reaches `-∞`; counts stay counts. Settled by
+    council on 2026-11-02 (AD-11 / D13): ratified and amended with a per-axis `samples` count (#1610
+    absorbed into #1598). Version skew under the rollup fence, the format-2 envelope
+    (`{"format":2,"rollup":{…}}`) that a #1598 build writes to `usage-rollup.json` from its first
+    compaction: on a store a #1598 build has compacted, an older *daemon* fails to read that envelope,
+    so its compaction stalls before it rewrites either store file and erases no `null` line. The stall
+    is silent, because the daemon discards the compaction error, and it ends when a #1598+ build runs
+    again. An older `stats` refuses every fenced rollup loudly and deletes nothing. An older
+    `reliability` leaves `null` lines out of its report and deletes nothing. The ruling accepts four
+    residuals, and an older daemon erases `null` lines in only the first two: (1) lines appended
+    before the first fenced write; (2) a rollup deleted or moved by hand; (3) an older `reliability`'s
+    report that leaves `null` lines out; (4) every pre-#1598 build's own `stats` and compaction,
+    stopped for good on each machine that has run #1598.
 11. **`stats` excludes an absent window from every session figure and from the census (D5)**; on its wire `session`, `band` and the session-cap counts `cap_hits` / `time_at_cap_secs` become omittable under `JSON_SCHEMA_VERSION` 1 → 2 — and in the same bump `weekly` (the weekly symmetry) and a `velocity` object emitted when either axis has a rate, with a nullable session rate — Swift's
     `StatsDim` goes optional, the one golden is regenerated, and the CLI table reuses its own `—` UNKNOWN sentinel for the session, signal, velocity, runway and cap columns (it then does not distinguish no-window from never-observed; only the wire does). Field set **author-chosen** (AD-13); whether the wire half rides in tranche 1
     is OAD-3 / D8 (recommendation: ride first — small cost, no queue contention).
@@ -72,7 +83,7 @@ orchestrator on the operator's behalf, and the design is carried as provisional.
     an `**Amended**` paragraph, update the README row) in their own pull request first, the parser doc rewritten in the commit that moves the test it governs, the HQ
     `REQ-USG-B-001` amendment recorded as owed by the operator (AD-19); the warm-up design's C-1
     reads two states from the fraction and the stamp (AD-20); the daemon-replacement runbook gains
-    the both-halves rule and a fleet recovery check (AD-21); that text is #1603, now in tranche 2 and landing after the deploy (AD-23).
+    the no-older-daemon rule and a fleet recovery check (AD-21); that text is #1603, now in tranche 2 and landing after the deploy (AD-23).
 15. **Open-PR composition**: this design lands first and #1537 rebases (its D9 stays its own); S6 takes the next free minor relative to #1588; #1538 composes on the blind seam — **author-chosen**: the landing order of another author's open PR is the operator's call, so this is a recommendation, not an order (AD-22).
 16. **A hot-fix comes first, then the tranche order is the cut order reversed** (AD-23; decided by the
     maintainer on 2026-11-01). **Tranche 0** is the hot-fix #1613, outside the twelve blocks: it serves a
@@ -129,7 +140,7 @@ the design applied, so Stage 3 can proceed on the default and the operator can o
   half built); the arming half is OAD-2 for the operator.
 - **D4 — the near-limit band**: default session-only, reads false on an absent session, with a test.
 - **D5 — ADR-0033's census**: default excludes a structurally absent window.
-- **D6 — version skew on the store**: settled by council on 2026-11-02 (a comment on #1598): `null` ratified, amended with a rollup fence #1598 builds and the rule that no pre-#1598 daemon runs against the store after its first `null` line; the residual (an older daemon's silent erasure, an older `stats`' loud refusal) is stated.
+- **D6 — version skew on the store**: settled by council on 2026-11-02 (a comment on #1598): `null` ratified, amended with a rollup fence #1598 builds and the rule that no pre-#1598 daemon runs against the store after its first `null` line. Under the fence an older daemon stalls silently instead of erasing, and an older `stats` refuses the fenced rollup loudly. The ruling accepts four residuals: (1) lines appended before the first fenced write; (2) a rollup deleted or moved by hand; (3) an older `reliability`'s report that leaves `null` lines out; (4) every pre-#1598 build's own `stats` and compaction, stopped for good on each machine that has run #1598. Residuals (1) and (2) are the only cases where an older daemon still erases `null` lines.
 - **D7 — the velocity tie-break on an absent EMA**: default `0.0`, the existing "safest landing"
   rule, watched by `MET-R-001`.
 - **D8 — when the `stats` wire half lands**: OAD-3 recommends tranche 1; the operator decides because it moves the appetite in PRD § 3.1 and puts the first Swift edit and a `stats` schema bump on the urgent path — ratify D8 and OAD-3 as one question.
