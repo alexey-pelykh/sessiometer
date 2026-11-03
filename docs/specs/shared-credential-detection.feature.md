@@ -15,8 +15,8 @@ Example Mapping: 🟦 5 rules · 🟩 52 examples · 🟥 2 open
 > before the fix. The examples without one say "No pre-authored oracle" where they occur: the import
 > examples that depend on how `import` derives the set of entries it wrote (the item leaves that shape
 > open), the order of lines in the CLI reply and in the import report, the example that judges
-> ambiguity on the roster after the write, the template examples (their module is created by whichever
-> of #1556 and #1557 lands first), and the swap-lock example (no acceptance criterion owes it a RED).
+> ambiguity on the roster after the write, the template examples (their module is #1556's to create, the scope
+> brief's `shared-piece-owners`), and the swap-lock example (no acceptance criterion owes it a RED).
 >
 > **Calls this stub makes.** Each waits for ratification and none is the operator's decision.
 > - The PRD's questions DQ-5 and DQ-6 stand as design D-4 answers them: no start-up sweep, and both
