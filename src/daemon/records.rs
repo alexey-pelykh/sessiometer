@@ -465,7 +465,11 @@ impl CredentialReadSource {
 /// - `!quarantined` — a DEAD (#42) blind active belongs to the `emergency_swap` path, not bounded
 ///   blindness; ADR-0017 keeps the two separate, so a quarantined active is excluded, AND
 /// - a retained anchor exists (`anchor.last_good` is `Some`, #450) — never a spurious projection on a
-///   genuinely-unknown account with no reading to key off.
+///   genuinely-unknown account with no reading to key off, AND
+/// - that anchor's SESSION window applies (`anchor.session` is `Some`, issue #1602): under
+///   `STATUS_SCHEMA_VERSION` `1.14` the block's `last_known_session_pct` is a `u8` that cannot say
+///   "none", so a weekly-only blind active emits no block rather than a fabricated `0` (D10's
+///   transitional default; the status-wire item #1599 lifts the field and restores the block).
 ///
 /// `auto_protection_degraded` is `true` when ANY of THREE arms is active on this blind account:
 /// - the ANCHOR arm ([`blind_gate_armed`] — the SAME arming test
@@ -507,6 +511,14 @@ pub(super) fn blind_active_view(
     // Bind the mark BEFORE the anchor is shadowed to its inner `LastGood` below.
     let high_water = anchor.high_water;
     let anchor = anchor.last_good?;
+    // Issue #1602 (D10, the transitional `STATUS_SCHEMA_VERSION` `1.14` state): an anchor whose
+    // session window does not APPLY (`session: None` — a weekly-only account) emits NO block. The
+    // wire's `last_known_session_pct` is a `u8` under this minor and cannot say "none", and a `0`
+    // there would be the fabrication this item forbids — byte-identical to a measured idle window.
+    // Until the status-wire item (#1599) lifts that field, such an account reads as a plain
+    // failed-poll row; the session gate below reads false on it in its own right
+    // (`blind_gate_armed` on a `None`), so `status` claims no auto-protection on its strength.
+    let anchor_session = anchor.session?;
     let blind_secs = at.saturating_duration_since(anchor.at).as_secs();
     // Issue #619: the anchor ARM decides on the anchor's PLAUSIBLE session (raised to the frozen
     // high-water mark when the pre-blind reading was stale-low), the SAME value `blind_swap` /
@@ -520,7 +532,7 @@ pub(super) fn blind_active_view(
     let gate_session = swap::plausible_anchor_session(high_water, anchor.session);
     Some(BlindActive {
         blind_secs,
-        last_known_session_pct: to_pct(anchor.session),
+        last_known_session_pct: to_pct(anchor_session),
         auto_protection_degraded: blind_gate_armed(blind_secs, gate_session)
             || (blind_secs > BLIND_GATE_SECS && server_retry_after_hold)
             || blind_velocity_projected_armed(blind_secs, gate_session, velocity, session_ceiling),
@@ -794,19 +806,29 @@ mod tests {
             samples: MIN_VELOCITY_SAMPLES,
         });
         assert!(
-            blind_velocity_projected_armed(1000, 0.50, near_miss_vel, trigger),
+            blind_velocity_projected_armed(1000, Some(0.50), near_miss_vel, trigger),
             "the bias-HIGH inflation bound catches a near-miss the point estimate would clear (issue #584)",
         );
 
         // Negatives — the arm never trips on:
         //   * a missing velocity signal (a first/failed poll, or a window-drop reset),
-        assert!(!blind_velocity_projected_armed(1380, 0.29, None, trigger));
+        assert!(!blind_velocity_projected_armed(
+            1380,
+            Some(0.29),
+            None,
+            trigger
+        ));
         //   * an UNSUSTAINED single-interval spike (samples < MIN_VELOCITY_SAMPLES), however steep,
         let spike = Some(VelocityEma {
             rate: 0.01,
             samples: MIN_VELOCITY_SAMPLES - 1,
         });
-        assert!(!blind_velocity_projected_armed(1380, 0.29, spike, trigger));
+        assert!(!blind_velocity_projected_armed(
+            1380,
+            Some(0.29),
+            spike,
+            trigger
+        ));
         //   * exactly T — the strict `>` floor shared with the anchor + server arms — even for a rate
         //     steep enough to cross past it (armed one second later),
         let fast = Some(VelocityEma {
@@ -815,13 +837,13 @@ mod tests {
         });
         assert!(!blind_velocity_projected_armed(
             BLIND_GATE_SECS,
-            0.29,
+            Some(0.29),
             fast,
             trigger
         ));
         assert!(blind_velocity_projected_armed(
             BLIND_GATE_SECS + 1,
-            0.29,
+            Some(0.29),
             fast,
             trigger
         ));
@@ -830,7 +852,12 @@ mod tests {
             rate: 0.00001,
             samples: MIN_VELOCITY_SAMPLES,
         });
-        assert!(!blind_velocity_projected_armed(1380, 0.29, crawl, trigger));
+        assert!(!blind_velocity_projected_armed(
+            1380,
+            Some(0.29),
+            crawl,
+            trigger
+        ));
     }
 
     #[test]
@@ -1000,7 +1027,7 @@ mod tests {
         assert!(
             !blind_gate_armed(
                 past_t.saturating_duration_since(base).as_secs(),
-                swap::plausible_anchor_session(mark, stale_low.session.expect("session window present")),
+                swap::plausible_anchor_session(mark, stale_low.session),
             ),
             "fixture guard: the corrected anchor stays below the band, so the anchor arm is disarmed",
         );
@@ -1010,5 +1037,56 @@ mod tests {
             to_pct(stale_low.session.expect("session window present")),
             "the displayed last-known % is the raw anchor, never the synthesized correction",
         );
+    }
+
+    #[test]
+    fn blind_active_view_emits_no_block_for_a_weekly_only_blind_active_until_the_wire_can_say_so() {
+        // Issue #1602 (row 7; D10's transitional default under `STATUS_SCHEMA_VERSION` `1.14`): the
+        // block's `last_known_session_pct` is a `u8` that cannot say "none", so a blind active whose
+        // retained anchor has NO session window emits no block at all — never one carrying a
+        // fabricated `0`, byte-identical to a measured idle window (mutant M-c). Blind past
+        // `BLIND_GATE_SECS`, with or without a server hold or a retained velocity, the projection is
+        // `None`; the status-wire item #1599 lifts the field and restores the block (its percent
+        // omitted, `auto_protection_degraded: true` — the fourth, status-only arm).
+        let base = Instant::now();
+        let weekly_only = AnchorArmInputs {
+            last_good: Some(LastGood {
+                session: None,
+                weekly: Some(0.30),
+                at: base,
+            }),
+            high_water: None,
+        };
+        let past_t = base + Duration::from_secs(BLIND_GATE_SECS + 1);
+        assert!(
+            blind_active_view(weekly_only, true, false, false, None, 0.95, past_t).is_none(),
+            "an anchor without a session window projects no block under the 1.14 wire",
+        );
+        assert!(
+            blind_active_view(weekly_only, true, false, true, None, 0.95, past_t).is_none(),
+            "…even blind behind a server hold: the block cannot carry a session percent it lacks",
+        );
+        let climbing = Some(VelocityEma {
+            rate: 0.01,
+            samples: 3,
+        });
+        assert!(
+            blind_active_view(weekly_only, true, false, false, climbing, 0.95, past_t).is_none(),
+            "…and a retained velocity has no session anchor to project from",
+        );
+        // Control: the same episode with a session window projects the block, degraded — so the
+        // `None` above is the absent window's, not the fixture's.
+        let two_window = AnchorArmInputs {
+            last_good: Some(LastGood {
+                session: Some(0.70),
+                weekly: Some(0.30),
+                at: base,
+            }),
+            high_water: None,
+        };
+        let block = blind_active_view(two_window, true, false, false, None, 0.95, past_t)
+            .expect("an anchor with a session window still projects");
+        assert_eq!(block.last_known_session_pct, 70);
+        assert!(block.auto_protection_degraded);
     }
 }

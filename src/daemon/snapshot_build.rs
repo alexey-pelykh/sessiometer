@@ -436,8 +436,14 @@ where
                     // line the swap + `use` gates use — so "weekly exhausted" means exactly
                     // "the daemon will not rotate onto this", with no band in which the UI
                     // reports an account usable while the daemon refuses it.
-                    weekly_exhausted: readings[i]
-                        .is_some_and(|usage| usage.weekly >= self.weekly_rotation_line()),
+                    // Issue #1602: read from the WEEKLY window alone — an account whose reply
+                    // carries no weekly window (`None`) has no line to exhaust and is never
+                    // `weekly_exhausted` (AD-4b); a weekly-only account is judged exactly as before.
+                    weekly_exhausted: readings[i].is_some_and(|usage| {
+                        usage
+                            .weekly
+                            .is_some_and(|weekly| weekly >= self.weekly_rotation_line())
+                    }),
                     usage: readings[i],
                     // The credential clocks + the daemon-computed 5-state rollup (issue
                     // #119), projected from this account's carried health state. The
@@ -5652,6 +5658,67 @@ mod tests {
         assert_eq!(
             daemon.next_swap(Some(0), &[usage(0.97, 0.40), None, None]),
             Some(NextSwap::AwaitingData),
+        );
+    }
+
+    #[tokio::test]
+    async fn status_response_marks_weekly_exhausted_from_the_weekly_window_alone() {
+        // Issue #1602 (row 13, AD-4b): the per-account `weekly_exhausted` verdict reads the WEEKLY
+        // window alone, and only where the reading has one — a weekly-only account is judged on
+        // its weekly line exactly as before (exhausted at 0.98 ≥ the 0.97 rotation line, not at
+        // 0.50), and a weekly-less account has no line to exhaust, so it is never marked. Mutant
+        // M-u (a `1.0` default) marks the weekly-less account.
+        let daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let two_window = Some(Usage {
+            session: Some(0.50),
+            weekly: Some(0.40),
+            weekly_resets_at: None,
+            session_resets_at: None,
+        });
+        let weekly_only = |weekly: f64| {
+            Some(Usage {
+                session: None,
+                weekly: Some(weekly),
+                weekly_resets_at: None,
+                session_resets_at: None,
+            })
+        };
+        let weekly_less = Some(Usage {
+            session: Some(0.40),
+            weekly: None,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        });
+
+        // work active, spare weekly-only over the line, backup weekly-less.
+        let snap = daemon.snapshot(Some(0), &[two_window, weekly_only(0.98), weekly_less], 0);
+        assert!(
+            snap.accounts[1].weekly_exhausted,
+            "a weekly-only account over the line is weekly-exhausted",
+        );
+        assert!(
+            !snap.accounts[2].weekly_exhausted,
+            "a weekly-less account is never weekly-exhausted (AD-4b)",
+        );
+        assert!(!snap.accounts[0].weekly_exhausted);
+        // The wire carries exactly those verdicts: one `true` (the spare), two `false`.
+        let json = serde_json::to_string(&status_response(&snap)).unwrap();
+        assert_eq!(
+            json.matches("\"weekly_exhausted\":true").count(),
+            1,
+            "{json}"
+        );
+        assert_eq!(
+            json.matches("\"weekly_exhausted\":false").count(),
+            2,
+            "{json}"
+        );
+
+        // The same weekly-only account below the line is not exhausted.
+        let below = daemon.snapshot(Some(0), &[two_window, weekly_only(0.50), weekly_less], 0);
+        assert!(
+            !below.accounts[1].weekly_exhausted,
+            "a weekly-only account below the line keeps its headroom",
         );
     }
 }

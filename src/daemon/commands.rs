@@ -143,9 +143,16 @@ where
         // Issue #607: the ROTATION line, not the raw ceiling — otherwise this re-validation accepts
         // a target in the `[ceiling − margin, ceiling)` band that `decide` swaps away from on the
         // next tick, i.e. an operator `use` that silently undoes itself moments later.
+        // Issue #1602: the weekly axis alone, read only where the cached reading HAS one — a
+        // weekly-less reading (no weekly window) is never exhausted (AD-4b); a weekly-only one is
+        // judged on its weekly line exactly as before.
         let weekly_exhausted = self.state.accounts[target_idx]
             .last_reading
-            .is_some_and(|usage| usage.weekly >= self.weekly_rotation_line());
+            .is_some_and(|usage| {
+                usage
+                    .weekly
+                    .is_some_and(|weekly| weekly >= self.weekly_rotation_line())
+            });
         let in_cooldown = self
             .state
             .last_swap
@@ -215,13 +222,14 @@ where
                             let to = self.roster[target_idx].label.clone();
                             // The SAME durable `Event::Swap` the standalone `use` emits (issue #9),
                             // so the log-derived cooldown agrees whichever path wrote. `session_pct`
-                            // = 0: a manual/forced swap is not session-triggered (the reason
-                            // distinguishes it). Non-secret handles only (issue #15).
+                            // = `Some(0)`: a manual/forced swap is not session-triggered (the reason
+                            // distinguishes it) — a documented sentinel, never an absent window
+                            // (issue #1602 leaves it as is). Non-secret handles only (issue #15).
                             events.push(Event::Swap {
                                 from: from.clone(),
                                 to: to.clone(),
                                 reason,
-                                session_pct: 0,
+                                session_pct: Some(0),
                                 // Manual / forced swap: operator-driven, not a projection (#634).
                                 projection: None,
                             });
@@ -1405,7 +1413,7 @@ mod tests {
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
                 reason: SwapReason::Manual,
-                session_pct: 0,
+                session_pct: Some(0),
                 projection: None,
             }]
         );
@@ -1496,7 +1504,7 @@ mod tests {
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
                 reason: SwapReason::Forced,
-                session_pct: 0,
+                session_pct: Some(0),
                 projection: None,
             }]
         );
@@ -6383,5 +6391,94 @@ mod tests {
             logged.contains("event=credential_health account=spare state=healthy"),
             "spare verified healthy once polled after the swap (#137): {logged:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn use_gate_reads_the_weekly_verdict_from_a_weekly_only_cached_reading() {
+        // Issue #1602 (row 10, AD-4b): the daemon-routed `use` re-validation reads the cached
+        // reading's WEEKLY axis alone, and only where the reading has one — a weekly-only reading
+        // is judged on its weekly line exactly as a two-window one (exhausted at 0.98 ≥ the 0.97
+        // rotation line, viable at 0.50), and a weekly-less reading (no weekly window, session
+        // 0.40) is never exhausted. Mutant M-w (a `1.0` default) rejects the weekly-less arm.
+        async fn gate_daemon(spare: Usage) -> FakeDaemon {
+            let mut daemon = lifecycle_daemon_with(
+                FakeRosterPoller::new()
+                    .ok("u-A", 0.10, 0.10)
+                    .ok_reading("u-B", spare),
+                tunables(95, 80, 0),
+            )
+            .await;
+            warmed_tick(&mut daemon).await;
+            assert_eq!(daemon.state.active, Some(0));
+            assert_eq!(
+                daemon.state.accounts[1].last_reading,
+                Some(spare),
+                "fixture: the cached reading is the scripted one",
+            );
+            daemon
+        }
+        let spare = SwapCommand {
+            target: "spare".to_owned(),
+            force: false,
+        };
+        let weekly_only = |weekly: f64| Usage {
+            session: None,
+            weekly: Some(weekly),
+            weekly_resets_at: None,
+            session_resets_at: None,
+        };
+
+        // Weekly-only at/over the rotation line → weekly-exhausted → refused, ZERO writes.
+        let mut daemon = gate_daemon(weekly_only(0.98)).await;
+        let (ack, events) = daemon.perform_socket_swap(&spare).await;
+        assert_eq!(
+            ack,
+            SwapAck::Rejected {
+                reason: SwapRejection::WeeklyExhausted,
+            },
+            "a weekly-only cached reading at the line is weekly-exhausted",
+        );
+        assert!(events.is_empty(), "a refused swap emits no event");
+        assert!(
+            daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token")),
+            "the refused swap wrote nothing",
+        );
+
+        // Weekly-only below the line → viable → the swap proceeds.
+        let mut daemon = gate_daemon(weekly_only(0.50)).await;
+        let (ack, _) = daemon.perform_socket_swap(&spare).await;
+        assert_eq!(
+            ack,
+            SwapAck::Accepted {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+            },
+            "a weekly-only cached reading below the line is viable",
+        );
+        assert_eq!(daemon.state.active, Some(1));
+
+        // Weekly-less (no weekly window) → never weekly-exhausted → the swap proceeds.
+        let mut daemon = gate_daemon(Usage {
+            session: Some(0.40),
+            weekly: None,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        })
+        .await;
+        let (ack, _) = daemon.perform_socket_swap(&spare).await;
+        assert_eq!(
+            ack,
+            SwapAck::Accepted {
+                from: "work".to_owned(),
+                to: "spare".to_owned(),
+            },
+            "a weekly-less cached reading has no line to exhaust (AD-4b)",
+        );
+        assert_eq!(daemon.state.active, Some(1));
     }
 }

@@ -413,7 +413,13 @@ async fn poll_viability<P: RosterPoller>(
         // Only the weekly dimension of the reading drives the viability verdict; the
         // sample-only fields on the `PolledReading` are irrelevant here (this is the
         // one-shot `use`-command probe, not the daemon's sampling poll loop).
-        Ok(reading) if reading.usage.weekly >= weekly_ceiling => Ok(Viability::WeeklyExhausted),
+        // Issue #1602: the verdict reads the weekly window only where the reading HAS one. A
+        // weekly-only reading (its session window absent) is judged on its weekly line exactly as
+        // a two-window one; a weekly-less reading has no line to exhaust and is `Viable` (AD-4b) —
+        // never an abort, never a fabricated `0`.
+        Ok(reading) if reading.usage.weekly.is_some_and(|w| w >= weekly_ceiling) => {
+            Ok(Viability::WeeklyExhausted)
+        }
         Ok(_) => Ok(Viability::Viable),
         // A dead stored token: the daemon-independent "quarantined / needs re-login"
         // signal (#42). 401 (rejected) and 403 (missing usage scope) both mean the
@@ -927,15 +933,16 @@ where
     };
 
     // 4. Emit the standard structured event (#9) — the durable record that also updates
-    //    `last_swap` — with the manual / forced reason. `session_pct=0`: a manual swap is
-    //    not session-triggered (the reason distinguishes it). Sourced from non-secret
+    //    `last_swap` — with the manual / forced reason. `session_pct=0` (`Some(0)`): a manual
+    //    swap is not session-triggered (the reason distinguishes it) — a documented sentinel,
+    //    never an absent window (issue #1602 leaves it as is). Sourced from non-secret
     //    handles only (issue #15); for an adopt recovery with an unknown outgoing, `from`
     //    is the non-secret `(unknown)` sentinel.
     log.emit(&Event::Swap {
         from: from_label.clone(),
         to: target_label.clone(),
         reason,
-        session_pct: 0,
+        session_pct: Some(0),
         // Manual / forced (or adopt-recovery) swap: not a projection-driven decision (issue #634).
         projection: None,
     })?;
@@ -1337,6 +1344,12 @@ mod tests {
         /// A live poll whose weekly fraction is the payload (below trigger ⇒ viable,
         /// at/above ⇒ weekly-exhausted).
         Live { weekly: f64 },
+        /// A live poll whose reply carries NO session window (issue #1602): `weekly` present,
+        /// `session: None` with no reset stamp — the weekly-only account.
+        LiveWithoutASessionWindow { weekly: f64 },
+        /// The mirror (AD-4b): a live poll whose reply carries NO weekly window — `session`
+        /// present, `weekly: None` with no reset stamp.
+        LiveWithoutAWeeklyWindow { session: f64 },
         /// A dead credential — `401` (rejected) ⇒ quarantined / needs re-login.
         Dead,
         /// A dead credential — `403` (missing usage scope) ⇒ also quarantined.
@@ -1373,6 +1386,24 @@ mod tests {
                     usage: Usage {
                         session: Some(0.10),
                         weekly: Some(weekly),
+                        weekly_resets_at: None,
+                        session_resets_at: None,
+                    },
+                    severity: None,
+                }),
+                Probe::LiveWithoutASessionWindow { weekly } => Ok(PolledReading {
+                    usage: Usage {
+                        session: None,
+                        weekly: Some(weekly),
+                        weekly_resets_at: None,
+                        session_resets_at: None,
+                    },
+                    severity: None,
+                }),
+                Probe::LiveWithoutAWeeklyWindow { session } => Ok(PolledReading {
+                    usage: Usage {
+                        session: Some(session),
+                        weekly: None,
                         weekly_resets_at: None,
                         session_resets_at: None,
                     },
@@ -7808,5 +7839,52 @@ mod tests {
             log.contains("event=canary_online_probe verdict=inconclusive refused=true"),
             "the refusal is on the record: {log}"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_viability_serves_the_weekly_verdict_for_a_weekly_only_reading() {
+        // Issue #1602 (row 10): a `use` without `--force` onto a weekly-only account reads the
+        // weekly verdict off the served reading — `WeeklyExhausted` at/over the line, `Viable`
+        // below it — and never aborts: the reply is served (issue #1596), not a `UsageParse`. The
+        // first BUT NOT of AC-9: mutant M-z gates the weekly line on a session window being present,
+        // so a weekly-only reading at 0.98 would fall through to `Viable`.
+        let account = acct("spare", "u-B");
+        let trigger = 0.98;
+        let exhausted = poll_viability(
+            &FakePoller::new(Probe::LiveWithoutASessionWindow { weekly: 0.98 }),
+            &account,
+            trigger,
+        )
+        .await;
+        assert_eq!(
+            exhausted.unwrap(),
+            Viability::WeeklyExhausted,
+            "a weekly-only reading at the line is weekly-exhausted — the weekly gate is not bypassed",
+        );
+        let viable = poll_viability(
+            &FakePoller::new(Probe::LiveWithoutASessionWindow { weekly: 0.50 }),
+            &account,
+            trigger,
+        )
+        .await;
+        assert_eq!(
+            viable.unwrap(),
+            Viability::Viable,
+            "a weekly-only reading below the line is viable",
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_viability_reads_a_weekly_less_reading_as_viable() {
+        // Issue #1602 (row 10, AD-4b): a reading whose reply carries no WEEKLY window has no line
+        // to exhaust, so the verdict is `Viable` — never `WeeklyExhausted` off a `1.0` standing in
+        // for the missing window (mutant M-r), and never a new `Unknown` verdict.
+        let viable = poll_viability(
+            &FakePoller::new(Probe::LiveWithoutAWeeklyWindow { session: 0.10 }),
+            &acct("spare", "u-B"),
+            0.98,
+        )
+        .await;
+        assert_eq!(viable.unwrap(), Viability::Viable);
     }
 }

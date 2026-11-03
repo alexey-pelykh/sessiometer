@@ -41,8 +41,8 @@ use super::*;
 /// SOMETHING viable), whereas [`all_exhausted_relief`] excludes an unknown reset
 /// outright (the hold then omits a timestamp). They also differ on DIMENSION, and
 /// deliberately: this fn ranks the WEEKLY reset alone — a viable target has by
-/// definition already cleared the session gate — whereas the hold spans BOTH windows,
-/// since every spare it ranks is blocked on at least one of them (issue #665).
+/// definition already cleared the session gate — whereas the hold spans every window the
+/// account has, since every spare it ranks is blocked on at least one of them (issue #665).
 /// The viability FILTER is unchanged; only the choice AMONG viable accounts changed.
 ///
 /// Three exclusions are load-bearing; two are the symmetric anti-thrash guards.
@@ -59,13 +59,20 @@ use super::*;
 /// exactly such a target, producing an indefinite session ping-pong between the two
 /// soonest-reset accounts. The `session < session_ceiling` filter closes that: the
 /// acquire predicate is now at least as strict as the negation of the release
-/// predicate on BOTH dimensions. It is unconditional, distinct from `floor` — a
+/// predicate on every dimension the account has. It is unconditional, distinct from `floor` — a
 /// STRICTER reserve layered on top (effective ceiling `min(session_ceiling, floor)`)
 /// which the PROACTIVE caller passes (default 80, #398) and the EMERGENCY caller
 /// drops (`None`) so a dead active always escapes. The disabled exclusion (#36): a parked account
 /// is never a destination even with ample headroom, and — being excluded here
 /// rather than relying on its (skipped) poll — it can never hold the daemon out of
 /// the #11 terminal state.
+///
+/// Every gate reads only a window the account HAS (issue #1602): a window the reply does not
+/// carry is `None`, never a fabricated `0`, and PASSES its gate vacuously (`is_none_or`). So a
+/// weekly-only spare is judged on its weekly line alone and a weekly-less spare on its session
+/// gates alone (the symmetric rule, AD-4b); a window that is present is read exactly as before.
+/// The `filter_map` that drops a FAILED poll and the soonest-reset `min_by` are untouched — a
+/// weekly-less spare ranks as one with no known reset.
 pub(crate) fn pick_target(
     active: usize,
     readings: &[Option<Usage>],
@@ -99,8 +106,8 @@ pub(crate) fn pick_target(
 #[derive(Clone, Copy)]
 pub(crate) struct SelectionTiebreak<'a> {
     /// Per-account carried runtime state (issue #668), indexed in lockstep with `readings` — the
-    /// tie-break reads its retained session-velocity EMA (issue #539). `&[]` — or any absent slot —
-    /// reads as "no observed climb" (see [`velocity_rate`]).
+    /// tie-break reads its retained session-velocity EMA (issue #539) beside the reading itself.
+    /// `&[]` — or any absent slot — reads as "no observed climb", `None` (see [`observed_climb`]).
     pub(super) accounts: &'a [AccountRuntime],
     /// The per-daemon selection seed (see [`Daemon::tiebreak_seed`]). `Some` activates BOTH enhanced
     /// axes (velocity preference, then per-daemon jitter); `None` degrades selection to exactly the
@@ -132,20 +139,28 @@ pub(crate) fn pick_target_ranked(
     .map(|(i, _)| i)
 }
 
-/// The retained session-velocity EMA rate (issue #612) for roster account `idx`, or `0.0` when there
-/// is no TRUSTED signal — the slot is absent (`None`, or an out-of-range / empty slice, as the
-/// un-jittered projection passes `&[]`), OR its EMA is not yet SUSTAINED
-/// ([`samples`](VelocityEma::samples) `< MIN_VELOCITY_SAMPLES`). Gating on sustained-ness mirrors the
-/// #539 projective trigger: a single-sample spike is noise, so it reads as "no observed climb"
-/// rather than deprioritising a target on one unstable interval. A missing/untrusted signal thus
-/// treats an un-warmed or just-reset account as the safest (lowest-velocity) landing rather than
-/// penalising it for lack of data. See [`VelocityEma`].
-fn velocity_rate(accounts: &[AccountRuntime], idx: usize) -> f64 {
-    accounts
-        .get(idx)
-        .and_then(|account| account.session_velocity)
-        .filter(|v| v.samples >= MIN_VELOCITY_SAMPLES)
-        .map_or(0.0, |v| v.rate)
+/// The velocity tie-break key (issue #612; issue #1602, D7 as ruled) for roster account `idx`:
+/// `Some(rate)` for an OBSERVED session climb, `None` for no observed climb. It is `None` when the
+/// account's reading carries no session window (`usage.session` is `None` — a weekly-only spare,
+/// whose session axis the tie-break passes vacuously), when there is no TRUSTED signal — the slot
+/// is absent (`None`, or an out-of-range / empty slice, as the un-jittered projection passes `&[]`)
+/// OR its EMA is not yet SUSTAINED ([`samples`](VelocityEma::samples) `< MIN_VELOCITY_SAMPLES`) —
+/// and when the sustained rate is `0.0` (the rate is non-negative and finite by construction, so
+/// `rate > 0.0` drops exactly that value). Gating on sustained-ness mirrors the #539 projective
+/// trigger: a single-sample spike is noise, so it reads as "no observed climb" rather than
+/// deprioritising a target on one unstable interval. The key is TYPED, never a number: `None` ranks
+/// AHEAD of every `Some` in [`pick_target_with_reason_ranked`], so a missing or untrusted signal
+/// treats an un-warmed, just-reset or session-less account as the safest (no-climb) landing rather
+/// than penalising it for lack of data — and never as a fabricated `0.0` rate read off a reading
+/// that has no session window. See [`VelocityEma`].
+fn observed_climb(usage: &Usage, accounts: &[AccountRuntime], idx: usize) -> Option<f64> {
+    usage.session.and_then(|_| {
+        accounts
+            .get(idx)
+            .and_then(AccountRuntime::sustained_session_velocity)
+            .map(|v| v.rate)
+            .filter(|&rate| rate > 0.0)
+    })
 }
 
 /// A per-(daemon seed, roster index) tie-break key (issue #612): decorrelate the index into the
@@ -200,8 +215,10 @@ pub(crate) fn pick_target_with_reason(
 /// 1. **Velocity**: prefer the target with the LOWER retained session-velocity EMA (`velocity`,
 ///    indexed in lockstep with `readings`) — a steeply-climbing peer would re-trip
 ///    [`swap::decide`]'s session dimension soon after a swap TO it (a wasted swap + near-term
-///    re-swap), so a calmer peer with the same time-to-reset is the better landing. An absent signal
-///    reads as `0.0` (see [`velocity_rate`]).
+///    re-swap), so a calmer peer with the same time-to-reset is the better landing. The key is
+///    typed (see [`observed_climb`]): an absent signal — a reading with no session window, no
+///    sustained EMA, or a sustained zero rate — is `None`, "no observed climb", which ranks AHEAD
+///    of every `Some`; two `Some`s order by their rate.
 /// 2. **Per-daemon jitter**: break a remaining tie by a per-daemon-stable hashed order
 ///    ([`selection_tiebreak_key`]) instead of roster index, so two daemons over the same roster —
 ///    which see identical server-side `weekly_resets_at` and would otherwise deterministically
@@ -244,13 +261,17 @@ pub(crate) fn pick_target_with_reason_ranked(
         .filter(|&(i, _)| i != active)
         .filter(|&(i, _)| enabled[i])
         .filter_map(|(i, reading)| reading.map(|usage| (i, usage)))
-        .filter(|&(_, usage)| usage.weekly < weekly_ceiling)
+        // Issue #1602: each window gate is a PASS on an absent window (`is_none_or`) — a window
+        // the account does not have cannot re-trip `decide`, which skips that axis — so a
+        // weekly-only spare clears the two session gates and a weekly-less spare clears the
+        // weekly line (AD-4b). A present window is read exactly as before.
+        .filter(|&(_, usage)| usage.weekly.is_none_or(|w| w < weekly_ceiling))
         // Always-on session anti-thrash gate: exclude a target at/above the session
         // trigger — it would immediately re-trip [`swap::decide`]'s session dimension
         // and thrash (the exact mirror of the weekly filter above). Distinct from the
         // `floor` below, which tightens this ceiling further when the caller passes it.
-        .filter(|&(_, usage)| usage.session < session_ceiling)
-        .filter(|&(_, usage)| floor.is_none_or(|f| usage.session < f))
+        .filter(|&(_, usage)| usage.session.is_none_or(|s| s < session_ceiling))
+        .filter(|&(_, usage)| floor.is_none_or(|f| usage.session.is_none_or(|s| s < f)))
         .collect();
     let candidate_count = viable.len();
     // Soonest weekly reset (issue #37) is the DOMINANT axis: a known reset sorts ahead of an
@@ -272,12 +293,23 @@ pub(crate) fn pick_target_with_reason_ranked(
             // co-selection herd on a remaining tie (a fixed per-daemon seed keeps it stable across
             // ticks). `None` is the legacy path: both inert, straight to the roster index below.
             .then_with(|| match sel.seed {
-                Some(seed) => velocity_rate(sel.accounts, a_idx)
-                    .total_cmp(&velocity_rate(sel.accounts, b_idx))
+                Some(seed) => {
+                    // Issue #1602 (D7 as ruled): a TYPED key, never a number. `None` — no observed
+                    // climb: a reading with no session window, no sustained EMA, or a sustained
+                    // zero rate — ranks AHEAD of every `Some`; two `Some`s order by their rate.
+                    let climb =
+                        |idx: usize, usage: &Usage| observed_climb(usage, sel.accounts, idx);
+                    match (climb(a_idx, &a), climb(b_idx, &b)) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => std::cmp::Ordering::Less,
+                        (Some(_), None) => std::cmp::Ordering::Greater,
+                        (Some(a_rate), Some(b_rate)) => a_rate.total_cmp(&b_rate),
+                    }
                     .then_with(|| {
                         selection_tiebreak_key(seed, a_idx)
                             .cmp(&selection_tiebreak_key(seed, b_idx))
-                    }),
+                    })
+                }
                 None => std::cmp::Ordering::Equal,
             })
             // The earliest roster index — the pre-#612 tie-break, and the only one legacy uses.
@@ -715,7 +747,7 @@ mod tests {
         // weekly dimension on the very next cycle. `decide_action` closes this by passing the SAME
         // derived line to `pick_target` that it releases on — the invariant this function's doc
         // states as "the acquire predicate is at least as strict as the negation of the release
-        // predicate on BOTH dimensions". The session dimension closes the same gap with the
+        // predicate on every dimension the account has". The session dimension closes the same gap with the
         // `target_max_session_usage` reserve (#398); weekly has no such reserve, hence this.
         let weekly_threshold = crate::swap::weekly_effective_ceiling(WK); // 0.97 at the 0.98 default
         let readings = vec![
@@ -864,7 +896,7 @@ mod tests {
 
     /// A retained velocity EMA for the #612 selection tests. `samples` is explicit because it is
     /// load-bearing: at or above [`MIN_VELOCITY_SAMPLES`] the rate is TRUSTED and the velocity axis
-    /// acts on it; below, `velocity_rate` reads it as no signal.
+    /// acts on it; below, `observed_climb` reads it as no signal.
     fn ema(rate: f64, samples: u32) -> Option<VelocityEma> {
         Some(VelocityEma { rate, samples })
     }
@@ -1062,6 +1094,272 @@ mod tests {
         assert!(
             winners.len() > 1,
             "with the spike ignored the tie disperses via jitter: {winners:?}",
+        );
+    }
+
+    // --- #1602: an absent window PASSES its gate, never a fabricated `0` ---------------------
+
+    /// A weekly-only reading for the #1602 selection cases — `session: None, session_resets_at:
+    /// None` (the account has no session window) beside a present weekly window and its reset.
+    fn weekly_only_reading(weekly: f64, weekly_resets_at: Option<i64>) -> Option<Usage> {
+        Some(Usage {
+            session: None,
+            weekly: Some(weekly),
+            weekly_resets_at,
+            session_resets_at: None,
+        })
+    }
+
+    /// The mirror (AD-4b): a weekly-less reading — a session window, `weekly: None`, no weekly reset.
+    fn weekly_less_reading(session: f64) -> Option<Usage> {
+        Some(Usage {
+            session: Some(session),
+            weekly: None,
+            weekly_resets_at: None,
+            session_resets_at: None,
+        })
+    }
+
+    #[test]
+    fn pick_target_admits_a_weekly_only_spare_on_its_weekly_headroom() {
+        // Issue #1602 (row 1, AD-4b): a spare whose reply carries no session window clears BOTH
+        // session gates vacuously (`is_none_or` — a window it does not have cannot re-trip
+        // `decide`'s session dimension) and is judged on its weekly line alone, through
+        // `pick_target` and `pick_target_with_reason` alike. Ceiling 0.95, floor 0.80, weekly line
+        // 0.97 — the live `decide_action` frame. Mutant M-f (the session gate as `is_some_and`)
+        // excludes it: this pins the opposite error, since a fabricated `0` would pass here too.
+        let readings = vec![
+            ranked_reading(0.97, 0.40, Some(100)), // active (excluded)
+            weekly_only_reading(0.90, Some(200)),  // weekly-only spare, the sooner weekly reset
+            ranked_reading(0.30, 0.20, Some(300)), // two-window peer, the later reset
+        ];
+        let enabled = all_on(&readings);
+        assert_eq!(
+            pick_target(0, &readings, &enabled, Some(0.80), 0.95, 0.97),
+            Some(1),
+            "the weekly-only spare is viable on its weekly headroom and wins on its sooner reset",
+        );
+        assert_eq!(
+            pick_target_with_reason(0, &readings, &enabled, Some(0.80), 0.95, 0.97),
+            Some((1, NextSwapReason::SoonestReset { resets_at: 200 })),
+        );
+        // Ranked by its weekly reset against the two-window peer, never privileged: with the resets
+        // swapped the peer's sooner reset wins, the weekly-only spare still viable behind it.
+        let peer_sooner = vec![
+            ranked_reading(0.97, 0.40, Some(100)),
+            weekly_only_reading(0.90, Some(300)),
+            ranked_reading(0.30, 0.20, Some(200)),
+        ];
+        assert_eq!(
+            pick_target_with_reason(0, &peer_sooner, &enabled, Some(0.80), 0.95, 0.97),
+            Some((2, NextSwapReason::SoonestReset { resets_at: 200 })),
+            "the weekly-only spare ranks on the same weekly-reset axis as a two-window peer",
+        );
+    }
+
+    #[test]
+    fn pick_target_blocks_a_weekly_only_spare_on_the_weekly_line_like_a_two_window_one() {
+        // Issue #1602 (row 1): the weekly line is ONE line, read wherever the reading HAS a weekly
+        // window — a weekly-only spare at/over it is excluded exactly as a two-window spare at the
+        // same value. Each spare is its fleet's ONLY spare, so the exclusion reads as `None`: beside
+        // a viable peer an admitted spare could merely lose the ranking, and the second weekly line
+        // AC-1 forbids (mutant M-x — a weekly-only spare exempted from the line) would stay
+        // invisible.
+        let weekly_only = vec![
+            ranked_reading(0.97, 0.40, Some(100)), // active (excluded)
+            weekly_only_reading(0.98, Some(200)),  // the only spare: weekly-only, over the line
+        ];
+        assert_eq!(
+            pick_target(
+                0,
+                &weekly_only,
+                &all_on(&weekly_only),
+                Some(0.80),
+                0.95,
+                0.97
+            ),
+            None,
+            "a weekly-only spare over the weekly line is excluded — there is no second weekly line",
+        );
+        let two_window = vec![
+            ranked_reading(0.97, 0.40, Some(100)),
+            ranked_reading(0.30, 0.98, Some(200)), // the only spare: two-window, the same value
+        ];
+        assert_eq!(
+            pick_target(0, &two_window, &all_on(&two_window), Some(0.80), 0.95, 0.97),
+            None,
+            "a two-window spare at the same value is excluded by the same line",
+        );
+    }
+
+    #[test]
+    fn pick_target_never_weekly_blocks_a_weekly_less_spare() {
+        // Issue #1602 (row 1, AD-4b — the symmetric rule): a spare whose reply carries no WEEKLY
+        // window has no weekly line to be over, so it is never weekly-blocked; its session gates
+        // still judge it. The fleet's only spare, so the viable half reads as a pick rather than a
+        // ranking it could lose (it carries no weekly reset). Mutant M-y (the weekly line as
+        // `is_some_and`) excludes it.
+        let viable = vec![
+            ranked_reading(0.97, 0.40, Some(100)), // active (excluded)
+            weekly_less_reading(0.10),             // the only spare: weekly-less, session 0.10
+        ];
+        assert_eq!(
+            pick_target_with_reason(0, &viable, &all_on(&viable), Some(0.80), 0.95, 0.97),
+            Some((1, NextSwapReason::OnlyCandidate)),
+            "a weekly-less spare is viable on its session gates alone",
+        );
+        // At/over the session ceiling the same spare is excluded by the SESSION gate — the gate it
+        // does have — never by a weekly line it lacks.
+        let saturated = vec![
+            ranked_reading(0.97, 0.40, Some(100)),
+            weekly_less_reading(0.96),
+        ];
+        assert_eq!(
+            pick_target(0, &saturated, &all_on(&saturated), Some(0.80), 0.95, 0.97),
+            None,
+            "the session ceiling still excludes a weekly-less spare",
+        );
+    }
+
+    #[test]
+    fn pick_target_ranks_a_weekly_only_spare_and_a_two_window_spare_on_the_same_weekly_reset_axis()
+    {
+        // Issue #1602 (row 12, D7 as ruled): the #37 soonest-reset axis ranks a weekly-only spare
+        // and a two-window spare alike — the sooner weekly reset wins regardless of kind — and on
+        // an EXACT tie the #612 velocity axis reads a TYPED key off the READING (`observed_climb`):
+        // a weekly-only spare has no session window, so it is "no observed climb" (`None`), which
+        // ranks ahead of every sustained climber and level with every other no-climb spare (the
+        // per-daemon jitter key orders those). Ranked with a `Some` seed swept over 24 values —
+        // unseeded, the velocity axis is inert and the tie falls to roster order, which could see
+        // none of M-t (the key read from the EMA slot instead of the reading), M-af (the no-climb
+        // class ranked AFTER the climbers) or M-ag (the weekly-only spare promoted AHEAD of the
+        // no-climb class).
+        let seeds = 0..24_u64;
+        let active = ranked_reading(0.97, 0.10, Some(100)); // index 0, excluded
+        let fleet = |first: Option<Usage>, second: Option<Usage>| vec![active, first, second];
+        let weekly_only = |resets_at| weekly_only_reading(0.20, Some(resets_at));
+        let two_window = |resets_at| ranked_reading(0.30, 0.20, Some(resets_at));
+        let climbing = ema(0.010, 3);
+
+        // (A) On an exact reset tie a weekly-only spare with no EMA beats a two-window spare with a
+        // sustained climbing EMA, for every seed and in either roster order (mutant M-af).
+        for seed in seeds.clone() {
+            assert_eq!(
+                pick_ranked(
+                    &fleet(weekly_only(200), two_window(200)),
+                    &[None, None, climbing],
+                    Some(seed),
+                ),
+                Some(1),
+                "(A) no observed climb beats a sustained climber on a reset tie (seed {seed})",
+            );
+            assert_eq!(
+                pick_ranked(
+                    &fleet(two_window(200), weekly_only(200)),
+                    &[None, climbing, None],
+                    Some(seed),
+                ),
+                Some(2),
+                "(A) …in either roster order (seed {seed})",
+            );
+        }
+        // (B) A weekly-only spare whose slot still holds a sustained EMA STEEPER than its peer's
+        // wins too, for every seed: the key is read from the reading, which carries no session
+        // window, never from the slot (mutant M-t reads the slot, and the steeper retained rate
+        // then loses the tie).
+        for seed in seeds.clone() {
+            assert_eq!(
+                pick_ranked(
+                    &fleet(weekly_only(200), two_window(200)),
+                    &[None, ema(0.020, 3), climbing],
+                    Some(seed),
+                ),
+                Some(1),
+                "(B) a steeper stale EMA in the weekly-only spare's slot is not read (seed {seed})",
+            );
+        }
+        // (C) Against a two-window spare with no sustained EMA — no slot, or an unsustained one —
+        // or with a sustained ZERO rate, the two spares are LEVEL: each wins for at least one seed
+        // over the sweep, the per-daemon jitter key deciding (mutant M-ag promotes the weekly-only
+        // spare ahead of the whole no-climb class, so it would win every seed).
+        let both: std::collections::BTreeSet<usize> = [1, 2].into_iter().collect();
+        for (peer_ema, case) in [
+            (None, "no EMA"),
+            (ema(0.010, MIN_VELOCITY_SAMPLES - 1), "an unsustained EMA"),
+            (ema(0.0, 3), "a sustained zero rate"),
+        ] {
+            let winners: std::collections::BTreeSet<usize> = seeds
+                .clone()
+                .map(|seed| {
+                    pick_ranked(
+                        &fleet(weekly_only(200), two_window(200)),
+                        &[None, None, peer_ema],
+                        Some(seed),
+                    )
+                    .expect("a viable target exists")
+                })
+                .collect();
+            assert_eq!(
+                winners, both,
+                "(C) against a two-window spare with {case}, each spare wins for at least one seed",
+            );
+        }
+        // (D) With unequal resets the sooner reset wins, whichever kind of spare holds it.
+        for seed in seeds.clone() {
+            assert_eq!(
+                pick_ranked(
+                    &fleet(weekly_only(200), two_window(300)),
+                    &[None, None, climbing],
+                    Some(seed),
+                ),
+                Some(1),
+                "(D) the weekly-only spare's sooner weekly reset wins (seed {seed})",
+            );
+            assert_eq!(
+                pick_ranked(
+                    &fleet(weekly_only(300), two_window(200)),
+                    &[None, None, climbing],
+                    Some(seed),
+                ),
+                Some(2),
+                "(D) the two-window spare's sooner weekly reset wins (seed {seed})",
+            );
+        }
+        // (E) With `seed: None` both #612 axes are inert and the roster index decides.
+        assert_eq!(
+            pick_ranked(
+                &fleet(weekly_only(200), two_window(200)),
+                &[None, None, climbing],
+                None,
+            ),
+            Some(1),
+            "(E) unseeded, the earliest roster index wins",
+        );
+        assert_eq!(
+            pick_ranked(
+                &fleet(two_window(200), weekly_only(200)),
+                &[None, climbing, None],
+                None,
+            ),
+            Some(1),
+            "(E) …whichever kind of spare holds it",
+        );
+        // The tie was still won on the (tied) soonest reset, so the wire reason is unchanged.
+        let tie = fleet(weekly_only(200), two_window(200));
+        assert_eq!(
+            pick_target_with_reason_ranked(
+                0,
+                &tie,
+                &all_on(&tie),
+                Some(0.80),
+                SESS,
+                WK,
+                SelectionTiebreak {
+                    accounts: &runtimes(&[None, None, climbing]),
+                    seed: Some(9),
+                },
+            ),
+            Some((1, NextSwapReason::SoonestReset { resets_at: 200 })),
         );
     }
 }
