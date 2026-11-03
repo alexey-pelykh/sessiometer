@@ -1,29 +1,36 @@
-# Feature: the capture acknowledgement says which account a write touched, what it collided with, which label it replaced and which credential it shares
+# Feature: a menu-bar capture refuses to duplicate a label or rename an account, and its acknowledgement says which account it touched and which credential it shares
 
-Issue #1559 · PRD REQ-ROS-I-001 / REQ-ROS-C-001 / REQ-IDN-I-001 / REQ-STSH-B-002 / REQ-NTC-C-001, AC-ROS-003 / AC-IDN-004 / AC-STSH-001 · design D-3, D-4, D-10, § 8.1, § 11.5
+Issue #1559 · PRD REQ-ROS-B-001 / REQ-ROS-I-001 / REQ-ROS-C-001 / REQ-IDN-C-002 / REQ-STSH-B-002 / REQ-NTC-C-001, AC-ROS-001 / AC-ROS-003 / AC-IDN-003 / AC-STSH-001, the rulings of § 8.1 · design D-2, D-3, D-4, D-10, § 8.1, § 8.2, § 11.5, § 12.2, § 12.3
 
-Example Mapping: 🟦 9 rules · 🟩 41 examples · 🟥 2 open
+Example Mapping: 🟦 9 rules · 🟩 57 examples · 🟥 0 open
 
 > **PROVISIONAL · Tier B.** The PRD's `dor_status` is `failed`, so every requirement this stub rests
-> on is unratified and its problem framing is unvalidated. The field names `account_uuid`,
-> `collisions`, `previous_label` and `shared_with`, and their element shapes, are pipeline defaults
-> that wait for ratification too. Each scenario waits to be bound in #1559's execution; none is a
-> test yet. The stub maps the item as filed: the socket `capture` acknowledgement and the Swift
-> decoder of it. The CLI notices are #1556, shared-credential detection is #1557, the `config-set`
-> acknowledgement is #1558, and the menu-bar presentation is #1561 and #1560. An example is a
-> scenario or an outline row.
+> on is unratified and its problem framing is unvalidated. The field names `account_uuid` and
+> `shared_with`, and the element shape of `shared_with`, are pipeline defaults that wait for
+> ratification too. Each scenario waits to be bound in #1559's execution; none is a test yet. The
+> stub maps the item as re-authored to the operator's refuse rulings: the socket `capture`
+> acknowledgement, its two new refusals, and the Swift decoder of both. The CLI half is #1556,
+> shared-credential detection is #1557, the `config-set` acknowledgement is #1558, and the menu-bar
+> presentation is #1561 and #1560. An example is a scenario or an outline row.
 >
 > The Blue Card Gate trips: the item carries more rules than one item should. This stub does not
 > split it. The rules are numbered so that a split has somewhere to cut. Rules 1 to 6 are what the
 > daemon sends. Rule 7 is the Rust-side byte pin. Rules 8 and 9 are the Swift decoder and the gate
 > between the two sides.
 >
-> A scenario marked 🟥 hangs on a question that has no answer yet. It names the question's handle
-> and writes no outcome as decided; the item's own default sits in the comment beside it. The 🟩
-> count is the examples that carry a decided outcome; the 🟥 ones are not in it. Both questions are
-> operator decisions: `duplicate-label-policy` (warn or refuse when a write makes a label name a
-> second account) and `login-mismatch-policy` (what a write does when it gives an already-rostered
-> account a different label). Both are tabled at the end.
+> Both operator decisions this stub once waited on are ruled (PRD § 8.1, 2026-11-03): a write that
+> would make a label name a second account is refused unless `--overwrite` is given, and a write that
+> would rename an account is refused unless `--rename` is given. Three readings of those rulings are
+> the orchestrator's, recorded beside them and confirmed at ratification, and the scenarios below
+> build on each. The socket `capture` carries neither flag, so it refuses both writes, with
+> `label-in-use` and `relabels-another-account`, and accepts no consent. A write that meets both
+> carries `label-in-use`. A new account captured with no label takes its uuid as its label, and when
+> another account already carries that string, the shared capture plan (#1556) gives it the first
+> free suffix, `-2`, `-3` and so on. That write is never refused and never completes a collision,
+> because REQ-LGN-B-003 forbids that path to hard-error. No completed capture therefore carries a
+> collision, and the acknowledgement gains no `collisions` key. The two tag names follow design
+> § 8.2. No scenario is marked 🟥: every outcome below is decided under the rulings and those
+> readings, and the 🟩 count is every example in the file.
 >
 > One question the PRD lists is not marked 🟥 here, and that is a call, not a decision. The PRD's
 > DQ-6 asks which channel carries the shared-credential report of a daemon-side write. The design
@@ -35,13 +42,16 @@ Example Mapping: 🟦 9 rules · 🟩 41 examples · 🟥 2 open
 > every `shared_with` row below go. The calls are tabled at the end.
 >
 > Words. `A:work` is a roster entry whose uuid is A and whose label is `work`; A, B, C and D stand
-> for whole uuids. *The signed-in account* is the account the daemon harvests: the identity in
-> `~/.claude.json` and the credential in the canonical keychain item. A *menu-bar capture* is the
-> socket `capture` command; it *asks for work* when it carries that label and *asks for no label*
-> when it carries none. K names a credential; no scenario quotes one. *The written entry* is the one
-> roster entry a capture creates or relabels. A *bearer* of a label is a roster entry that carries
-> it. *Quiet* means the acknowledgement carries `account_uuid` and none of `collisions`,
-> `previous_label` and `shared_with`.
+> for whole uuids, `A:uuid(C)` is an entry A whose label is C's uuid, written out, and `uuid(C)-2`
+> is that string with `-2` appended. *The signed-in account* is the account the daemon harvests: the
+> identity in `~/.claude.json` and the credential in the canonical keychain item. A *menu-bar
+> capture* is the socket `capture` command; it *asks for work* when it carries that label and *asks
+> for no label* when it carries none. K names a credential; no scenario quotes one. *The written
+> entry* is the one roster entry a capture creates or refreshes. A *bearer* of a label is a roster
+> entry that carries it. A *rename* is a capture that gives a rostered account a label other than
+> the one it carries. *Nothing is written* means nothing is stashed, `config.toml` keeps its bytes
+> and the live roster is unchanged. *Quiet* means the acknowledgement carries `account_uuid` and no
+> `shared_with`.
 >
 > The traps in this feature:
 > - A decode that does not throw proves nothing. The Swift decoder drops an unknown sibling key
@@ -50,10 +60,15 @@ Example Mapping: 🟦 9 rules · 🟩 41 examples · 🟥 2 open
 >   values and key sets for that reason.
 > - A gate must live where it can fail. `panel-goldens` is soft: every step is `continue-on-error`,
 >   so it always reports pass. Rule 9 puts the gate in the `test` job.
-> - A bearer list with the written entry first reads like the CLI's notice and is wrong here. The
->   acknowledgement lists the bearers in roster order and marks the written entry by `account_uuid`.
-> - A report on a write that created nothing trains the operator to dismiss the one that matters.
->   Rule 5's quiet rows are import's own fixtures.
+> - A refusal test that checks only for `rejected` passes over a refusal that reached the wire as
+>   `failed`: `classify_capture_failure` ends in a wildcard arm (src/daemon/classify.rs:167), and
+>   `failed` invites a retry that refuses the same way. Rules 2 and 3 assert the tag.
+> - A refusal taken after the stash write leaves an orphan stash (AC-ROS-001, BUT NOT). Rules 2 and 3
+>   assert that nothing was written.
+> - A refusal gate that also fired on a derived label would hard-error the path REQ-LGN-B-003
+>   forbids to. Rule 2's derived-label outline asserts that the write completes under a free label.
+> - A refusal of a write that created nothing blocks the operator for nothing and trains them to
+>   route around the one that matters. Rule 5's quiet rows are import's own fixtures.
 > - Rust sends `count`; the Swift body reads `accounts`; the app never gets the count. That predates
 >   this item, and a whole-body comparison would fail on it today. Rules 8 and 9 compare this work's
 >   fields only.
@@ -86,31 +101,40 @@ Scenario Outline: the acknowledgement carries the uuid the roster holds for the 
     # `count` keeps its meaning, the length of the live roster (`self.roster.len()`, src/daemon/commands.rs:416).
 ```
 
-🟥 Blocked on `login-mismatch-policy`. The scenario below waits for the operator's answer.
-
 ```gherkin
-Scenario: 🟥 a relabel leaves the uuid where it was
+Scenario: a refused relabel leaves the uuid and the label where they were
   Given a roster B:spare
     And the signed-in account is B
    When a menu-bar capture asks for work
-   Then the roster on disk holds B under the label work, and holds no other uuid
-    And (pending `login-mismatch-policy`: whether the relabel completes at all. If it does, the acknowledgement is refreshed with account_uuid B. If the policy refuses it, there is no such acknowledgement)
-    # Covers the invariant's third case, "a relabel". Capturing the signed-in account again under a
-    # new label is the path `recapture_updates_the_label_when_a_new_one_is_given` pins as a feature,
-    # and design § 8.2 says a refuse answer closes that path for the socket.
+   Then the acknowledgement is rejected with the reason relabels-another-account
+    And the roster on disk holds B under the label spare, and holds no other uuid
+    And the live roster holds B under the label spare
+    # Covers the invariant "a label never changes an entry's `account_uuid`", its third case, "a
+    # relabel", which on the socket is now a refusal: the relabel never completes, so neither the uuid
+    # nor the label moves. Capturing the signed-in account again under a new label is the path
+    # `recapture_updates_the_label_when_a_new_one_is_given` pins; under the ruling that test gains
+    # rename consent (#1556), and the socket carries none. Rule 3 asserts the refusal itself.
 ```
 
-## Rule 2 — a write that makes a label name a second account says so in the acknowledgement
+## Rule 2 — a write that would make a label name a second account is refused, and a derived label is made free instead
 
-> REQ-ROS-I-001, REQ-ROS-B-001, REQ-ROS-B-002, design D-1 and § 8.1. The rule is import's: a write
-> creates a collision on a label when the label has more than one bearer after the write and more
-> bearers than it had before (`created_ambiguity`, src/cli.rs:5425, over the counts of
-> `label_bearers`, src/cli.rs:5245). #1556 moves it beside `Account` as `label_collisions`. The
-> acknowledgement carries one element per collided label, `{label, bearers}`. The bearers are the
-> uuids of every entry that bears the label after the write, in roster order, the written entry
-> among them. One capture writes one entry, so it collides at most one label. The list form is
-> shared with `config-set` (#1558), where several labels can collide at once. The form of the
-> report is `duplicate-label-policy`'s, so the loud scenarios wait and the quiet ones do not.
+> REQ-ROS-B-001, REQ-ROS-B-002, REQ-ROS-I-001, AC-ROS-001, design D-1, D-2, § 8.1 and § 8.2, and
+> the operator's ruling on `duplicate-label-policy` (PRD § 8.1). A write creates a collision when it
+> would give an account a label that account did not carry before, and another account would then
+> carry that label as well (the Terms of design § 12.3). #1556 adds that rule beside `Account` as the
+> shared `label_collisions`, which the four write paths use, and gates the capture plan on it before
+> the stash write. Import keeps its own count rule, which REQ-ROS-B-002 states: more than one bearer
+> after the write and more bearers than before (`created_ambiguity`, src/cli.rs:5425, over the
+> counts of `label_bearers`, src/cli.rs:5245). One capture writes one entry, so on every write it
+> can make the two rules give the same verdicts. A menu-bar capture that gives a label and would
+> create a collision is refused with `label-in-use`, nothing is written, and no key on the request
+> lifts the refusal. A new account captured with no label takes its uuid as its label
+> (`derive_label`, src/capture.rs:621), and REQ-LGN-B-003 forbids that path to hard-error. When
+> another account already carries that string, which a relabel, an import, a restore or a hand edit can produce, #1556's
+> plan appends `-2`, `-3` and so on until the label is free. That write is never refused and never
+> completes a collision, and the acknowledgement's `label` names the label the plan chose, as it does
+> for every capture. No completed capture carries a collision, so the capture acknowledgement gains
+> no `collisions` key. The `config-set` refusal carries one (#1558).
 
 ```gherkin
 Scenario: the account that already bears the label is not a collision
@@ -119,87 +143,108 @@ Scenario: the account that already bears the label is not a collision
    When a menu-bar capture asks for work
    Then the acknowledgement is refreshed with account_uuid A
     And the acknowledgement is quiet
-    # Covers AC `oracle-socket-capture-reports-a-collision`, its second sentence: "It must not report
-    # when the captured uuid is A itself". One bearer before and one after, so the count did not
-    # rise. AC-ROS-001 names a report here as a BUT NOT. This is also AC `quiet-writes-stay-quiet`'s
-    # "relabel to the label the entry already carries", so Rule 5's table repeats it only for a
-    # two-bearer roster (its third row).
-```
+    # Covers AC `oracle-socket-capture-refuses-a-collision`, its sentence "It must not refuse when the
+    # captured uuid is A itself". One bearer before and one after, so the count did not rise, and the
+    # label given is the one A carries, so this is no rename either. AC-ROS-001 names a report here as
+    # a BUT NOT. This is also AC `quiet-writes-stay-quiet`'s "relabel to the label the entry already
+    # carries", so Rule 5's table repeats it only for a two-bearer roster (its third row).
 
-🟥 Blocked on `duplicate-label-policy`. The scenarios below wait for the operator's answer.
-
-```gherkin
-Scenario: 🟥 a new account under a label another account bears
+Scenario: a new account under a label another account bears is refused before any write
   Given a roster A:work
     And the signed-in account is B, which the roster does not hold
    When a menu-bar capture asks for work
-   Then the acknowledgement of this write is not silent about the collision on work
-    And (pending `duplicate-label-policy`: the form of the report, a collision carried by a completed captured acknowledgement or a refusal before any write)
-    # The item's default is warn: captured, account_uuid B, and one collision, the label work with the
-    # bearers A and B in roster order. Under refuse the write stops before the stash is written, so
-    # nothing is stashed and nothing is rostered; a refusal after the stash write would leave an
-    # orphan stash (AC-ROS-001, BUT NOT). The acknowledgement is then a `rejected` one. By Rule 2 of
-    # docs/specs/capture-rejection-parity.feature.md it carries a redacted machine code and no label,
-    # so, unless that rule is amended, the app would learn that a label is in use and not which one.
-    # Refuse also needs AC-6 of the migration PRD re-ratified ("BUT NOT by enforcing label
-    # uniqueness"), a `label-in-use` tag on `CaptureRejection` (src/daemon/socket.rs:672), and its
-    # Swift case in the same commit, which `every_rust_rejection_tag_has_a_swift_case` (src/daemon/socket.rs:1979) gates.
-    # Covers AC `oracle-socket-capture-reports-a-collision`; the item suggests the name
-    # `a_socket_capture_that_makes_a_label_name_a_second_account_says_so_in_its_ack`.
+   Then the acknowledgement is rejected with the reason label-in-use
+    And nothing is written: nothing is stashed under B, and the roster holds A alone, on disk and live
+    And the capture's audit line names the label work and the outcome label_in_use
+    # Covers AC `oracle-socket-capture-refuses-a-collision`; the item suggests the name
+    # `a_socket_capture_that_would_make_a_label_name_a_second_account_is_refused`. This is the socket
+    # `capture` oracle REQ-ROS-C-002 names, asserting the refusal the ruling selects. The gate sits in
+    # the plan, before `stash.write` (design D-2), so no orphan stash is left (AC-ROS-001, BUT NOT).
+    # The audit line is the one `capture_failure` (src/daemon/commands.rs:437) builds for every
+    # refusal: the label the request carried and the reason's token.
 
-Scenario: 🟥 a relabel onto another account's label
+Scenario: a relabel onto another account's label carries label-in-use, the reason that wins when both apply
   Given a roster A:work, B:spare
     And the signed-in account is B
    When a menu-bar capture asks for work
-   Then the acknowledgement of this write is not silent about the collision on work
-    And (pending `duplicate-label-policy`: the form of the report)
-    And (pending `login-mismatch-policy`: whether the relabel completes, and whether the acknowledgement names spare as the label B carried)
-    # The item's default: refreshed, account_uuid B, previous_label spare, and one collision, the
-    # label work with the bearers A and B. Covers AC `oracle-socket-refresh-reports-the-previous-label`.
+   Then the acknowledgement is rejected with the reason label-in-use
+    And the roster on disk still holds A under work and B under spare
+    And the stash of B is not written
+    # Covers AC `oracle-socket-capture-refuses-a-rename`, its second case. The write is a rename and a
+    # collision at once, and it carries `label-in-use`. On the CLI no flag lets this one write through
+    # (the label must be freed first, then the rename repeated); on the socket no flag exists at all.
 
-Scenario: 🟥 a third account joins a label two accounts already bear
+Scenario: a third account joining a label two accounts already bear is refused the same way
   Given a roster A:work, B:work
     And the signed-in account is C, which the roster does not hold
    When a menu-bar capture asks for work
-   Then the acknowledgement of this write is not silent: work now names three accounts
-    And (pending `duplicate-label-policy`: the form of the report)
-    # The item's default: bearers A, B and C. A report that fired only for a first duplicate would
-    # swallow a worse one the operator has just made. This is import's "deepening" scenario
-    # (docs/specs/import-duplicate-label.feature.md). Covers AC `oracle-socket-capture-reports-a-collision`
-    # (the bearers) and the item's second conformance criterion (the bearer count import finds).
+   Then the acknowledgement is rejected with the reason label-in-use
+    And nothing is written: nothing is stashed under C, and the roster keeps A and B, on disk and live
+    # A rule that refused only a first duplicate would let a worse one through. This is import's
+    # "deepening" scenario (docs/specs/import-duplicate-label.feature.md), refused here. Covers AC
+    # `oracle-socket-capture-refuses-a-collision`.
 
-Scenario: 🟥 the bearers come back in roster order, with the written entry where it sits
-  Given a roster A:work, B:spare, C:work
-    And the signed-in account is B
-   When a menu-bar capture asks for work
-   Then the collision on work lists the bearers A, B, C in that order
-    And account_uuid is B, so the app marks the written entry without it being listed first
-    And (pending `duplicate-label-policy`: the form of the report)
-    And (pending `login-mismatch-policy`: whether the relabel completes)
-    # The CLI's notice puts the written entry first and marks it (design § 8.5). The acknowledgement
-    # does not: design § 8.1 says the bearers' roster order gives each one its ordinal (UX-3). Covers
-    # AC `oracle-socket-capture-reports-a-collision` ("bearers A and B in roster order").
+Scenario Outline: a new account captured with no label, whose uuid another account carries as its label, completes under the first free label
+  Given a roster <roster>
+    And the signed-in account is C, which the roster does not hold
+   When a menu-bar capture asks for no label
+   Then the acknowledgement is captured with account_uuid C and the label <label>
+    And the roster on disk holds C under <label>, and every other entry under the label it carried
+    And no label in the roster names more accounts than it named before the write
 
-Scenario: 🟥 the collision names what import's notice names
-  Given a roster A:work
-    And a menu-bar capture of the uuid B asks for work
-   When import's duplicate-label notice is rendered for work, and the acknowledgement of that capture is read
-   Then both name the label work
-    And the collision lists as many bearers as `label_bearers` counts for work after the write
-    And (pending `duplicate-label-policy`: the collision exists only if the form is a report on the completed write)
-    # Import's notice is `duplicate_label_notice` (src/cli.rs:5628) and its count is `label_bearers` (src/cli.rs:5245).
-    # The acknowledgement carries facts and never rendered prose (design D-3), so the facts compared
-    # here are the label and the bearer count. The notice's cost-and-remedy text belongs to the CLI
-    # and the card. Covers the item's second conformance criterion, by concretize-and-compare.
+  Examples:
+    | roster                 | label     |
+    | A:uuid(C)              | uuid(C)-2 |
+    | A:uuid(C), D:uuid(C)-2 | uuid(C)-3 |
+    # Covers AC `derived-label-takes-a-free-label`. The suffix is the shared capture plan's, and #1556
+    # adds it, so this outline passes once #1556 lands and owes no RED here. It pins two things at the
+    # socket: the menu-bar path takes the same plan, and the refusal this item maps never reaches a
+    # derived label. Row 2 shows the suffix itself taken. A write given no label is never refused
+    # (REQ-LGN-B-003), and it never collides either, so no completed capture carries a collision.
+
+Scenario: no key on the request lifts either refusal
+  Given a capture request line that carries the label work and the keys overwrite, rename and force, each true
+   When the daemon parses it
+   Then the capture command it yields is the one the line without those keys yields: the label work, and nothing else
+    # Covers AC `no-override-on-the-socket`. The socket carries no consent, so this rule's refusal and
+    # Rule 3's stand whatever the request says. Today the shared request parse ignores an unknown key
+    # and reads `force` for `swap` alone (`ControlRequest`, src/daemon/socket.rs:414), and
+    # `serve_control` (src/daemon/socket.rs:904) builds `CaptureCommand` from the label only. That
+    # holds before and after the change; the scenario pins it, so that a consent field cannot arrive
+    # unasked. The panel's ways through are Settings, to rename, and #1019's routed `remove`, to
+    # replace; the CLI's one-action replace is a parity gap recorded against #1019, not built here.
+
+Scenario: each write import's duplicate-label notice warns about, restated as one capture, is refused
+  Given the scenarios of docs/specs/import-duplicate-label.feature.md in which import warns
+   When each is restated as a menu-bar capture that gives the label
+   Then each is refused with label-in-use
+    #   a same-label, different-uuid import ........ this rule's second scenario
+    #   deepening a duplicate the target had ....... this rule's fourth scenario
+    #   an artifact carrying its own duplicate ..... none. One capture writes one entry, and that
+    #                                                scenario writes two at once
+    # Covers the item's second conformance criterion, its refused half, by concretize-and-compare;
+    # Rule 5 holds the quiet half. Import's rule is `created_ambiguity` (src/cli.rs:5425) over the
+    # counts of `label_bearers` (src/cli.rs:5245), and its notice is
+    # `duplicate_label_notice` (src/cli.rs:5628). Import still warns and never refuses (AC-6 of
+    # docs/requirements/migration-credential-portability.md). The socket refuses the very writes
+    # import warns about: on a write one capture can make, the shared rule and import's count give
+    # the same verdicts (this rule's preamble), and the refusal carries no label or count (Rule 5).
 ```
 
-## Rule 3 — a refresh that renames an account names the label it replaced
+## Rule 3 — a capture never renames an account, so no acknowledgement names a previous label
 
-> REQ-IDN-I-001, AC-IDN-004, design § 8.1. `previous_label` rides `refreshed` only, and only when
-> the write changed the label of an already-rostered entry. A new account has none. Today
-> `plan_capture` (src/capture.rs:635) overwrites the label in place, with `existing.label = l.to_owned()` (src/capture.rs:662),
-> and returns the stash and the outcome only, so the label it replaced is lost; #1556 makes the plan
-> return it. The Swift decoder cannot read `refreshed` at all today. That is #1474, which this item
+> REQ-IDN-C-002, AC-IDN-003, design D-2 and § 8.2, and the operator's ruling on
+> `login-mismatch-policy` (PRD § 8.1). Today `plan_capture` (src/capture.rs:635) overwrites the
+> label of an already-rostered entry in place, with `existing.label = l.to_owned()` (src/capture.rs:662),
+> so a menu-bar capture that gives the signed-in account a new label renames it silently. Under the
+> ruling a rename is refused before the stash write unless rename consent is given, and the socket
+> carries none, so a menu-bar capture never completes a rename. It is refused with
+> `relabels-another-account`, or with `label-in-use` when the new label is also another account's
+> (Rule 2). No acknowledgement therefore carries a previous label, and REQ-IDN-I-001 and AC-IDN-004,
+> which asked for one on `refreshed`, are re-keyed with the rulings. A capture that gives no label, or
+> the label the account already carries, is a plain refresh, as Rule 1's outline and Rule 2's first
+> scenario show. The card names no label the account carries now, because the panel cannot know for
+> certain which account a capture landed on (design § 12.3, C-6); the rest of the card is #1561's. The Swift decoder cannot read `refreshed` at all today. That is #1474, which this item
 > waits for, and which has not chosen the Swift shape of the outcome.
 
 ```gherkin
@@ -210,21 +255,25 @@ Scenario: a new account has no previous label
    Then the acknowledgement is captured with account_uuid A
     And the acknowledgement is quiet
     # AC-IDN-002's second half: "BUT NOT a previous-label disclosure, because a new account has
-    # none". The key belongs to `refreshed`; no captured acknowledgement carries it.
+    # none". Since the rulings no acknowledgement carries a previous label at all (this rule's
+    # preamble), so the scenario holds for the new account and for every other write.
 ```
 
-🟥 Blocked on `login-mismatch-policy`. The scenario below waits for the operator's answer.
-
 ```gherkin
-Scenario: 🟥 a refresh that gives the account a fresh label names the label it carried
+Scenario: a capture that gives a rostered account a new label is refused before any write
   Given a roster B:spare
     And the signed-in account is B
    When a menu-bar capture asks for work
-   Then the roster on disk holds B under the label work
-    And (pending `login-mismatch-policy`: whether the relabel completes, and whether the acknowledgement is refreshed with the previous label spare, or a refusal)
-    # The item's default: refreshed, account_uuid B, previous_label spare, and no collision, because
-    # work was a fresh label. Covers AC-IDN-004's first Then. Whatever the answer, the relabel adds
-    # no `result` value (Rule 8): a refusal is a `rejected` with a new reason, never a fourth result.
+   Then the acknowledgement is rejected with the reason relabels-another-account
+    And the roster on disk still holds B under the label spare
+    And the stash of B is not written
+    And the capture's audit line names the label work and the outcome relabels_another_account
+    # Covers AC `oracle-socket-capture-refuses-a-rename`, its first case, and AC-IDN-003: the stash and
+    # the roster are left as they were, BUT NOT a refusal that takes effect after the stash write.
+    # REQ-IDN-C-002 puts the refusal before the stash is written. The relabel adds no `result` value
+    # (Rule 8): a refusal is a `rejected` with a new reason, never a fourth result. The tag carries no
+    # label, and the panel cannot tell for certain which account the capture landed on, so nothing on
+    # the card names spare (design § 12.3, C-6).
 ```
 
 ## Rule 4 — a credential another entry already holds is named in the acknowledgement, and the event log says the same
@@ -300,14 +349,15 @@ Scenario: an unreadable stash of another entry does not turn a landed capture in
     # both on disk into a `rejected` one. The write is never refused because of a pair, or the lack of one.
 ```
 
-## Rule 5 — a write that created nothing says nothing, and a refusal is unchanged
+## Rule 5 — a write that created nothing says nothing, and a refusal carries its reason alone
 
 > REQ-ROS-Q-001 (`CollisionReportPrecision`, goal 0) and the invariant "a write that creates no
-> collision reports nothing". Quiet is a decided outcome under every option of both decisions:
-> nothing is reported, refused or warned about when nothing was created, relabelled or shared. The
-> fixtures are import's quiet ones (docs/specs/import-duplicate-label.feature.md), because a socket
-> capture touches one entry. A `rejected` acknowledgement is unchanged: a redacted machine code and
-> no uuid, label or count (Rule 2 of docs/specs/capture-rejection-parity.feature.md).
+> collision reports nothing". Quiet holds under the rulings as it held under every option: nothing is
+> reported or refused when nothing was created, renamed or shared. The fixtures are import's quiet
+> ones (docs/specs/import-duplicate-label.feature.md), because a socket capture touches one entry. A
+> `rejected` acknowledgement keeps its shape: a redacted machine code and no uuid, label or count
+> (Rule 2 of docs/specs/capture-rejection-parity.feature.md), for the five tags it has today and the
+> two this item adds.
 
 ```gherkin
 Scenario Outline: a write that created nothing sends account_uuid and nothing else new
@@ -323,17 +373,20 @@ Scenario Outline: a write that created nothing sends account_uuid and nothing el
     | A:work, B:work | B                    | asks for no label | refreshed | B    |
     | A:work, B:work | B                    | asks for work     | refreshed | B    |
     # Covers AC `quiet-writes-stay-quiet` and REQ-ROS-Q-001's fixtures that one capture can reach.
-    # Row 1 is an ordinary new account under a fresh label: `after > 1` is what keeps it quiet. Rows 2
-    # and 3 refresh an entry whose label already had two bearers, without and with the label given:
-    # the count stays at two, so `after > before` is what keeps them quiet. Both clauses carry
-    # weight, as import's stub shows. The third fixture the AC names, a relabel to the label the
-    # entry already carries, is Rule 2's first scenario.
+    # Row 1 is an ordinary new account under a fresh label: no other account carries `personal`, which
+    # is what keeps it from being refused. Rows 2 and 3 refresh an entry whose label already had two
+    # bearers, without and with the label given: B takes no label it did not carry, which is what keeps
+    # them from being refused. Both halves of the shared rule carry weight (Rule 2's preamble), and
+    # import's count gives the same verdicts, `after > 1` failing on row 1 and `after > before` on rows
+    # 2 and 3, as import's stub shows. The third fixture the AC names, a relabel to
+    # the label the entry already carries, is Rule 2's first scenario.
 
-Scenario: every quiet scenario of the import stub that one capture can reach has a counterpart that stays quiet
+Scenario: every quiet scenario of the import stub that one capture can reach has a counterpart that completes and stays quiet
   Given the quiet scenarios of docs/specs/import-duplicate-label.feature.md
    When each is restated as a menu-bar capture
-   Then each is quiet
-    # Covers the item's second conformance criterion, by concretize-and-compare rather than by reading.
+   Then each completes without a refusal, and is quiet
+    # Covers the item's second conformance criterion, its quiet half, by concretize-and-compare rather
+    # than by reading; Rule 2 holds the refused half.
     #   same label, same uuid ...................... Rule 2's first scenario
     #   an ordinary import of distinct labels ...... row 1 above
     #   overwriting a duplicate already there ...... rows 2 and 3 above
@@ -347,22 +400,36 @@ Scenario: a refusal carries its reason and nothing else
   Given a menu-bar capture that the daemon refuses, for each reason it can send
    Then the acknowledgement line carries the result rejected and that reason's tag, and no other key
     And it carries no account_uuid, no label, no count and none of the new keys
-    # Covers the item's "Quiet writes and refusals" paragraph. The reasons are the five tags of the enum
-    # `CaptureRejection` (src/daemon/socket.rs:672): no-active-account, keychain-locked,
-    # swap-lock-busy, failed and prior-configuration. One of them is already pinned whole by
-    # `the_prior_configuration_tag_is_redacted` (src/daemon/socket.rs:2035). The same line is the Swift side's input in Rule 8.
+    # Covers the item's "Quiet writes and refusals" paragraph and AC `refusal-vocabulary-moves-as-one`.
+    # The reasons are the seven tags of the enum `CaptureRejection` (src/daemon/socket.rs:672): the five
+    # it has today, no-active-account, keychain-locked, swap-lock-busy, failed and prior-configuration,
+    # whose lines stay byte-identical, and the two this item adds, label-in-use and
+    # relabels-another-account. One of the five is already pinned whole by
+    # `the_prior_configuration_tag_is_redacted` (src/daemon/socket.rs:2035), and Rule 7 pins each new
+    # one whole by its golden. The same line is the Swift side's input in Rule 8.
 
 Scenario: a roster save that fails after the stash landed names nothing
   Given a menu-bar capture whose credential was stashed under the uuid B
     And the roster save then fails
    Then the acknowledgement is rejected with the reason failed, and carries no uuid, no label and no count
     And no credential_shared event is written for the capture
-    # Covers the item's "Quiet writes and refusals" paragraph and AC `vocabulary-gates-unchanged`
-    # (`CaptureRejection` keeps its tags).
+    # Covers the item's "Quiet writes and refusals" paragraph and AC `refusal-vocabulary-moves-as-one`
+    # (the five tags `CaptureRejection` has today keep their bytes).
     # The daemon knows B and the label at this point and sends neither. A roster save failure maps to
     # the opaque `failed` in `classify_capture_failure` (src/daemon/classify.rs:167). Detection runs
     # after the roster is saved (design D-4), so a failed save compares nothing. The stash is an
     # orphan, which is F10's and not this item's.
+
+Scenario: a refused capture compares no credential and names no shared one
+  Given a roster A:work, whose stash holds the credential K
+    And the signed-in account is B, which the roster does not hold, and its credential is K
+   When a menu-bar capture asks for work
+   Then the acknowledgement is rejected with the reason label-in-use, and carries no shared_with
+    And no credential_shared event is written for the capture
+    # Covers AC `oracle-socket-capture-refuses-a-collision`, its last sentence. Detection runs after the
+    # roster is saved (design D-4) and the refusal comes before any write, so nothing is compared. No
+    # pair is lost: B's credential was never stashed, so no second entry holds K. A rename refusal
+    # compares nothing for the same reason.
 ```
 
 ## Rule 6 — the acknowledgement carries no credential, email or credential-derived value
@@ -418,7 +485,9 @@ Scenario: a hyphenated uuid is not one long alphanumeric run
 > `include_str!`. Whichever of this item and #1558 lands first creates the shared emitter, and the
 > second adds its golden. The item suggests the emitter name `emit_wire_ack_golden_fixtures` and
 > the files `build/fixtures/wire-capture-ack-captured.json` and
-> `build/fixtures/wire-capture-ack-refreshed.json`.
+> `build/fixtures/wire-capture-ack-refreshed.json`, plus one golden per refusal this item adds,
+> `build/fixtures/wire-capture-ack-rejected-label-in-use.json` and
+> `build/fixtures/wire-capture-ack-rejected-relabels-another-account.json`.
 
 ```gherkin
 Scenario Outline: an optional key is omitted when it is empty, never sent as null or as an empty list
@@ -432,7 +501,7 @@ Scenario Outline: an optional key is omitted when it is empty, never sent as nul
     | refreshed |
     # Covers AC `wire-shape-and-golden`, "the optional keys only when non-empty", and the serde seam
     # of AC `quiet-writes-stay-quiet`. An older client ignores an unknown key but not a `null` it
-    # cannot decode, and the empty list is a claim ("no collision") the omitted key does not make.
+    # cannot decode, and the empty list is a claim ("no shared credential") the omitted key does not make.
 
 Scenario: the pin fails when a committed golden differs from what the crate produces
   Given the committed golden of a variant
@@ -457,37 +526,51 @@ Scenario: a field added to a variant later is a compile error until the builder 
 Scenario: only the named ignored emitter writes a golden
   Given a plain test run
    Then no golden is written or changed
-    And running the emitter by name regenerates both goldens
+    And running the emitter by name regenerates every golden this item adds
     # Covers AC `wire-shape-and-golden`: the goldens "are written only by the named ignored emitter".
     # Never run the suite with `--include-ignored`: it rewrites a frozen migration fixture
     # (`build/fixtures/migration-v1-encrypted.json`).
 ```
 
-🟥 Blocked on `duplicate-label-policy` and `login-mismatch-policy`. The scenario below waits for the operator's answer.
-
 ```gherkin
-Scenario: 🟥 the filled goldens carry the item's fields
+Scenario: the filled goldens carry the item's fields, and none carries a collision or a previous label
   Given the captured variant and the refreshed variant
    When their goldens are emitted
-   Then each line carries every field its variant can carry, each filled
-    And account_uuid and shared_with are among them
-    And (pending `duplicate-label-policy`: whether collisions is among them. Warn puts it there; refuse moves the report to a rejection tag)
-    And (pending `login-mismatch-policy`: whether previous_label is among them on refreshed. Refuse moves the report to a rejection tag)
+   Then the captured line carries account_uuid and shared_with, each filled
+    And the refreshed line carries account_uuid and shared_with, each filled
+    And no golden carries collisions or previous_label
     # Covers AC `wire-shape-and-golden` and the Specification's golden paragraph ("every optional
-    # field filled").
-    # The item's default: captured with account_uuid, collisions and shared_with; refreshed with all
-    # four. The golden is the exact line the daemon writes, so the keys it holds are the keys the
-    # decoder must read (Rules 8 and 9).
+    # field filled"). Since the rulings, no completed capture carries a collision (Rule 2) or a
+    # previous label (Rule 3), so both variants carry the same two keys. The golden is the exact line
+    # the daemon writes, so the keys it holds are the keys the decoder must read (Rules 8 and 9).
+
+Scenario Outline: each new refusal has a golden that is its whole line
+  Given the refusal <tag>
+   When its golden is emitted
+   Then the golden holds the line {"result":"rejected","reason":"<tag>"} and nothing else
+
+  Examples:
+    | tag                      |
+    | label-in-use             |
+    | relabels-another-account |
+    # Covers AC `wire-shape-and-golden` and AC `refusal-vocabulary-moves-as-one`. Pinned whole, as
+    # `the_prior_configuration_tag_is_redacted` (src/daemon/socket.rs:2035) pins its own tag, because
+    # the wire form is what a client sees: no label, uuid or count
+    # (docs/specs/capture-rejection-parity.feature.md, Rule 2). The Swift side decodes each in Rule 8.
 ```
 
-## Rule 8 — the app reads every fact, tolerates its absence and keeps the vocabulary closed
+## Rule 8 — the app reads every fact, tolerates its absence, models both refusals and keeps the vocabulary closed
 
-> Design D-10, ACs `swift-decodes-values` and `vocabulary-gates-unchanged`. The decoder is
+> Design D-10 and § 8.2, ACs `swift-decodes-values`, `refusal-vocabulary-moves-as-one` and
+> `refusal-card-sentence-and-mock-row`, and R-12 of docs/requirements/roster-loss-prevention.md
+> (user-ratified): a new refusal reason is present in the Rust `CaptureRejection`, in the Swift
+> mirror and in the panel's authored capture-states reference, in the same change. The decoder is
 > `CaptureAck.decode` (apps/menubar/Sources/CaptureAck.swift:92), pure. It probes `result`, then
 > decodes a private body, and it drops unknown sibling keys. It exposes each fact on the `captured`
-> and the `refreshed` outcome, and `previous_label` only where the outcome is refreshed, whatever shape
-> #1474 gives `refreshed`. No scenario here names a Swift case or accessor. The Swift test locates
-> each golden from its own `#filePath`, as `ConfigSetRejectDetailParityTests` (apps/menubar/Tests/ConfigSetRejectDetailParityTests.swift:152) does.
+> and the `refreshed` outcome, whatever shape #1474 gives `refreshed`. No scenario here names a Swift
+> accessor for the facts; the two refusal cases take the names fixed with their tags, `labelInUse`
+> and `relabelsAnotherAccount`. The Swift test locates each golden from its own `#filePath`, as
+> `ConfigSetRejectDetailParityTests` (apps/menubar/Tests/ConfigSetRejectDetailParityTests.swift:152) does.
 
 ```gherkin
 Scenario Outline: the app reads the value the golden carries for <field>
@@ -509,7 +592,7 @@ Scenario Outline: an acknowledgement from an older daemon decodes to empty facts
   Given the line an older daemon sends: <line>
    When the app decodes it
    Then it does not throw
-    And the decoded outcome carries the label work and no uuid, no collisions, no previous label and no shared credentials
+    And the decoded outcome carries the label work, no uuid and no shared credentials
 
   Examples:
     | line                                            |
@@ -540,11 +623,14 @@ Scenario Outline: the closed vocabulary still throws on a value the app does not
     | line                                              |
     | {"result":"future_state"}                         |
     | {"result":"rejected","reason":"future-reason"}    |
-    # Covers AC `vocabulary-gates-unchanged`. `testDecodeUnknownResultThrows` and
-    # `testDecodeAllRejectionReasons` pass without edits. `CaptureRejection` keeps its five tags and
-    # `every_rust_rejection_tag_has_a_swift_case` (src/daemon/socket.rs:1979) passes without edits under the item's
-    # defaults, warn and keep the rename. A refuse answer adds a tag with its Swift case in the same
-    # commit, and that test gates it.
+    # Covers AC `refusal-vocabulary-moves-as-one`. `testDecodeUnknownResultThrows` and
+    # `testDecodeUnknownRejectionReasonThrows` pass without edits: the vocabulary grows by two tags and
+    # stays closed. `CaptureRejection` gains `label-in-use` and `relabels-another-account` with their
+    # Swift cases in the same commit, and
+    # `every_rust_rejection_tag_has_a_swift_case` (src/daemon/socket.rs:1979) gates them with no edit
+    # to its own body; `tagged_rejections` (src/daemon/socket.rs:1764) gains the two variants in its
+    # list and the two arms its `match` asks for, and
+    # `testDecodeAllRejectionReasons` gains the two rows its `CaptureRejection.allCases` count asks for.
 
 Scenario: the daemon's result vocabulary stays three values
   Given one acknowledgement of each variant the daemon can build
@@ -552,34 +638,63 @@ Scenario: the daemon's result vocabulary stays three values
    Then they are captured, refreshed and rejected
     And no relabel, collision or shared credential adds a fourth
     # AC-IDN-004's BUT NOT: "a new `result` value for the relabel, which today's decoder would throw
-    # on". This holds under every option of both decisions. The `result` vocabulary's own parity gate is #1474's.
+    # on". It holds under the rulings: a refused relabel is a `rejected` with its own reason, never a
+    # fourth result. The `result` vocabulary's own parity gate is #1474's.
 
 Scenario: a captured acknowledgement still ends the capture in its done phase with the same label
   Given a menu-bar capture whose acknowledgement is captured under the label work
    Then the model's phase is done with the label work
-    And the model's phases and copy are unchanged
-    # Covers the item's "`AccountCaptureModel` keeps its phases and its copy". The edit to the match in
-    # `capture` (apps/menubar/Sources/AccountCaptureModel.swift:148) is mechanical. What the card does
-    # with the facts is #1561's.
+    And the model's phases, and the done line's copy, are unchanged
+    # Covers the item's "`AccountCaptureModel` keeps its phases". The edit to the match in
+    # `capture` (apps/menubar/Sources/AccountCaptureModel.swift:148) is mechanical. The only copy this
+    # item adds is the two refusal sentences of the next outline. What the card does with the facts is
+    # #1561's.
 ```
 
-🟥 Blocked on `duplicate-label-policy` and `login-mismatch-policy`. The scenarios below wait for the operator's answer.
-
 ```gherkin
-Scenario Outline: 🟥 the app reads the value the golden carries for <field>
-  Given the committed <variant> golden
+Scenario Outline: each new refusal decodes to its own case and reaches the card as its own sentence
+  Given the line {"result":"rejected","reason":"<tag>"}
    When the app decodes it
-   Then the decoded outcome carries <value>
+   Then the decoded outcome is the refusal <case>, and decoding does not throw
+    And the capture ends in its failed phase with that refusal
+    And the card's sentence for it differs from every other capture failure's, names no command and does not say "try again"
+    And that sentence carries no token or phrase that src/framing_vocabulary.rs bans, the list read from that file when the test runs
+    And that sentence says <reason>, and names no label
 
   Examples:
-    | variant   | field          | value                                                        |
-    | captured  | collisions     | each element's label and bearer uuids, in the golden's order |
-    | refreshed | collisions     | each element's label and bearer uuids, in the golden's order |
-    | refreshed | previous_label | the golden's previous label                                  |
-    # Pending per row: the two `collisions` rows wait on `duplicate-label-policy` (whether `collisions` is a
-    # field); the `previous_label` row waits on `login-mismatch-policy` (whether `previous_label` is a field).
-    # Covers AC `swift-decodes-values`: "each collision's label and bearers in order, the previous
-    # label". The previous label is read on a refreshed outcome only.
+    | tag                      | case                   | reason                                                   |
+    | label-in-use             | labelInUse             | another account already carries the label asked for      |
+    | relabels-another-account | relabelsAnotherAccount | the account is already on the roster under another label |
+    # Covers AC `refusal-vocabulary-moves-as-one` and AC `refusal-card-sentence-and-mock-row`. The
+    # decoder fails closed on an unknown reason, so a tag that lands in Rust alone breaks the capture
+    # button rather than degrading it. The sentence lives in
+    # `StatusPanelFormat.captureErrorText` (apps/menubar/Sources/StatusPanelFormat.swift:53), whose
+    # switch has no default arm, so the compiler asks for it, and `PanelCaptureCardTests` measures it against the card. Both refusals are
+    # stable, so a retry refuses the same way, which is why neither sentence invites one (the reason
+    # #1441 gave its own tag). A remedy on the panel is an act or a launch path, never text naming a
+    # command (docs/requirements/gui-cli-capability-parity.md, R-4 and R-5). The tag carries no label,
+    # so the sentence names none, and no line of the card names the label the landed account carries
+    # now, which the panel cannot know for certain (design § 12.3, C-6). Which rows carry the label
+    # asked for, and the card's act and launch paths, are #1561's. The wording is not pinned here.
+    # The framing step is C-9's binding (design § 12.3) and REQ-NTC-C-002's. The test reads
+    # `BANNED_TOKENS` and `BANNED_PHRASES` from src/framing_vocabulary.rs when it runs, through
+    # `FramingVocabularyScan` (apps/menubar/Tests/NotificationDeliveryTests.swift:198), whose parse
+    # throws rather than return an empty list, and scans the sentence under the whole list with no
+    # exemption set, as the notification screen in that file does. A copy of the list typed into the
+    # test would be the second definition issue #1219 retired, which no Rust change could redden.
+
+Scenario: the panel's capture-states reference authors a row for each new refusal
+  Given apps/menubar/design/menubar-preview.html after the change
+   When its two capture-states frames are read, light and dark
+   Then each holds one Refused row per new refusal
+    And each row carries the words of that refusal's card sentence, with the treatment of the existing Refused row
+    # Covers AC `refusal-card-sentence-and-mock-row` and R-12's "the panel's authored capture-states
+    # reference". The precedent is #1441, whose change added the prior-configuration row to both
+    # frames and recorded the panel's divergences from it in apps/menubar/design/README.md
+    # (docs/specs/capture-rejection-parity.feature.md, Rule 3). The two rows lengthen both frames, and
+    # so the page, which is already past the render cap (the scope brief's `render-height-budget`).
+    # Like #1441's, this change edits the HTML and does not regenerate renders/all-states.png; a
+    # whole-page render waits on `mock-page-restructure`.
 ```
 
 ## Rule 9 — a field added on one side only fails the `test` job
@@ -589,9 +704,10 @@ Scenario Outline: 🟥 the app reads the value the golden carries for <field>
 > (`rust_wire_tags`, src/daemon/socket.rs:1793). Its Swift side is parsed strictly from source text and panics on a shape
 > it cannot parse (`swift_rejection_tags`, src/daemon/socket.rs:1882), reading the one file the decoder lives in
 > (`swift_capture_ack`, src/daemon/socket.rs:1866). A canary proves the extraction finds what it
-> should. The list holds this work's fields: `account_uuid`, `collisions`, `previous_label` and
-> `shared_with` here, and `collisions` on `applied` in #1558. Whichever item lands first creates the
-> gate and its helpers, and the second adds its fields.
+> should. The list holds this work's fields: `account_uuid` and `shared_with` here, and
+> `collisions` on the `config-set` refusal in #1558, which carries it on `rejected` since the
+> rulings. Whichever item lands first creates the gate and its helpers, and the second adds its
+> fields. The two refusal tags are not fields: `every_rust_rejection_tag_has_a_swift_case` gates them.
 
 ```gherkin
 Scenario: a listed field that the Swift decoder does not read fails the gate
@@ -642,17 +758,8 @@ Scenario: the drift that exists today does not fail the gate
 ```
 
 ## Red cards — the questions that no scenario above can close
-> **Ruling, 2026-11-03.** Both policies this section waits on are decided by the operator: refuse (PRD § 8.1, design
-> § 12.2). The 🟥 scenarios below take the refuse form at #1559's re-gate: `label-in-use` and `relabels-another-account`
-> rejections in the acknowledgement, with the override carried in the request in a form #1559 settles; the collision
-> and previous-label lines on a completed write remain only for rosters that already hold a duplicate. The header's
-> count predates the ruling.
 
-
-| Blocked on | Question | Hangs on it | The item's own default |
-|---|---|---|---|
-| `duplicate-label-policy` | When a write makes a label name a second account, is the report a `collisions` element on the completed write's acknowledgement (warn) or a refusal before any write (refuse)? Refuse needs AC-6 of the migration PRD re-ratified, a `label-in-use` tag on `CaptureRejection` and its Swift case in the same commit | Rule 2, the 🟥 scenarios; Rule 7, whether `collisions` is a golden key; Rule 8, the `collisions` rows; the future oracle for `oracle-socket-capture-reports-a-collision` | warn, the only form that needs no re-ratification |
-| `login-mismatch-policy` | When a socket `capture` gives an already-rostered account a different label, does the write complete with the old label named (`previous_label`), complete with a warning, refuse (a `relabels-another-account` tag), or compare an email-shaped label with the captured address? | Rule 1, the relabel scenario; Rule 2, the relabel-onto and roster-order scenarios; Rule 3, the 🟥 scenario; Rule 7, whether `previous_label` is a golden key; Rule 8, the `previous_label` row; the future oracle for `oracle-socket-refresh-reports-the-previous-label` | keep the rename and disclose it |
+This pass re-authored the two Red cards this section held, `duplicate-label-policy` and `login-mismatch-policy`, into the refuse-form scenarios of Rules 1, 2, 3, 5, 7 and 8 after the operator ruled both on 2026-11-03 (PRD § 8.1); no Red card remains.
 
 ## Calls this stub took
 
@@ -663,7 +770,14 @@ Each is a call made without the operator, and each is ratification-pending.
 | DQ-6 is closed: the acknowledgement carries `shared_with` | The design's recorded default (§ 14.8) agrees with REQ-STSH-B-002 (Must) and with the operator's parity ruling of 2026-07-31 (`docs/requirements/gui-cli-capability-parity.md`) | Rule 4 and every `shared_with` row in Rules 5 to 9 go, and the goldens lose a key |
 | The key-set comparison in `swift-decodes-values` is read as equality over this work's fields, with `count` and `accounts` a named exemption | The golden carries `count`, the model reads `accounts`, and the item says whole-body equality fails on that pair today | None. It is a reading of a criterion that cannot be met as worded; the item's wording needs the scope |
 | "Every quiet scenario in that file" is read as every one a socket capture can reach | One capture writes one entry, so the swap has no counterpart; #1558 words the same clause with that scope | None. The item's wording needs the scope |
-| No scenario names a Swift case or accessor for the decoded facts or for `refreshed` | #1474 has not chosen the shape; the item says "whatever shape #1474 gives" | None |
+| No scenario names a Swift accessor for the decoded facts, or a Swift case for `refreshed` | #1474 has not chosen the shape; the item says "whatever shape #1474 gives". The two refusal cases are named, because their names were fixed with their tags | None |
+| The derived-label outline is asserted at the socket and owes no RED here | The orchestrator's reading puts the free-suffix rule in the shared capture plan, which #1556 changes, so the rule is in the tree before this item starts | If #1556 lands without the suffix, its gate refuses a colliding derived label, which REQ-LGN-B-003 forbids, and this item waits for that to be settled |
+| A refused capture's audit line names the label the request carried | `capture_failure` already builds every refusal's line from the request's label hint, and the event's token follows the tag, as `prior_configuration` follows `prior-configuration` | A refusal that found the account could name its current label instead; only the two audit steps change |
+| "No key on the request lifts a refusal" is read as: the key is ignored, as today's parse ignores it | The socket accepts no consent, and the parse already drops the key, so the reading costs no change | A strict re-parse would answer `malformed request` instead; that scenario's Then changes and the refusals do not |
+| Each new refusal has a golden of its whole line | The orchestrator's brief for this re-authoring asks for one golden per new refusal, and the wire form is what the panel sees | The two goldens go, and the whole-line pin moves to a unit test like `the_prior_configuration_tag_is_redacted` |
+| The two refusal sentences are pinned by property, not by wording | R-12 asks this item for one sentence per tag, while the wording of card lines is #1561's | If the wording is pinned here, #1561's refusal presentation edits a pinned value |
+| The framing scan of the two refusal sentences takes `BANNED_TOKENS` whole, with no exemption set | REQ-NTC-C-002 asks for the audience that matches the string's register; the notification screen, the one audience on the Swift side, takes the whole list, and no `captureErrorText` sentence spends a banned word today | An exemption set would let its tokens through; only the token list the scan passes changes |
+| The mock rows land without a regenerated render | #1441's row did the same, and the page is already past the render cap | If the render must move with the rows, the item waits on `mock-page-restructure` |
 
 ## Not pinned by the item
 
@@ -674,10 +788,13 @@ item does not spell out.
 - The names of the new tests, beyond the ones the item suggests, and the file that holds the pin.
 - The Swift type that carries the facts: one payload shared by both outcomes, or one per case.
 - The bytes of a `credential_shared` event. Those are #1557's, and its stub pins them.
-- Which roster `collisions` and `shared_with` are read from when the daemon refuses a shrinking
-  reload after the save. The report carries the roster that was written, and `count` is the one
+- Which roster `shared_with` is read from when the daemon refuses a shrinking reload after the
+  save. The report carries the roster that was written, and `count` is the one
   value the handler reads back from the live roster (`self.roster.len()`, src/daemon/commands.rs:416). #1558 says the same for `config-set`.
-- The wording of any card line. That is #1561's.
+- The wording of the two refusal sentences, beyond the properties Rule 8 names, and the wording of
+  any other card line, which is #1561's.
+- The names of the two new `CaptureEventOutcome` variants. Their tokens follow the tags,
+  `label_in_use` and `relabels_another_account`, and the audit steps assert the tokens.
 
 ## Acceptance criteria that no scenario expresses
 
@@ -694,6 +811,13 @@ item does not spell out.
 - *Malformed new key*: `malformed-new-key-keeps-the-outcome` pins that a line whose new key is present but
   malformed decodes to its outcome with that fact empty (seam `CaptureAck.decode`, RED owed); no scenario
   here expresses it.
+- *Vocabulary bookkeeping*: under AC `refusal-vocabulary-moves-as-one`, `testDecodeAllRejectionReasons`
+  gains the two rows its `CaptureRejection.allCases` count asks for, `PanelCaptureCardTests`' `captureFailures`
+  gains the two rows `testEveryCaptureFailureIsEnumerated` asks for, and
+  `capture_event_outcome_rejected` (src/daemon.rs:6402) gains the two arms its `match` asks for.
+- *Stale restatements*: `stale-restatements-updated` names the comments that still say a capture
+  acknowledgement carries only the label and the count, and the Swift `CaptureRejection` doc that counts
+  its tags; its check is a `git grep` that prints nothing.
 - *Mutation records*: the two mutations in Rule 9, recorded in the pull request.
 - *RED records*: the item owes a failing run, recorded on the issue, for each oracle. See the next
   section.
@@ -708,26 +832,37 @@ Taken from the acceptance criteria, for whoever binds the scenarios.
 - Rules 1 to 5: `perform_socket_capture` (src/daemon/commands.rs:280) over the hermetic daemon, as
   the two existing tests build it, with a temporary config path, a stash fake seeded with `stash_with`,
   and the serde form of `CaptureAck` (src/daemon/socket.rs:656). Rule 4 also reads the events the
-  handler returns.
+  handler returns. The fixtures write one roster to the file and to the daemon, as those tests do: a
+  refusal is judged against the roster the handler reads from `config.toml` before the lock. Rule 2's
+  override scenario is asserted at the request parse in `serve_control` (src/daemon/socket.rs:904).
 - Rule 6: the redaction meter over the serialized goldens.
-- Rule 7: the serde form, the emitter and the pin, in the `test` job.
-- Rule 8: Swift unit tests over `CaptureAck.decode`, which is pure, reading the goldens from disk.
+- Rule 7: the serde form, the emitter and the pin, in the `test` job, for both variants and both new
+  refusals.
+- Rule 8: Swift unit tests over `CaptureAck.decode`, which is pure, reading the goldens from disk; over
+  `StatusPanelFormat.captureErrorText`, which is pure, with `PanelCaptureCardTests` measuring each
+  sentence against the card and a framing scan reading src/framing_vocabulary.rs when it runs; and
+  the mock's two capture-states frames, read as text.
 - Rule 9: a Rust test in the `test` job that reads `CaptureAck.swift` as text.
 
 ## Oracle authorship
 
 *Work class*: deterministic-output. The primary deliverable is a wire frame, the serialized
-acknowledgement, with its byte-pinned golden and a decoder over it. A golden compare, a value
-assertion on the serde form and a value-asserting decode each falsify a wrong output mechanically.
+acknowledgement and its two new refusals, with byte-pinned goldens and a decoder over them. A golden
+compare, a value assertion on the serde form and a value-asserting decode each falsify a wrong output
+mechanically.
 
-*Authorship*: no oracle item is filed yet. The item's collision oracle and its previous-label oracle
-assert a form that `duplicate-label-policy` and `login-mismatch-policy` decide, and the PRD says as
-much: the answer "fixes the assertion form of REQ-ROS-C-002's oracles". The scenarios blocked on
-them are Rule 1's relabel scenario, Rule 2's five 🟥, Rule 3's 🟥, Rule 7's filled-golden scenario and
-Rule 8's 🟥 outline. The rest are decided. The one oracle item is filed once the operator decides, so
-they wait for it too.
+*Authorship*: no oracle item is filed yet. Since the operator ruled both policies, every outcome here
+is decided, and the PRD's "fixes the assertion form of REQ-ROS-C-002's oracles" now reads as the
+refusal. Two seams still hold the oracle back. The Swift assertions on `refreshed` go through the
+outcome #1474 gives the app, and Rule 4's agreement compares the acknowledgement with the
+`credential_shared` events #1557 adds. The capture plan's gate (#1556) is no longer an authoring
+seam: every refusal and quiet assertion is made at `perform_socket_capture` over the serde form,
+which compiles before #1556 lands. The refusal assertions fail until this item maps the refusals, and
+the quiet ones pass before and after. The derived-label outline is #1556's rule seen through the
+socket: it passes once #1556 lands and owes no RED here. The one oracle item is filed once #1474 and
+#1557 have landed, and before this item starts.
 
-For whoever files it once the operator decides:
+For whoever files it:
 
 - The new fields do not exist on `CaptureAck` today (src/daemon/socket.rs:656), so a test written
   before the change cannot build the filled value. Assert on `serde_json::to_value` of the
@@ -735,8 +870,16 @@ For whoever files it once the operator decides:
 - `perform_socket_capture` (src/daemon/commands.rs:280) returns `(CaptureAck, Option<Event>)` today, and #1557 changes the
   second element to a `Vec<Event>`. An oracle over the events, Rule 4's agreement, can only be
   authored after #1557 lands.
-- The Swift scenarios wait for #1474, which gives the app a `refreshed` outcome.
+- The Swift scenarios on `refreshed` wait for #1474, which gives the app a `refreshed` outcome. The
+  two refusal cases do not exist before the change either: a Swift RED test reaches them through
+  `CaptureRejection(rawValue:)` under `XCTUnwrap`, which compiles before the change and fails until
+  the case exists.
+- A refusal test asserts the tag and that nothing was written: the stash fake's entries, the bytes
+  of `config.toml` and the live roster. A test that asserts only `rejected` passes over the `failed`
+  an unmapped refusal produces.
 - A RED oracle lands `#[ignore = "RED oracle: pre-authored ahead of its fix (issue #1559), which
   un-ignores it"]`, because `ci-ok` cannot merge a failing suite and `main-protection` has no bypass
   actor. It keeps a non-ignored companion on the same fixture and proves it discriminates by
-  applying the fix in a scratch copy and mutating each guarded invariant.
+  applying the fix in a scratch copy and mutating each guarded invariant. A Swift RED test lands in
+  one of the two forms the open decision `swift-red-landing-form` names: a strict `XCTExpectFailure`
+  tagged `[RED #1559]` whose `issueMatcher` matches on `contains`, or `try XCTSkipIf(true, "<reason>")`.

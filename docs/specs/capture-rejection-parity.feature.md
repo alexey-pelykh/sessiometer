@@ -48,7 +48,8 @@ Scenario: the menu-bar first run still works
 Scenario: every Rust tag has a Swift case
   Given the set of rejection reasons the daemon can emit
    Then each has a corresponding CaptureRejection case
-    # The four today are no-active-account, keychain-locked, swap-lock-busy, failed.
+    # The five today are no-active-account, keychain-locked, swap-lock-busy, failed and
+    # prior-configuration (#1441 added the fifth; this comment counted four until 2026-11-03).
 
 Scenario: the new tag decodes rather than throws
   Given the daemon sends the new refusal tag

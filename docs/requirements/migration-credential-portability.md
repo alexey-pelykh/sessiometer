@@ -1217,8 +1217,9 @@ stash irreversibly (`apply_remove`, `src/cli.rs`) and is therefore the case that
 drive the policy, not the one left untested.
 
 > *Amended 2026-11-03 (#1550; the operator's ruling, recorded in `docs/requirements/account-label-integrity.md`
-> § 8.1): the operator ruled that a write which would make a label name a second account is refused unless
-> `--overwrite` is given, on CLI `capture`, CLI `login`, the socket `capture` and `config-set`. That enforces
+> § 8.1): the operator ruled that a write which would make a label name a second account is refused, on CLI
+> `capture`, CLI `login`, the socket `capture` and `config-set`, and that CLI `capture` and `login` may proceed
+> with `--overwrite` (`docs/design/account-label-integrity-solution-design.md` § 12.3, C-5 to C-7). That enforces
 > label uniqueness at those four write paths, so this criterion's "BUT NOT by enforcing label uniqueness" is
 > narrowed to load time and to `import`, where it stands until the operator rules on import.*
 
