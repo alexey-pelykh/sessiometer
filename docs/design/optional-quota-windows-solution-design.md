@@ -459,8 +459,8 @@ last poll failed"; the transitional meaning is named, dated and tied to the item
   carries (`REQ-DEP-C-001`). The fence's conditions C1 to C5 and C7 take their scenarios in the stub's
   Rule 6, with C1's committed-fixture arm in Rule 4's T10 scenario; C6, the operator text, is the
   module doc's under Rule 5 and the runbook item #1603's; the per-axis `samples` count takes its
-  scenarios in Rule 4, with its module-doc clause in Rule 5 and its pins in Rule 6's T17 — all in
-  `docs/specs/sample-store-session-null.feature.md`.
+  scenarios in Rule 4, with its module-doc clause and its count-posture sweep (AC-27) in Rule 5 and
+  its pins in Rule 6's T17 — all in `docs/specs/sample-store-session-null.feature.md`.
 - Tests that move with the shape (`REQ-SMP-C-001`): the canary
   `the_sample_store_cannot_carry_a_non_finite_session_reading` (`src/reliability.rs:7386`) moves twice.
   Its decode loop (`from_str` … `is_err` at `src/reliability.rs:7414-7423`) moves its `"null"` arm to assert
