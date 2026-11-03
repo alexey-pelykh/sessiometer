@@ -525,9 +525,9 @@ lands.
 #### MET-T-002: Relabel disclosure
 
 - **TAG**: RelabelDisclosure
-- **SCALE**: share of relabelling revives — since 2026-11-03 a CLI `capture` or `login` made with `--rename` that
-  matches a rostered account and gives it a different label, a socket `capture` refusing the relabel
-  (design § 12.3 C-3, C-6) — whose reply names both the previous label and the
+- **SCALE**: share of relabelling revives — since 2026-11-03 only a CLI `capture` or `login` made with `--rename` that
+  matches a rostered account and gives it a different label; a socket `capture` refuses a relabel and is
+  outside the population (design § 12.3 C-3, C-6) — whose reply names both the previous label and the
   new one
 - **METER**: hermetic tests over each caller of `plan_capture`
 - **PAST**: 0% at `d9d75ba`; the reply names only the new label (§ 2.4)
@@ -1060,9 +1060,9 @@ claim; the resolution for each follows the table.
 - **RosterEntry Edit, claimed by F1 and F2.** One relabelling revive can both create a collision and
   rename a different account. Resolved as one CTA with conditional behaviour: the one reply carries
   F1's report when REQ-ROS-B-002 counts a collision, and F2's previous label when the revive changed
-  the label. Since 2026-11-03 such a write is refused instead unless the CLI consents, `--overwrite` for the
-  collision and `--rename` for the rename in two steps (design § 12.3 C-4), so a completed reply carries
-  F2's previous label only, never F1's report.
+  the label. Since 2026-11-03 such a write cannot proceed whatever flags are given, because overwrite consent applies
+  only to a new account (design § 12.3 C-4, C-5); the way through is to free the label first, then repeat
+  the write with `--rename`, so a completed reply carries F2's previous label only, never F1's report.
 - **StashedCredential Create, claimed by F3 and F6.** Resolved by order: F6 decides before the write,
   so a refused import entry writes nothing and F3 never compares it; F3 compares every credential that
   is written.
@@ -1165,7 +1165,7 @@ is `login-mismatch-policy`'s to decide (§ 8.1).
 | ID | EARS pattern | Statement | Priority | Origin | Confidence |
 |---|---|---|---|---|---|
 | REQ-IDN-B-001 | Event-driven | When a `capture`, a `login` or a socket `capture` command matches an already-rostered account and gives it a label different from the one it carried, the system shall name in its reply both the label the account carried before the write and the label it carries after it. | Must | `AI-inferred-expansion`; `capture` and the socket `capture` are a same-class addition | VALIDATED: the reply cannot show the previous label (§ 2.4) |
-| REQ-IDN-I-001 | Optional | Where the socket `capture` command refreshes an account under a different label, the daemon shall carry the previous label as an additive field of the `refreshed` acknowledgement. | Must | `AI-inferred-expansion` | VACUOUS since 2026-11-03: the socket `capture` never completes a rename (design § 12.3, C-6), so this condition never holds; the refusal's card names no label (C-6, C-9) |
+| REQ-IDN-I-001 | Optional | Where the socket `capture` command refreshes an account under a different label, the daemon shall carry the previous label as an additive field of the `refreshed` acknowledgement. | Must | `AI-inferred-expansion` | VACUOUS since 2026-11-03: the socket `capture` never completes a rename (design § 12.3, C-6), so this condition never holds; the refusal's card names no account's label; a write that also collides is refused `label-in-use`, whose card names only the label asked for (C-6, C-9) |
 | REQ-IDN-I-002 | Optional | Where the menu-bar app decodes a `refreshed` acknowledgement that carries a previous label, the app shall show both labels on the capture card. | Should | `AI-inferred-expansion` | VACUOUS since 2026-11-03, with REQ-IDN-I-001 (design § 12.3, C-6). Before that: ASSUMED: it waits on #1474 |
 | REQ-IDN-C-001 | Ubiquitous | The project shall author, before the change, a test in which `login X` lands on a rostered account labelled `Y` and the reply names `Y`, failing against the tree before the change. | Must | `AI-inferred-expansion` | ASSUMED |
 | REQ-IDN-C-002 | Optional | Where `login-mismatch-policy` selects a refusal, the system shall take that refusal before the credential stash is written, leaving no stash and no roster change. | Must, where chosen | `AI-inferred-expansion` | SPECULATIVE until 2026-11-03; `login-mismatch-policy` now selects the refusal (§ 8.1), so this requirement applies |
@@ -1211,7 +1211,7 @@ is `login-mismatch-policy`'s to decide (§ 8.1).
 > **BUT NOT** a new `result` value for the relabel, which today's decoder would throw on;
 > **BUT NOT** the previous label shown before the app can decode `refreshed` at all.
 > *Re-keyed 2026-11-03 (design § 12.3, C-6, C-9): the capture is refused with `relabels-another-account`
-> before any write; the card names no label, since the watch snapshot cannot say for certain which account the capture landed on, and offers Settings to rename.*
+> before any write; the card names no account's label, since the watch snapshot cannot say for certain which account the capture landed on, and offers Settings to rename.*
 
 **Invariants.** No reply names an email address the label does not carry, or any credential-derived
 value. An onboarding reply keeps its verb and its count.
