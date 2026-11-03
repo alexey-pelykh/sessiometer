@@ -4,7 +4,7 @@ Issue #1574 · parent #1550 · PRD § 10.4 (F4, Invariants) and § 10.11 (REQ-NT
 
 Example Mapping: 🟦 5 rules · 🟩 17 examples · 🟥 3 open (`label-normalization-policy`; `duplicate-label-policy`; the Accounts-row frame)
 
-Sources: the PRD, `docs/requirements/account-label-integrity.md`, and the design, `docs/design/account-label-integrity-solution-design.md`. Both land with the scoping pull request. Every requirement id, `UX-` id and section number below points into them.
+Sources: the PRD, `docs/requirements/account-label-integrity.md`, and the design, `docs/design/account-label-integrity-solution-design.md`. Both are on `main` since the scoping pull request #1638 merged. Every requirement id, `UX-` id and section number below points into them.
 
 Work class: **deterministic-output** (the `oracle-authorship` call, ratification-pending). The primary deliverable is what a Settings row shows and says, a badge string and an accessible-label string, and the saved-roster state they are computed from. A mechanical grader falsifies a wrong one by exact comparison. The aspects that no mechanical grader reaches are listed under § Not scenarios, each with the check or the reviewer that covers it: the badge's place, look and contrast, what VoiceOver says aloud, and the mock frame.
 

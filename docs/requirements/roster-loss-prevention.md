@@ -241,6 +241,12 @@ Where a reload originates from a **mutating** verb (`remove`, `disable`, `enable
 `config set`), the daemon **shall** adopt the roster as read, including a legitimate reduction to
 zero — R-3's refusal **shall not** apply.
 
+> *Noted 2026-11-03 (#1550; `docs/design/account-label-integrity-solution-design.md` § 12.3, C-5): once #1556
+> builds `capture --overwrite` and `login --overwrite`, each replaces exactly one roster entry with a new
+> account without lowering the account count, so its reload stays append-only and R-3's floor still applies.
+> A write that would lower the count, a rename onto a label another account carries, is refused there
+> instead. `plan_capture` keeps its two arms (I-1); the replacement removes the holder outside it.*
+
 **R-5** *(E3, user-ratified)*
 `login` **shall** carry the roster it parses at its first config read through to the point of
 persistence, rather than discarding all but `c.login` and re-reading (I-5). Where the two reads

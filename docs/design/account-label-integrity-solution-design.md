@@ -158,6 +158,14 @@ A source-scan test pins that every function that writes the roster calls the rul
 pins every caller of `reconcile_roster`. It is what stops a fifth writer —
 the socket `login` #1021 — shipping without the rule (premortem PM-19; the PM-n numbers index the design stage's pre-mortem pass, whose record is machine-local scratch that this repository does not carry).
 
+**Refuse form (2026-11-03, § 12.3 Terms and C-7).** The shared function carries a per-account calibration
+instead of the count rule above: a write creates a collision when it gives an account a label it did not
+carry before and another account carries that label after the write. The count rule lets a save move an
+account onto a label two others already share; the per-account rule refuses it and still keeps the
+label swap of AC-ROS-002 quiet. `apply_import` keeps `label_bearers` and `created_ambiguity` unchanged
+until the operator rules on `import`, and the source-scan test lists it as the one writer with its own
+rule; the F8 hook plugs into the shared function.
+
 ### D-2 — the plan seam returns what the reply needs, before any write *(REQ-ROS-B-001, REQ-IDN-B-001, REQ-IDN-C-002)*
 
 `plan_capture` (`src/capture.rs:635`) is the one place that matches a harvested uuid to an entry, and it
@@ -176,8 +184,9 @@ keychain delete to undo it, and that delete can fail and leave an orphan (PM-14)
 
 Every new operator-facing string is a named template in one module, registered with the #160 scanner
 under the advisory audience (#1123); none is an inline literal (PM-13). The CLI renders the templates.
-Socket acknowledgements carry structured facts — labels, the bearers' uuids, a previous label — and never
-rendered prose; the app renders its own strings, scanned by a Swift test that reads
+Socket acknowledgements carry structured facts — labels, the bearers' uuids, a previous label (since
+2026-11-03 the refusal tags carry no data and no acknowledgement carries a previous label, § 12.3 C-6,
+C-12) — and never rendered prose; the app renders its own strings, scanned by a Swift test that reads
 `src/framing_vocabulary.rs` the way `NotificationDeliveryTests` already does.
 
 An account is named by its label. Its uuid is added only where the label alone is ambiguous, meaning it
@@ -370,6 +379,11 @@ given for a rostered account renames it, coordinated with #1379's edit of the sa
 after `login-mismatch-policy` is answered, because a refuse answer would make "renames" false
 (REQ-DOC-B-003 assumes the keep-rename option; § 14.6 item 14).
 
+*Amended 2026-11-03: `login-mismatch-policy` was answered refuse (§ 12.2), so `LOGIN_USAGE` says what
+§ 12.3 C-10 states instead: a label that would rename the landed account is refused unless `--rename` is
+given, which renames it, with the rest of that entry; REQ-DOC-B-003 and AC-DOC-003 are re-keyed the same
+way, and #1570 carries the sentence.*
+
 ### D-14 — platform scope *(PRD § 3; #26, #27)*
 
 The design assumes no stash backend exists on Linux or Windows, because every stash call shells out to
@@ -413,7 +427,8 @@ terminal.
 4. The roster is saved under its own config-write lock (#1445); the daemon is told to reload, best-effort.
 5. Outside both locks: F3 compares the written credential with each other entry's stash (D-4).
 6. The reply prints the confirmation line (verb, label, previous label when it changed, the enabled count),
-   then one line per notice: collision, shared credential. A detected pair also appends one
+   then one line per notice: collision, shared credential (since 2026-11-03 no completed write creates a
+   collision, so only the shared-credential notice remains, § 12.3 C-8). A detected pair also appends one
    `credential_shared` line, best-effort like the login audit line (`emit_login_event`, `src/capture.rs:359`).
 
 **Socket `capture`** (panel): the same steps run inside
@@ -469,6 +484,11 @@ each bearer its ordinal (UX-3); they ride the socket that
 already carries every uuid in the `config-get` view, so no exposure class is added (SEC-4). The CLI names
 uuids from its own process.
 
+**Refuse form (2026-11-03, § 12.3 C-12).** Under the operator's rulings no completed write creates a
+collision or completes a socket rename, so `collisions` on `captured`, `refreshed` and `applied`, and
+`previous_label` on `refreshed`, do not ship. `config-set`'s `rejected` arm carries `collisions` beside `reason`
+with the reason `label-in-use`. `account_uuid` and `shared_with` are unchanged.
+
 ### 8.2 Rejection tags — only for an option the operator chooses
 
 | Tag | Enum | Added only if |
@@ -478,6 +498,10 @@ uuids from its own process.
 
 Each tag lands with its Swift case in the same commit. The CLI's refusal is an `Error` with its own
 template under the `Error`-template audience (#1139).
+
+Both tags are added: the operator chose refuse for both decisions (§ 12.2). The capture tags carry no other
+field, as `docs/specs/capture-rejection-parity.feature.md` requires; their shapes and owners are § 12.3 C-6,
+C-7 and C-12.
 
 ### 8.3 Status and watch frames — one minor bump
 
@@ -529,6 +553,12 @@ oauthAccount names <uuid-B>. Nothing was written for it. `` (this design's earli
 "belongs to" the second uuid, which the comparison cannot tell; #1565 corrected it). No template contains a
 token from the #160 banned list (`BANNED_TOKENS`, `src/framing_vocabulary.rs:182`).
 
+**Refuse form (2026-11-03, § 12.3).** The collision line and the "previously" form above describe the warn
+option. Under the rulings the CLI prints a refusal before any write (C-9), a rename made with `--rename`
+names both labels, a holder replaced with `--overwrite` is named by its uuid with its stored login deleted
+(C-5, C-8), and a derived label is made free with a suffix rather than reported (C-2). The shared-credential
+lines and the import lines stand.
+
 ### 8.6 What each surface's version does
 
 | Surface | Change | Version effect |
@@ -539,7 +569,7 @@ token from the #160 banned list (`BANNED_TOKENS`, `src/framing_vocabulary.rs:182
 | `log --json` | lines carried verbatim; new event name | none |
 | `reliability --json` | none | none |
 | migration artifact | none | none (`FORMAT_VERSION` frozen) |
-| CLI text | notices; previous label; enabled count | none (no machine contract) |
+| CLI text | notices; previous label (since 2026-11-03 only on a revive made with `--rename`, § 12.3 C-8); enabled count | none (no machine contract) |
 
 ## 9. UX Architecture — menu-bar surfaces
 
@@ -560,11 +590,11 @@ Settings half of these states waits on it.
 | UX-4 | Row identity is the account identifier; with an older daemon, position plus label. The switching state keys on row identity too | two same-label lines must stay two rows (REQ-ROW-C-001); a label-keyed switching state (`pendingTarget`, `apps/menubar/Sources/StatusPanelRoster.swift:256`) would spin on both rows |
 | UX-5 | The footer callout, next-swap's one home, names its target by label and, when that label has more than one bearer, by the target row's ordinal, found by the target's identifier: "→ work 2 of 2", spoken "Next swap to work, 2 of 2 accounts named work". With an older daemon it cannot find the row and says "one of 2 accounts named work". Either way it keeps its lead and its why line, adds UX-10's reason as a resting line, and disables its Swap | R-2 (re-ratified 2026-07-09) dropped the per-row next-swap marker, so the callout is the only surface DQ-4's question can land on (#930), and "→ work" alone names neither row |
 | UX-6 | The relabel folds into the card's outcome line, "Refreshed ‘work’ (was ‘spare’)", and appears only once #1474 lets the app decode `refreshed`; the card's lines run outcome, collision, shared | AC-IDN-004 BUT NOT; one write reads as one verb, as the CLI's single confirmation line does (§ 8.5) |
-| UX-7 | A refusal, if a policy chooses one, reuses the card's Refused state and Settings' rejected-save state | same decision shape as the existing rejections |
-| UX-8 | Each notice line is announced as a status message without moving focus (WCAG 4.1.3); the announcement carries the ordinal sentence, and the uuids stay in the visible text for reading on demand. Each duplicate row's accessible name carries its ordinal (WCAG 4.1.2), and so does each duplicate Settings label field's accessible label, "Label, 2 of 2", before VoiceOver reads the field's value (WCAG 2.4.6); during an unsaved edit the ordinal still reflects the saved roster; rows without a duplicate keep today's names | the quality-pillar review found these missing (§ 11.4); the UX lens found two duplicate Settings rows indistinguishable to VoiceOver, since each reads "Account", "Label", "work" and "Active" (`accountRow`, `apps/menubar/Sources/SettingsView.swift:228-241`) |
+| UX-7 | A refusal, if a policy chooses one, reuses the card's Refused state and Settings' rejected-save state (both policies chose one on 2026-11-03: the card's two refused states and Settings' refused save, § 12.3 C-6, C-7, C-9; UX-6's relabel line never appears on the card, since a socket relabel is refused) | same decision shape as the existing rejections |
+| UX-8 | Each notice line is announced as a status message without moving focus (WCAG 4.1.3); the announcement carries the ordinal sentence, and the uuids stay in the visible text for reading on demand. Each duplicate row's accessible name carries its ordinal (WCAG 4.1.2), and so does each duplicate Settings label field's accessible label, "Label, 2 of 2", before VoiceOver reads the field's value (WCAG 2.4.6); during an unsaved edit the ordinal still reflects the saved roster; rows without a duplicate keep today's names. Superseded for the Settings refusal on 2026-11-03: no announcement replaces the warn form's, since a colliding save is refused (§ 9.5 Refuse form, § 12.3 C-9); the ordinal and accessible-name clauses stand | the quality-pillar review found these missing (§ 11.4); the UX lens found two duplicate Settings rows indistinguishable to VoiceOver, since each reads "Account", "Label", "work" and "Active" (`accountRow`, `apps/menubar/Sources/SettingsView.swift:228-241`) |
 | UX-9 | A notice names an entry by its uuid only beside a label that has more than one bearer, and always next to its ordinal (§ 9.6). The F4 panel rows never show an identifier. An ambiguous Settings row shows its own uuid only if the operator answers `settings-row-shows-uuid` yes; if built, the line belongs to its row's accessibility container, is spoken as a short prefix with the full uuid as the field's hint, and wraps beside the 160 pt field | REQ-NTC-C-001 names the uuid "where the label alone is ambiguous" and REQ-STSH-B-002 (a Must) names both entries by uuid where their labels are equal, on the surface that wrote; AC-WIRE-001's BUT NOT binds the rows and the wire; PRD § 3 defers a display affordance until "The operator adds it", so the row line waits for that answer; both questions return to the PRD (§ 14.6 items 10a and 10b) |
 | UX-10 | Switching to a row whose label has more than one bearer is shown blocked before the click. The row takes the existing blocked treatment, a resting reason, "Can’t switch — another account has this label.", and a row tooltip that adds the remedy, "Rename one in Settings."; the check comes first among the `SwitchBlock` cases, because the daemon resolves the target before any viability gate (`perform_socket_swap`, `src/daemon/commands.rs:103-116`). The callout, which has no blocked state today (its Swap is disabled only while a swap is pending), keeps its lead and why line, adds the same reason as a resting line, and disables its Swap. The after-click refusal stays as the fallback for a frame that lags a new duplicate, reworded to match. A duplicate row's spoken label and the Swap button's accessible label carry the ordinal; its tooltip does not, because the badge beside the label already shows the ordinal to a sighted reader (§ 9.6's copy table and #1573 pin the tooltip as reason plus remedy; reconciled by the `/scope` orchestrator on 2026-10-27, the trailing sentence having read "hint and tooltip" since revision 4) | the daemon refuses an ambiguous target (`AmbiguousTarget`, `src/daemon/commands.rs:114`); the wire proves the label is shared, and the panel blocks before the click exactly what the wire proves the daemon will refuse (`SwitchBlock`, `apps/menubar/Sources/StatusPanelFormat.swift:173-178`); today the refusal arrives only after the click. Switching by identifier instead is recorded for the operator (`panel-switches-by-identifier`, § 14.6 item 15) |
-| UX-11 | The Settings collision note follows the roster the section holds: it shows while any label has more than one bearer, whichever surface or command made the duplicate, survives unrelated edits, and leaves once one entry is renamed; a save whose `applied.collisions` reports a new collision is also announced (UX-8). A window left open keeps the roster it loaded until it is reopened, because only `show()` loads it (`SettingsWindowController`, `apps/menubar/Sources/SettingsView.swift:71-72`) | a note tied only to a save's acknowledgement would miss a duplicate made by a panel capture, `login` or `import`, and an unrelated save would clear it while the duplicate remains; the announcement stays calibrated to the write that created a collision (REQ-ROS-Q-001) |
+| UX-11 | The Settings collision note follows the roster the section holds: it shows while any label has more than one bearer, whichever surface or command made the duplicate, survives unrelated edits, and leaves once one entry is renamed; a save whose `applied.collisions` reports a new collision is also announced (UX-8; superseded 2026-11-03: a colliding save is refused with `label-in-use` and not announced, § 9.5 Refuse form, § 12.3 C-7 and C-9). A window left open keeps the roster it loaded until it is reopened, because only `show()` loads it (`SettingsWindowController`, `apps/menubar/Sources/SettingsView.swift:71-72`) | a note tied only to a save's acknowledgement would miss a duplicate made by a panel capture, `login` or `import`, and an unrelated save would clear it while the duplicate remains; the announcement stays calibrated to the write that created a collision (REQ-ROS-Q-001) |
 
 UX-3 is an author-chosen default. Its alternative re-seeds every row's colour from the identifier, which is
 what #445's acceptance criteria first asked for: colours then survive a relabel, but every panel repaints
@@ -590,6 +620,10 @@ PRD § 3 defers that affordance. The alternatives are recorded in § 12b and in 
 
 ### 9.3 Task flows
 
+**Refuse form (2026-11-03, § 12.3).** TF-1 and TF-2 below describe the warn form's notices. Under the rulings TF-1's
+capture is refused with `label-in-use` or `relabels-another-account` before any write, and the card shows the
+refusal naming no label it cannot know for certain (C-6, C-9); TF-2's colliding save is refused (C-7).
+
 **TF-1 — add an account from the panel** (socket `capture`). Actor: the operator. Precondition: the daemon
 answers and Claude Code is signed in. (1) The operator requests a capture; the card shows its existing
 Pending state. (2) The daemon acknowledges `captured` or `refreshed`; the card's outcome line says
@@ -611,7 +645,7 @@ no collision line; an older app ignores the new fields.
 bearer, its rows carry their ordinals and the section shows the collision note (UX-11). (1) The operator
 edits a label and saves. (2) The daemon answers `applied` with its effect; the section shows the existing
 confirmation. A save that creates a collision adds the ordinals and the note, which stays after "Saved"
-clears, and announces it once (UX-8); a save that resolves one removes them; a save that swaps two labels
+clears, and announces it once (UX-8; superseded 2026-11-03 by the refusal, § 9.5 Refuse form); a save that resolves one removes them; a save that swaps two labels
 creates no collision and announces nothing (AC-ROS-002). Error paths: `invalid`, `unknown-account`,
 `no-config`, `config-unreadable`, `save-failed` and `unavailable` keep their presentations; `label-in-use`
 exists only under a refuse policy (UX-7).
@@ -689,6 +723,11 @@ Responsive: none.
 | shared-with entries | ack `shared_with[]` (label, uuid) | one line; each side's ordinal and uuid only where its label has more than one bearer | Primary |
 | written entry's uuid | ack `account_uuid` | locates "this one" among the bearers; shown only inside a line that names that entry | Tertiary |
 
+**Refuse form (2026-11-03, § 12.3).** The previous-label and collisions rows describe the warn form. Under the
+rulings the panel's capture never completes a relabel or a collision: the card shows the two refusals instead,
+naming the label `L` the panel sent and never the landed account's current label, which the watch snapshot
+cannot give for certain (C-6, C-9). The label, shared-with and uuid rows stand.
+
 #### Interaction State Matrix: Panel capture card
 
 | State | Applicable | Visual treatment | User action | Recovery |
@@ -720,6 +759,13 @@ R-11, owner open, § 14.7), so the badge and the note are drawn there before Swi
 | effect | `applied.effect` | existing | Secondary |
 | account uuid | `accountUuid`, already each row's identity (`apps/menubar/Sources/SettingsView.swift:199`) | under the label field, only if `settings-row-shows-uuid` is answered yes (UX-9) | Tertiary |
 
+**Refuse form (2026-11-03, § 12.3 C-7, C-9).** The announced collision of UX-8, TF-2's "announces it once", the
+`applied.collisions[]` row of this screen's data fields and UX-11's "a warn's cost" describe the warn form. Under
+the rulings a save that would create a collision is refused before any write: the form keeps the edit unsaved,
+#1558's fixed sentence sits in the rejected-save slot (UX-7), #1560 marks the listed rows the refusal's
+`collisions` names and names the label on each in words, no announcement replaces the warn form's, and the
+marking lasts until the next save or load. The persistent note for duplicates that already exist stands.
+
 #### Interaction State Matrix: Settings accounts section
 
 | State | Applicable | Visual treatment | User action | Recovery |
@@ -741,8 +787,8 @@ Every string avoids the #160 banned tokens and is scanned (REQ-NTC-C-002).
 
 | Element | Text (draft) | Ownership |
 |---|---|---|
-| Outcome line, capture card | Captured ‘work’. · Refreshed ‘work’ (was ‘spare’). | Developer |
-| Collision line, capture card | ‘work’ now names 2 accounts: this one is work 2 of 2 (<uuid-B>), the other work 1 of 2 (<uuid-A>). Until one is renamed, you can't switch to either from the panel. Rename one in Settings. | Developer |
+| Outcome line, capture card | Captured ‘work’. · Refreshed ‘work’ (was ‘spare’). (the “was” form is the CLI's, on a revive made with `--rename`, since 2026-11-03; the card never shows it, § 12.3 C-6) | Developer |
+| Collision line, capture card | ‘work’ now names 2 accounts: this one is work 2 of 2 (<uuid-B>), the other work 1 of 2 (<uuid-A>). Until one is renamed, you can't switch to either from the panel. Rename one in Settings. (Retired 2026-11-03: no completed capture creates a collision, § 12.3 C-8; the refused card's copy is #1559's and #1561's.) | Developer |
 | Shared line, capture card | ‘work’ and ‘spare’ hold the same credential. | Copywriter review |
 | Shared line, one side shared | ‘spare’ and work 2 of 2 (<uuid-B>) hold the same credential. | Copywriter review |
 | Shared line, equal labels | This one, work 2 of 2 (<uuid-B>), and work 1 of 2 (<uuid-A>) hold the same credential. | Copywriter review |
@@ -753,7 +799,7 @@ Every string avoids the #160 banned tokens and is scanned (REQ-NTC-C-002).
 | After-click refusal, the fallback | Can’t switch — another account has this label. Rename one in Settings. (replaces “Two accounts share that label — rename one, then switch.”) | Developer |
 | Callout, shared target | → work 2 of 2 · spoken “Next swap to work, 2 of 2 accounts named work” · older daemon: “one of 2 accounts named work” | Developer |
 | Spoken cue, row and Settings field | “work, 2 of 2 accounts named work” · Settings: “Label, 2 of 2”, then the field's value | Developer |
-| Status-message announcement | “‘work’ now names 2 accounts; this one is 2 of 2.” | Developer |
+| Status-message announcement | “‘work’ now names 2 accounts; this one is 2 of 2.” (Retired 2026-11-03 with the collision line, § 12.3 C-8, C-9.) | Developer |
 | Header | “3 accounts · work 2 of 2 active” | Developer |
 | Swap result | the acknowledgement's labels, unchanged: “Switched work → spare” | Developer |
 | Row uuid line, Settings | the row's uuid under the label field, only if `settings-row-shows-uuid` is answered yes | Developer |
@@ -793,9 +839,9 @@ and note read `config-get`, which already lists the roster in order and keys eac
 | PanelAccountRow | Entity | REQ-ROW-B-001 | PRD § 9.1 | — |
 | AccountStatusLine | Entity | REQ-WIRE-I-001 | PRD § 9.1 | — |
 | OperatorNotice | Entity | REQ-ROS-I-002 | PRD § 9.1 | also REQ-IDN-I-002, REQ-STSH-B-002 |
-| Collision line and note | Entity | REQ-ROS-I-002 | PRD § 9.3, OperatorNotice View (collision) | ordinals, the bearers' uuids and a warn's cost, at parity with § 8.5; the Settings note follows state (UX-11) |
+| Collision line and note | Entity | REQ-ROS-I-002 | PRD § 9.3, OperatorNotice View (collision) | ordinals, the bearers' uuids and a warn's cost, at parity with § 8.5; the Settings note follows state (UX-11); since 2026-11-03 the collision line is retired and the note stands (§ 12.3 C-8) |
 | Settings row uuid line, only if answered yes | Entity | none | PRD § 9.4, `account_uuid` "where a label is ambiguous" | net-new, conditional: UX-9; not built until `settings-row-shows-uuid` is answered (§ 14.6 item 10b) |
-| Relabel in the outcome line | Entity | REQ-IDN-I-002 | PRD § 9.3, OperatorNotice View (relabel) | waits on #1474; folded into the outcome line (UX-6) |
+| Relabel in the outcome line | Entity | REQ-IDN-I-002 | PRD § 9.3, OperatorNotice View (relabel) | waits on #1474; folded into the outcome line (UX-6); since 2026-11-03 CLI-only, on a revive made with `--rename` (§ 12.3 C-6, C-8) |
 | Shared-credential line | Entity | REQ-STSH-B-002 | PRD § 9.3, OperatorNotice Create (shared credential) | DQ-6: both channels |
 | Ordinal badge and spoken cue, on every surface | Entity | REQ-ROW-C-002, REQ-ROS-I-002 | DQ-4 (#939) | the non-colour cue and the duplicate set's one handle (UX-3) |
 | Duplicate-set colour tie-break | Entity | REQ-ROW-C-002 | DQ-4; PM-10 | — |
@@ -857,7 +903,8 @@ backfill leaves samples keyless and retries at the next start.
 Quality-pillar finding, closed in § 9.1 as UX-8. Rows sharing a label carry a non-colour cue (WCAG 1.4.1)
 and an accessible name with their ordinal (4.1.2); a duplicate Settings label field carries its ordinal in
 its accessible label, so two fields named "Label" stay distinct (2.4.6). Notice lines are announced as
-status messages without taking focus (4.1.3); the announcement carries the ordinal sentence, and the uuids
+status messages without taking focus (4.1.3; since 2026-11-03 the collision line is retired and the
+Settings refusal is not announced, § 12.3 C-8, C-9); the announcement carries the ordinal sentence, and the uuids
 stay in the visible text, read as characters only on demand. The spoken distinction is the ordinal, never a
 full uuid; if the Settings row's uuid line is built (UX-9), it belongs to its row's accessibility container
 (1.3.1) and is spoken as a short prefix. A blocked switch states its reason to VoiceOver before any click
@@ -876,10 +923,10 @@ survive the re-key. Out of scope: real-keychain and real-login automation (F7 is
 the Linux and Windows stores. The capability matrix:
 
 | CAP | Capability | Binds |
-|---|---|---|
+| CAP-04 | the capture card and Settings show collision, relabel and shared notices at parity with § 8.5, naming each entry by ordinal and by uuid where its label has more than one bearer, with a warn's cost; a card with a notice survives the 1.8 s reset; the Settings note and ordinals follow the roster's state, including after a capture made elsewhere (since 2026-11-03: the card shows the two refusals instead of collision and relabel notices, naming no label it cannot know; the shared notice and the Settings note stand, § 12.3 C-6, C-8, C-9) | REQ-ROS-I-002, REQ-IDN-I-002, REQ-STSH-B-002, REQ-NTC-C-001 |
 | CAP-01 | the rule counts a collision exactly: swap, refresh of a two-bearer label, same-label relabel, fresh label | REQ-ROS-B-002, REQ-ROS-Q-001 |
 | CAP-02 | every writer reports a counted collision on its own surface | REQ-ROS-B-001, REQ-ROS-C-002 |
-| CAP-03 | acks carry notices as optional fields; the parity gate fails on an unmodelled value or field | REQ-ROS-I-001, REQ-ROS-C-001, REQ-IDN-I-001 |
+| CAP-03 | acks carry notices as optional fields; the parity gate fails on an unmodelled value or field (since 2026-11-03 the capture refusals carry no field and REQ-IDN-I-001 is vacuous, § 12.3 C-6 and C-12) | REQ-ROS-I-001, REQ-ROS-C-001, REQ-IDN-I-001 |
 | CAP-04 | the capture card and Settings show collision, relabel and shared notices at parity with § 8.5, naming each entry by ordinal and by uuid where its label has more than one bearer, with a warn's cost; a card with a notice survives the 1.8 s reset; the Settings note and ordinals follow the roster's state, including after a capture made elsewhere | REQ-ROS-I-002, REQ-IDN-I-002, REQ-STSH-B-002, REQ-NTC-C-001 |
 | CAP-05 | a relabelling revive names both labels; onboarding and same-label refreshes do not | REQ-IDN-B-001, REQ-IDN-C-001 |
 | CAP-06 | a chosen refusal precedes every stash write | REQ-IDN-C-002 |
@@ -981,7 +1028,7 @@ break the rule and the F3 compare once each and watch the suite fail. No propert
 | UX-3 duplicate set | the ordinal as the one handle on every surface; colour slots no other row uses; spoken cue (author-chosen) | re-seed every row from the identifier; the uuid as the handle | two-way; visible |
 | UX-9 uuid where ambiguous | notices name a uuid only beside an ambiguous label; a Settings row's own uuid only on an explicit answer (author-chosen) | uuid-free notices; the row's uuid by default | two-way; visible; returns to the PRD (§ 14.6 items 10a, 10b) |
 | UX-10 shared-label switch | blocked before the click, with its reason and remedy (author-chosen) | switch by identifier; the refusal after the click, as today | two-way; returns to the PRD (§ 14.6 item 15) |
-| UX-11 Settings note | derived from the roster's state; announced only for a save that created a collision (author-chosen) | tied to the save's acknowledgement | two-way |
+| UX-11 Settings note | derived from the roster's state; announced only for a save that created a collision (author-chosen; superseded 2026-11-03: a colliding save is refused and not announced, § 12.3 C-7, C-9) | tied to the save's acknowledgement | two-way |
 | SEC-3 orphan advice | recommend `report` over `reap` (author-chosen) | — | advice only |
 
 ### 12.2 Open decision stubs — context and options filled, decision left open
@@ -1042,8 +1089,8 @@ existing holder; the operator's words and the orchestrator's reading are in PRD 
 `label-in-use` tag and its Swift case are built; REQ-ROS-C-002's oracles assert the refusal; the collision
 notices of F1 (D-1, UX-1 to UX-9) reach only rosters that already hold a duplicate, since no completed write on
 the four paths creates one; AC-6 is re-ratified as narrowed (the migration PRD's amendment note); the items that
-built the warn default (#1556, #1558, #1559, #1560, #1561) re-enter the ready gate. Open: the replaced account's
-fate under `--overwrite`, the socket paths' carriage of the override, and `import`.
+built the warn default (#1556, #1558, #1559, #1560, #1561) re-enter the ready gate. Settled in § 12.3 (C-5 to
+C-7): the replaced account's fate under `--overwrite` and that the socket paths carry no override. Open: `import`.
 
 #### `login-mismatch-policy` — what `login <label>` does when the captured account is not the one the label names
 
@@ -1064,8 +1111,8 @@ words and the reading are in PRD § 8.1. **Consequences.** The `relabels-another
 are built for the socket path; the CLI refuses before the stash write; with the flag the rename proceeds and
 REQ-IDN-B-001's disclosure holds; `recapture_updates_the_label_when_a_new_one_is_given` gains the flag;
 REQ-LGN-B-004's "refreshes it" holds for the same-label case. #1570's help sentence is re-keyed to the refusal (the scope
-brief's `login-mismatch-policy-recorded-on-1570` row), and REQ-DOC-B-003's keep-rename wording with it. Open: how
-the socket `capture` carries the override (#1559).
+brief's `login-mismatch-policy-recorded-on-1570` row), and REQ-DOC-B-003's keep-rename wording with it. Settled in § 12.3
+(C-6): the socket `capture` carries no override.
 
 #### `label-normalization-policy` — what makes two labels the same, if anything
 
@@ -1104,6 +1151,339 @@ irreversibly. Report, a metadata-only listing; cleanup stays with the operator; 
 Accept: no code, and the decision record replaces the comments calling an orphan "harmless".
 
 **Decision.** Open. **Consequences.** Open.
+
+### 12.3 The refuse form — the two rulings' consequences, settled for the re-authoring (2026-11-03)
+
+Pipeline-authored by the `/scope` orchestrator on 2026-11-03 and ratification-pending, like every
+requirement in the PRD. It was written as the shared contract for re-authoring #1556, #1558, #1559,
+#1560, #1561 and #1570 to the operator's rulings of § 12.2, critiqued in a fresh context before any
+item was re-authored on it, and is the single place their cross-item behaviour is fixed; each item
+cites it as "design § 12.3, C-N". Where an earlier section of this design describes the warn form, this
+section wins for those six items.
+
+Each decision carries its authority:
+
+- `operator` — the operator's own words, quoted verbatim below.
+- `orchestrator` — a reading or a pick by the `/scope` orchestrator, confirmed or changed when the
+  operator ratifies the PRD. An item built on it says so once, and is not NOT READY for it.
+
+Base of every fact below: `origin/main` at `b9df076`.
+
+#### The operator's words, verbatim (2026-11-03)
+
+1. "refuse unless `--rename` or `--force` is added, be defensive rather than 'oh and btw we renamed shit'"
+2. "it's impossible to overwrite an existing ACC_1 with ACC_2 under same label w/o adding `--overwrite` or removing ACC_1 and alike. (or `--force`?)"
+3. "proceed as recommended and propagate/update" — accepting the recommendation of `--overwrite` over
+   `--force` for the duplicate-label case. `--rename` is the operator's own word, from quote 1.
+
+They are recorded in `docs/requirements/account-label-integrity.md` § 8.1 (the two "Ruling"
+paragraphs) and in `docs/design/account-label-integrity-solution-design.md` § 12.2.
+
+#### Code and requirement facts the contract rests on (read at `b9df076`)
+
+- `plan_capture` in `src/capture.rs` is the one roster decision shared by CLI `capture`, CLI `login`
+  (through `reconcile_login`) and the daemon's socket `capture`. It matches the captured account by
+  `account_uuid`. A match is a refresh (`CaptureOutcome::Refreshed`, login vocabulary `Revived`), and a
+  non-empty label given for it overwrites the entry's label. No match appends a new entry (`Captured`,
+  login `Onboarded`), with the label given or, when none is given, the uuid itself (`derive_label`).
+  Nothing checks whether another entry already carries the label. It has exactly two arms and no arm
+  removes (`docs/requirements/roster-loss-prevention.md` I-1).
+- CLI `capture` with no label at an interactive terminal offers the harvested email as a pre-filled
+  label at a prompt (#447, `prefill_label_from_identity` in `src/capture.rs`), and a confirmed value
+  counts as operator-authored.
+- `recapture_updates_the_label_when_a_new_one_is_given` in `src/capture.rs` pins the rename on a
+  refresh.
+- `remove_account` and `apply_remove` in `src/cli.rs`: `remove` resolves its target through
+  `resolve_target` (`src/use_account.rs`), which REFUSES a duplicated label (`Error::UseTargetAmbiguous`,
+  issue #1005). The order is roster save, stash delete, then
+  `notify_daemon_roster_reload(ReloadIntent::Mutating)`. Removing the active account leaves the daemon
+  with no active account until another is made active.
+- `docs/requirements/roster-loss-prevention.md` R-3 (user-ratified): a reload from an append-only verb
+  (`login`, `capture`) is refused when its account count is LOWER than the live count; R-4 lists the
+  mutating verbs; tests in `src/capture.rs` pin `capture` and `login` to `ReloadIntent::AppendOnly`,
+  and a flip of either to `Mutating` is called out there as reinstating the 2026-08-27 roster collapse.
+- R-12 of the same document (user-ratified): a new machine-readable refusal reason is present in the
+  Rust `CaptureRejection`, in the Swift mirror and in the panel's authored capture-states reference, in
+  the same change.
+- `CaptureAck` and `CaptureRejection` in `src/daemon/socket.rs`: `captured` / `refreshed` /
+  `rejected { reason }`. `CaptureRejection` is a field-less kebab-case enum; the Swift mirror in
+  `apps/menubar/Sources/CaptureAck.swift` is a CLOSED enum that throws on an unknown tag;
+  `every_rust_rejection_tag_has_a_swift_case` fails the `test` job when they drift, and the `rust` CI
+  filter includes `apps/menubar/Sources/CaptureAck.swift` so a Swift-only edit runs it.
+  `docs/specs/capture-rejection-parity.feature.md` states that a rejection tag carries no operator data
+  (no path, account label or count).
+- `ConfigSetAck` and `ConfigSetRejection` in `src/daemon/socket.rs`: `applied { effect }` or
+  `rejected { reason, detail? }`, zero writes on a rejection; the request re-parses under
+  `deny_unknown_fields`, and its editable surface is tunables plus the labels of existing accounts:
+  it can never add or remove a roster entry or touch a credential (issue #268). The Swift mirror in
+  `apps/menubar/Sources/ConfigWire.swift` throws on an unknown reason; no Rust test reads that file and
+  the `rust` CI filter does not list it; `apps/menubar/Tests/SettingsTextMetricsTests.swift` iterates
+  `ConfigSetRejection.allCases`, so every reason needs its Settings sentence (#762).
+- The CLI has no rename verb: `config` offers `path`, `validate`, `show`, `backups` and `restore`
+  only. The CLI renames an account only through `capture` or `login` with a new label while signed in
+  as it. The Settings window exists on macOS only.
+- `docs/requirements/gui-cli-capability-parity.md`: R-1 (a `routable` CLI capability is reachable from
+  the menu-bar app), R-3 (a routable capability with no socket command is a tracked parity gap), R-4
+  and R-5 (an actionable panel state offers an `act` or `launch` path; inert text naming a command is a
+  defect). #1019 (open) routes `remove` to the app, with confirmation and an active-account guard.
+
+#### Terms
+
+- **The captured account** `U`: the account the write lands on, found by `account_uuid`.
+- **The label** `L`: the label the write is given. When none is given, `L` is `U`'s current label
+  `M` if `U` is rostered, and the uuid-derived label if `U` is new.
+- **A rename**: `U` is rostered under `M`, and `L` differs from `M`.
+- **A collision**: the write, as given, would give an account a label it did not carry before, and that
+  label would then be carried by another account as well. Evaluated on the write as given; an override
+  that removes the holder is what consent buys. `orchestrator`: this replaces REQ-ROS-B-002's count rule
+  ("above one and above the number before"), which lets a save such as `{B: "c", C: "work"}` on a roster
+  `A: work, B: work, C: c` through, although `C` joins `A`'s label; the per-account rule refuses it, and
+  still keeps AC-ROS-002's swap `{A: "b", B: "a"}` quiet. The shared `label_collisions` that #1556 adds
+  beside `Account` (design D-1) carries this calibration and serves the four write paths; `apply_import`
+  keeps `label_bearers` and `created_ambiguity` unchanged until the operator rules on `import` (C-1),
+  and the source-scan test that pins every writer to the shared rule lists `apply_import` as the one
+  writer that keeps its own. F8's comparison-key hook plugs into the shared function.
+- **A holder**: an account other than `U` that carries `L` before the write.
+
+#### C-1 Which writes the rulings govern (orchestrator)
+
+CLI `capture`, CLI `login`, the socket `capture`, and `config-set`. `import` and `config restore` are
+untouched: AC-6 of `docs/requirements/migration-credential-portability.md` still answers
+warn-and-never-refuse for `import`, and `config restore` stays the lead already recorded in the scope
+brief.
+
+#### C-2 A collision is refused unless overwrite consent can and does apply
+
+- `operator`: on CLI `capture` and `login`, a write that would make a label name a second account is
+  refused unless `--overwrite` is given.
+- `orchestrator`: the refusal precedes every write (no stash, no roster save, no canonical re-point,
+  no `~/.claude.json` co-write, no daemon notification); its machine tag is `label-in-use` on the
+  socket and in `config-set`; it applies to the socket `capture` and `config-set` too, where no
+  override exists (C-6, C-7).
+- `orchestrator`: a DERIVED label never collides. A new account captured with no label given takes its
+  uuid as its label (`derive_label`), and REQ-LGN-B-003 forbids that path to hard-error. If another
+  account already carries that exact string, which a relabel, an import, a restore or a hand edit can
+  produce, the derivation appends `-2`, `-3` and so on until the label is free. The write is never refused for a
+  derived label and never completes a collision, and its reply prints the label it chose, as every
+  capture and login reply already does. With no label given and `--overwrite`, the derived label is
+  made free first, so the flag is surplus (C-5).
+
+#### C-3 A rename is refused unless rename consent is given
+
+- `operator`: a `login <label>` that would rename the account the login lands on is refused unless
+  `--rename` is given. Quote 1 offers "`--rename` or `--force`"; that `--force` is not also accepted
+  as the rename consent is the orchestrator's reading, so that one flag means one thing.
+- `orchestrator`: the same gate applies to CLI `capture`, which shares `plan_capture`, and to the
+  socket `capture` (which has no consent, C-6), on the operator's own reason, "be defensive rather than
+  'oh and btw we renamed shit'".
+- With `--rename` the rename happens, and the reply names the label the account carried before and the
+  one it carries after (REQ-IDN-B-001).
+- A write on a rostered account that gives no label, or gives `M` itself, is a plain refresh: allowed
+  and unchanged, so REQ-LGN-B-004's "a bare `login` for an existing label refreshes it (idempotent)"
+  holds.
+- `orchestrator`: the #447 prompt runs only when the captured account is new. With no label given, a
+  rostered account is refreshed without a prompt, so pressing Enter can never rename it.
+- `recapture_updates_the_label_when_a_new_one_is_given` keeps pinning the rename, now with rename
+  consent; a sibling pins the refusal without it.
+
+#### C-4 A rename onto a label another account carries is never one write (orchestrator)
+
+A `capture` or `login` that would rename `U` onto a label a holder carries cannot proceed whatever
+flags are given, because overwrite consent applies only to a new account (C-5). The single refusal
+names the account the write landed on, both conditions, and the two-step way through: free the label
+first (C-9), then repeat the write with `--rename`. No flag the refusal names can lead to a second
+refusal for the same write.
+
+#### C-5 What overwrite consent does (orchestrator, building on the operator's word "overwrite")
+
+- It applies only when `U` is new and exactly one holder `V` carries `L`. Then `U` replaces `V` one for
+  one: `V`'s roster entry is replaced in place by `U`'s, at `V`'s position, and `U` joins enabled like
+  every freshly captured account (issue #36). The account count does not change.
+- Because the count does not change, the reload intent stays `ReloadIntent::AppendOnly`, R-3's floor
+  still protects the roster, and `plan_capture` keeps its two arms (I-1): the replacement composes
+  `apply_remove` by `V`'s uuid with `plan_capture` in memory, before one roster save. The orchestrator
+  records a dated note in `docs/requirements/roster-loss-prevention.md` that `capture --overwrite` and
+  `login --overwrite` replace one entry without lowering the count.
+- Order: stash `U` under the swap lock; save the roster once, after the lock is released, as
+  `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released` in `src/capture.rs` pins;
+  notify the daemon (append-only); then delete `V`'s stash, re-taking the lock if #1556 finds the
+  delete needs it. A delete failure leaves an orphan stash, which the reply names by uuid
+  (`orphan-stash-policy` stays open), and the command still exits 0; the replacement itself has
+  completed.
+- With two or more holders (a duplicate already in the roster, from an import, a restore or a hand
+  edit), the write is refused as ambiguous, the way `remove` refuses a duplicated label (issue #1005),
+  and no flag helps: the operator removes the extra holders by uuid first, or picks another label.
+- With `U` already rostered, overwrite consent does not apply (C-4).
+- The reply names the replaced account by its uuid, since its label is `L` itself, and says its stored
+  login was deleted.
+- A `login --overwrite` that replaces the signed-in holder does not make `U` active: #274's rule (a
+  login becomes active only when it is the current active account, or none is active) stays. The reply
+  says the replaced account was the signed-in one, that no rostered account is active now, and names
+  `sessiometer use <label>`.
+- Surplus consent changes nothing: an `--overwrite` where no collision would happen, or a `--rename`
+  where no rename would happen, gives the same write, the same reply and the same event as the command
+  without it.
+
+#### C-6 The socket `capture` carries no consent in these items (orchestrator)
+
+- It refuses a collision with `label-in-use` and a rename with `relabels-another-account`, and accepts
+  no consent field. A write that meets both carries `label-in-use`.
+- The tags carry no operator data, as `docs/specs/capture-rejection-parity.feature.md` requires: no
+  label, no uuid, no count. The panel holds what the card may state with certainty: the label `L` it
+  sent, and every roster row's label from the watch snapshot, so the card can say which rows carry
+  `L`. It cannot know for certain which account the capture landed on: the snapshot's active row is
+  the first entry whose stash matches the canonical credential (`src/active.rs`), re-resolved within
+  the poll interval, so it can lag an out-of-band sign-in and can name either entry of a
+  shared-credential pair, while the capture lands on the account `~/.claude.json` names
+  (`src/capture.rs`). So the card never names the landed account's current label.
+- R-12: the item that adds the two tags (#1559) adds, in one change, the Rust tags, their Swift cases,
+  the card's sentence for each, and their entries in the mock's capture-states reference.
+- The socket `capture` reaches `plan_capture` through `capture_locked`, so it refuses as soon as #1556
+  merges. Until #1559 lands, `classify_capture_failure` (`src/daemon/classify.rs`) reports that refusal
+  with the existing `failed` tag, with zero writes; #1559 ends that interim by mapping the two
+  refusals onto their tags.
+- A socket `capture` never completes a rename, so the `refreshed` acknowledgement never carries a
+  previous label: REQ-IDN-I-001 and REQ-IDN-I-002 are re-keyed (C-13).
+- The panel's way to a deliberate rename is Settings, and its way to replace an account is #1019's
+  routed `remove` followed by a capture. The one-action replace the CLI offers is a parity gap under
+  R-3, recorded against #1019, not built here.
+
+#### C-7 `config-set` refuses a collision and carries no override (orchestrator, from the code)
+
+- A save is refused whole, with zero writes, when any account it relabels would, after the save, carry
+  a label another account also carries (the Terms' calibration, over every label the save touches,
+  including two accounts given one new label in the same save). Reason tag: `label-in-use`. A Settings
+  rename that creates no collision needs no consent of any kind.
+- The `rejected` arm carries `collisions` beside `reason`, only with that reason: a list of
+  `{label, bearers}`, where `bearers` holds the uuid of every account that would carry the label. The
+  orchestrator records the field in design § 8.1.
+- The existing reasons keep their precedence: `label-in-use` is reported only for a save that passes
+  every check made before the save (`invalid`, `unknown-account`, `no-config`, `config-unreadable`), and
+  it precedes the save itself, so it never co-occurs with `save-failed`. Every acknowledgement for a save
+  that creates no collision stays byte-identical to today's.
+- No override exists: replacing a holder means removing an account and deleting its stored login, and
+  `config-set` structurally cannot add or remove a roster entry or touch a credential (issue #268). The
+  operator renames or removes the holder first, which is the operator's own "or removing ACC_1 and
+  alike".
+- A save that gives no account a label another account carries after the save is applied, including
+  one that renames an account out of an existing duplicate, or swaps two accounts' labels.
+- The item that adds the tag (#1558) adds, in one change, its Swift case, its Settings sentence (the
+  `SettingsTextMetricsTests` loop over every reason), and a reason-parity test for
+  `ConfigSetRejection` like `every_rust_rejection_tag_has_a_swift_case`, with
+  `apps/menubar/Sources/ConfigWire.swift` added to the `rust` CI filter. Editing
+  `.github/workflows/ci.yml` owes the `Gate-Change-Acknowledged:` trailer.
+
+#### C-8 What remains of the warn-form notices (orchestrator)
+
+- No completed write on the four paths creates a collision (C-2 covers the derived label). The
+  collision lines of the warn form do not ship.
+- Duplicates can still exist, from `import`, `config restore` or a hand edit.
+  The surfaces that show an existing duplicate stay: the Settings note (#1560), the panel rows (#1566),
+  the Settings ordinals (#1574), and label resolution's ambiguity refusal.
+- What a completed CLI write still discloses: a rename made with rename consent (both labels), a
+  holder replaced with overwrite consent (its uuid and the deleted stored login). A shared credential (F3, #1557 and its surfaces) is unchanged by the
+  rulings, on every path.
+
+#### C-9 What each surface shows on a refusal (orchestrator)
+
+- CLI: one refusal message. It names, in this order: the account the write landed on (its current
+  label, or "not on the roster" and its uuid); the reason; each flag that would let the write proceed,
+  only where one would; and the ways through that fit the case and that the CLI can run. For a rename
+  refusal: run it again with no label, which refreshes, or with `--rename`. For a collision: pick
+  another label; free the label by removing its holder (`sessiometer remove <uuid>`) or by signing in
+  to the holder and running `capture <other-label> --rename`; or, on macOS, rename it in Settings. A `login` refusal also says
+  the login was not saved and that, if the landed account is not the one meant, the operator signs in
+  to the intended account instead. Exit code: the CLI's existing taxonomy; #1556 picks the code and
+  names its precedent.
+- Audit: a refused write logs its outcome as refused on the event its path already emits, with the
+  reason as a snake_case token (`label_in_use`, `relabels_another_account`): the daemon's capture event
+  (`Event::Capture`, built in `src/daemon/commands.rs`) for the socket `capture`, and the login event
+  (`emit_login_event` in `src/capture.rs`) for CLI `login`. CLI `capture` emits no event today; #1556
+  says whether it gains one.
+- Panel capture card: it names the reason in words. For `relabels-another-account` it says the account
+  is already on the roster under another label, naming none (C-6). For `label-in-use` it names the
+  label `L`, which the panel sent and so knows whatever the snapshot shows, and, when the snapshot
+  shows two or more rows carrying `L`, how many; when it shows none, the card still names `L`. The
+  `relabels-another-account` card is therefore the sentence plus the remedies, where the CLI refusal
+  names the landed account's current label: a parity gap the scope brief records
+  (`refuse-form-relabel-card-names-no-label`), closable by a field beside the tag, as `config-set`'s
+  `collisions` sits beside `reason`, never by data on the tag. Its remedies are `act` or `launch` paths,
+  never inert text naming a command (parity R-4, R-5): edit the label on the card and capture again,
+  or open Settings to rename an account. No override button.
+- Settings: a refused save stays unsaved in the form. #1558 carries the reason's fixed sentence (the
+  Settings client renders reason and detail only); #1560 names the label on each marked row, in words
+  and never by colour alone, and marks the listed rows whose uuid is in the refusal's `collisions`; a
+  bearer the window does not list gets no row. No announcement replaces the warn form's: the refusal
+  is a rejected-save outcome the form already presents. The marking lasts as long as that outcome: the
+  next save clears it whatever it returns, and so does the next load. The persistent note for existing
+  duplicates stays.
+- Every new string passes the repo's framing scans, names accounts by label, ordinal or uuid only,
+  never by email or token (issue #15), and quotes no credential. A new Swift string is bound to the
+  scan the way `apps/menubar/Tests/NotificationDeliveryTests.swift` does it, by reading
+  `src/framing_vocabulary.rs` at test time, never checked by hand.
+
+#### C-10 What changes for #1570 (orchestrator)
+
+`LOGIN_USAGE`'s `<label>` entry describes what #1556 leaves in the tree: a label that would rename the
+account the login lands on is refused unless `--rename` is given, which renames it; when the account is
+new to the roster, a label one other account carries is refused unless `--overwrite` is given, which
+replaces that account and deletes its stored login; a label two or more accounts carry, or one that
+would both rename the landed account and take another account's label, is refused and no flag
+overrides that. #1570 stays `Blocked by #1556` and owns that sentence and its propagation sweep. #1556
+owns both flag lists, `CAPTURE_USAGE`'s `<label>` entry, and every comment in `src/capture.rs` that
+describes the rename on a refresh, the label prompt or the append-only shape (`derive_label`,
+`plan_capture` and its refresh arm, `run_login`, `prefill_label_from_identity`'s doc, and the
+append-only comments beside the daemon notifications, one of which says a login "drops none"),
+because it changes what they describe and none of them carries the sweep's search words.
+
+#### C-11 Oracles (the scope brief's `oracle-authorship` rule, unchanged)
+
+A deterministic-output item whose expected outcomes are all decidable under this contract gets its
+own `(test)` oracle item, RED before any fix, delivered by a party other than the fix's executor, and
+the fix item is `Blocked by` it. An item whose oracle still waits on a seam another item lands, or on
+another open operator decision, records that and files nothing. A prose/config item names its existing
+checks and owes no oracle (`ready-gate` § Work-Class Split for Oracle Authorship). Authors DRAFT oracle
+bodies; the orchestrator files them after the planning pull request merges.
+
+#### C-12 Wire names, fixed so the Rust and Swift halves cannot drift (orchestrator)
+
+- Socket `capture`: two new `CaptureRejection` tags, `label-in-use` and `relabels-another-account`,
+  with no other field (C-6). Swift cases `labelInUse = "label-in-use"` and
+  `relabelsAnotherAccount = "relabels-another-account"`.
+- Socket `capture`, `refreshed` arm: no `previous_label` (C-6). `shared_with` (F3, #1557) is unchanged.
+- `config-set`, `rejected` arm: a new `ConfigSetRejection` tag `label-in-use`, with `collisions` (a list
+  of `{label, bearers}`, `bearers` in roster order) beside `reason`, present only with that reason. The
+  `applied` arm carries no `collisions`. Swift case `labelInUse = "label-in-use"`. This refusal may carry
+  labels and uuids where a `CaptureRejection` tag may not, because `config-get` already sends the same
+  labels and uuids to the Settings client (design § 8.1); the capture-rejection-parity rule governs
+  `CaptureRejection`.
+- A present-but-malformed new field drops that fact and keeps the outcome (register row
+  `malformed-key-drops-the-fact`).
+- The order of `collisions` when one save collides on two labels stays `config-set-ack-collisions`
+  Red 2.
+
+#### C-13 What the orchestrator records in the planning documents, in the re-authoring pull request
+
+- PRD § 8.1's two Ruling paragraphs and the migration PRD's AC-6 amendment note: the socket `capture`
+  and `config-set` refuse with no override (correcting "unless `--overwrite` is given" there).
+- `docs/requirements/roster-loss-prevention.md`: the dated note of C-5.
+- PRD criteria the refuse form re-keys: REQ-IDN-I-001, REQ-IDN-I-002, AC-IDN-001's "`work` now names two
+  accounts", AC-IDN-002's collision report, and every other one the six authors report.
+- Design § 8.1: the `config-set` `collisions` field on `rejected`, and the two capture tags.
+- The scope brief: a register row per `orchestrator` decision above, and each item's new verdict.
+- The scope brief: the row `refuse-form-relabel-card-names-no-label` for the parity gap C-9's panel
+  bullet names.
+- PRD § 8.2: REQ-LGN-B-004's ratification stamp of 2026-07-01 ("the accidental-overwrite risk is
+  accepted") is superseded by the rulings for the rename and collision cases; its home is outside this
+  repository, so the note lands where § 8.2 surfaces it.
+
+#### Open decisions these items still meet, unchanged by the rulings
+
+`panel-notices-name-the-uuid` (design § 14.6 item 10a), `panel-switches-by-identifier` (item 15),
+`label-normalization-policy`, `account-key-form` (DQ-1), `settings-accounts-frame-owner`,
+`mock-page-restructure`, `swift-red-landing-form`, `orphan-stash-policy`,
+`ready-items-before-ratification`, and the operator's ratification of the PRD. An item that holds
+under every option of one of them is not blocked by it.
 
 ## 12b. Alternatives Considered and Drawbacks
 
@@ -1214,7 +1594,7 @@ Likelihood and impact run from 1 to 3; their product reads 7–9 HIGH, 4–6 MED
 | RK-03 | a reaper deletes an in-flight stash or the witness (PM-22, T-03) | 2 | 3 | 6 MED | implementer | `report` recommended; if `reap`, SP-2 and the grace window |
 | RK-04 | the detector is inert and zero detections read as "no sharing" (PM-3) | 2 | 2 | 4 MED | implementer, operator | the mutation pass; MET-R-003's reading names the blind spot; SP-1 premise 1 |
 | RK-05 | #1457 and F4 claim one minor (PM-8) | 2 | 2 | 4 MED | the second to merge | the number is read at merge; goldens regenerated after rebase |
-| RK-06 | #1474 has not landed, so `refreshed` notices cannot reach the panel | 2 | 2 | 4 MED | implementer | Rust fields first; `captured`'s collision line does not wait |
+| RK-06 | #1474 has not landed, so `refreshed` notices cannot reach the panel | 2 | 2 | 4 MED | implementer | Rust fields first; `captured`'s collision line does not wait (retired 2026-11-03: no completed capture creates a collision, § 12.3 C-8; the refusal tags do not wait on #1474 either) |
 | RK-07 | F7's walk never happens | 2 | 2 | 4 MED | operator | MET-R-001's gate; one walk serves #1020, #1542 and #1546 |
 | RK-08 | F4 overruns | 2 | 2 | 4 MED | implementer | separate items (§ 4), the decision-free ones first; the other features land alone |
 | RK-09 | a shared-path change breaks the uncompiled Linux build (PM-20) | 2 | 2 | 4 MED | implementer | no platform call added; G-LINUX |
@@ -1352,6 +1732,7 @@ nothing until it is answered:
     accepts or narrows the line when ratifying.
 14. **REQ-DOC-B-003's wording** assumes the keep-rename answer to `login-mismatch-policy`; a refuse answer
     makes "renames that account" false, so the `LOGIN_USAGE` edit follows that decision (§ 4, D-13).
+    Answered 2026-11-03: refuse (§ 12.2); the wording is re-keyed to § 12.3 C-10.
 15. **`panel-switches-by-identifier`.** The PRD lists "swap to it" among the acts a shared label spoils
     (§ 2), but no requirement names the panel's switch, and PRD § 9.3's CTA inventory has no swap action. Today both of the
     panel's swap actions send the label, and the daemon refuses an ambiguous one after the click. The design
@@ -1406,7 +1787,7 @@ alternatives existed — are marked **(default)**.
   § 13), Infrastructure and Integration (no new deployment or external system), UX Prototype (no user
   validation planned), UI/Visual (no new component; folded into UX/IA and REQ-ROW-C-002).
 - D-1 to D-14 (§ 5, § 12.1), with D-3's enabled count **(default)**, D-7's sentinel placement **(default)**,
-  D-8's unchanged readers **(default)**, and the field names `collisions`, `previous_label`, `shared_with`,
+  D-8's unchanged readers **(default)**, and the field names `collisions`, `previous_label`, `shared_with` (of which only `shared_with` and `config-set`'s `collisions` ship under § 12.3 C-12),
   the event name `credential_shared` and its `via` token **(default)**.
 - The rejection tag names `label-in-use` and `relabels-another-account`, used only if chosen **(default)**.
 - UX-1 to UX-11 (§ 9.1), with UX-3's ordinal as the duplicate set's one handle **(default)**, UX-9's
@@ -1583,7 +1964,7 @@ the two items the verdict names.
 >
 > **The block is resolved**
 > - **The Must clause is met on the panel path.**
->   - The acknowledgements carry the uuids as facts (§ 8.1): `account_uuid` on `captured` and `refreshed`, `collisions[].bearers`, and `shared_with[].account_uuid`.
+>   - The acknowledgements carry the uuids as facts (§ 8.1): `account_uuid` on `captured` and `refreshed`, `collisions[].bearers`, and `shared_with[].account_uuid` (since 2026-11-03, § 12.3 C-12: `account_uuid` and `shared_with[].account_uuid` on the capture acknowledgement; `collisions[].bearers` on `config-set`'s refusal instead).
 >   - The card's collision line and its equal-label shared line name those uuids, and mark the written entry "(this one)" (§ 9.6).
 >   - The CLI marks the written entry too (§ 8.5).
 > - **Option (c) is met.** The card says "Rename one in Settings", and Settings now shows each ambiguous row's uuid under its label (UX-9, § 9.5, § 9.6). The operator can therefore match the card's uuid to a Settings row, with no wire change.

@@ -39,7 +39,7 @@ artifacts: {design-doc: docs/design/account-label-integrity-solution-design.md, 
 > and each cited line reads the same there as at `d9d75ba`. The line numbers that §§ 2.11 and 2.14
 > quote from other documents stay as those documents wrote them.
 
-**Version**: 1.4
+**Version**: 1.5
 **Created**: 2026-10-26
 **Last Updated**: 2026-11-03
 **Status**: Draft — blocked from scoping by `dor_status: failed` (§ 14c); the run went past that verdict provisionally, under the scope brief's register row `proceed-past-failed-dor`, and § 14b lists the items it filed
@@ -61,8 +61,10 @@ roster entries unnoticed. The panel, the usage history, the `status` and `watch`
 tell accounts apart by label alone, so a shared or moved label makes them merge or confuse the accounts behind
 it (§ 2).
 
-**Proposed solution.** Make every write that creates a collision, renames an account or stores a credential
-another entry already holds announce it on the surface that did the write (F1 to F3). Give every surface
+**Proposed solution.** Refuse, before any write, a write that would create a collision or rename an account,
+unless the operator consents on the CLI with `--overwrite` or `--rename` (ruled 2026-11-03, § 8.1 and design
+§ 12.3), and make a write that stores a credential another entry already holds announce it on the surface
+that did the write (F1 to F3). Give every surface
 downstream of the roster an identity that a relabel does not change (F4). Check an import payload's own
 identities before writing (F5, F6). Measure the premises behind the identifier on real logins (F7). Record
 the decisions nobody has made: what makes two labels the same (F8) and what becomes of an orphaned keychain
@@ -419,7 +421,7 @@ In-repo records:
 | 6 | Nobody has established whether anything reaps or reports an orphan stash | Established statically: nothing does | § 2.12 |
 | 7 | Nobody has read the export side | Read: the exporter copies the stash's `oauthAccount` without a comparison | § 2.8 |
 | 8 | A refusal contradicts both AC-6 and D-LGN-6 | D-LGN-6's "never hard-error, never prompt" is scoped in its own text to an omitted label, and `capture` has prompted since #447 (`prefill_label_from_identity`, `src/capture.rs:166-171`). The D-LGN-6 half is an ambiguity; the AC-6 half stands | § 8.1, § 8.2 |
-| 9 | REQ-LGN-B-004 decides the login case | Its stamp matches on the label; the code matches on the uuid | 🔴 contradiction, § 8.2, under `login-mismatch-policy` |
+| 9 | REQ-LGN-B-004 decides the login case | Its stamp matches on the label; the code matches on the uuid | 🔴 contradiction, § 8.2, under `login-mismatch-policy`; superseded 2026-11-03 for the rename and collision cases by the rulings (design § 12.3, C-3, C-13): a bare `login` for the account's own label still refreshes it, a login that would rename the account is refused unless `--rename` is given, and the stamp's "accidental-overwrite risk is accepted" no longer holds; the stamp's home is outside this repository, so this row carries the note |
 | 10 | #1482's body: a "two-read consistency check" covers the login window | The second read is gone (`reconcile_login`, `src/capture.rs:961-968`), and a concurrent writer's change is still overwritten at save | § 2.13; fixing it stays #1482's |
 | 11 | R-15: the uuid's shape and length are unchecked | `account_uuid_violation` checks both, on read and on write | 🔴 contradiction, routed to #1091 |
 | 12 | The seed: a uuid on the wire does not trip the issue #15 meter | True of the meter; but the status wire's own `canary` comments say "never … account-uuid (issue #15)" | § 2.6; REQ-WIRE-C-002, DQ-1 |
@@ -523,8 +525,9 @@ lands.
 #### MET-T-002: Relabel disclosure
 
 - **TAG**: RelabelDisclosure
-- **SCALE**: share of relabelling revives — a `capture`, `login` or socket `capture` that matches a
-  rostered account and gives it a different label — whose reply names both the previous label and the
+- **SCALE**: share of relabelling revives — since 2026-11-03 only a CLI `capture` or `login` made with `--rename` that
+  matches a rostered account and gives it a different label; a socket `capture` refuses a relabel and is
+  outside the population (design § 12.3 C-3, C-6) — whose reply names both the previous label and the
   new one
 - **METER**: hermetic tests over each caller of `plan_capture`
 - **PAST**: 0% at `d9d75ba`; the reply names only the new label (§ 2.4)
@@ -749,6 +752,16 @@ replaced account's fate under `--overwrite`, which is the orchestrator's reading
 `capture` and `config-set` carry the override; and whether `import` follows the ruling, where AC-6 still
 answers warn-and-never-refuse.
 
+**Settled for the re-authoring (the orchestrator, 2026-11-03), ratification-pending.** Design § 12.3 fixes
+the cross-item behaviour of the items that read this answer, after a fresh-context critique. The override
+exists on CLI `capture` and `login` only: the socket `capture` and `config-set` refuse with no override
+(C-6, C-7), which corrects the reading above where it implied `--overwrite` reaches all four paths.
+Overwrite consent replaces exactly one holder, in place, and only when the captured account is new, so the
+roster count never drops and the append-only reload floor of `docs/requirements/roster-loss-prevention.md`
+R-3 still holds (C-5). A label two or more accounts carry is refused whatever the flags, the way `remove`
+refuses a duplicated label (C-5). A uuid-derived label is made free with a numeric suffix rather than
+refused (C-2). `import` stays open.
+
 **`login-mismatch-policy`**: what `login <label>` does when the captured account is not the one the
 label names.
 
@@ -774,8 +787,17 @@ the same-label case; the deliberate rename path that `recapture_updates_the_labe
 pins stays reachable through the flag, so that test gains the flag rather than being struck. Open, carried
 in the scope brief's register as `login-mismatch-policy-ruling`: how the socket `capture` carries the
 override, since the socket has no `login` verb and relabels through its `capture` (#1559). A `login` that would
-both rename an account and make its label name a second account meets both rulings; which flags it needs is
-#1556's re-gate to settle.
+both rename an account and make its label name a second account meets both rulings; design § 12.3 C-4
+settles it: no flag makes that one write, and the operator frees the label first.
+
+**Settled for the re-authoring (the orchestrator, 2026-11-03), ratification-pending.** The rename gate covers
+CLI `capture` and the socket `capture` too, which share `plan_capture` with `login`, on the operator's own
+reason (design § 12.3, C-3). The refusal's trigger is a rename: the login lands on a rostered account and
+gives it a label different from the one it carries; a login that lands on a new account under a label another
+account carries is `duplicate-label-policy`'s case. With no label given, a rostered account is refreshed without
+the #447 prompt,
+so pressing Enter can never rename it (C-3). The socket `capture` carries no override: the panel renames
+through Settings (C-6).
 
 **`label-normalization-policy`**: what normalization means, if anything.
 
@@ -931,14 +953,14 @@ feature column of `—` marks an existing CTA that no feature here changes.
 
 | Object | CTA | Feature | Variants | Precondition | Outcome |
 |---|---|---|---|---|---|
-| RosterEntry | Create | F1 | CLI `capture`, CLI `login`, socket `capture`, `import` | a harvested or imported uuid the roster does not hold | the entry is appended under its label; a collision it creates is reported |
-| RosterEntry | Edit (relabel) | F1 ! F2 | a revive with a label through `capture`, `login` or socket `capture`; `config-set` | the entry exists | the label is replaced; a collision is reported (F1); on a revive, the previous label is named (F2) |
+| RosterEntry | Create | F1 | CLI `capture`, CLI `login`, socket `capture`, `import` | a harvested or imported uuid the roster does not hold | the entry is appended under its label; a collision it creates is reported (since 2026-11-03: on the three governed paths a collision is refused before the write, and `import` keeps its own rule, design § 12.3 C-1, C-2) |
+| RosterEntry | Edit (relabel) | F1 ! F2 | a revive with a label through `capture`, `login` or socket `capture`; `config-set` | the entry exists | the label is replaced only with rename consent, and never onto a label another account carries (design § 12.3, C-3, C-4); on a CLI revive made with `--rename` the previous label is named (F2); a socket revive that would relabel is refused (C-6) |
 | RosterEntry | View | F4 | `list`, `status`, the panel | the daemon serves `status` | one line or row per entry, keyed on an identity a relabel does not change |
 | RosterEntry | Delete | — | `remove` | a query that resolves to one entry | the entry is removed, then its stash is deleted; F10 covers the orphan a failure leaves |
-| AccountLabel | Compare (exact) | F1 | the before-and-after bearer count | a write that sets a label | a collision is detected when REQ-ROS-B-002 counts one |
+| AccountLabel | Compare (exact) | F1 | the before-and-after bearer count | a write that sets a label | a collision is detected when REQ-ROS-B-002 counts one (since 2026-11-03, per account on the governed write paths, design § 12.3 Terms) |
 | AccountLabel | Compare (confusable) | F8 | the rule F8's record adopts | the record adopts detection | a confusable pair is detected |
 | CapturedIdentity | Match | F2 | `plan_capture`'s uuid lookup | a completed capture or login | the matched entry, or a new one |
-| CapturedIdentity | View (disclose) | F2 | the reply on a relabelling revive | a match whose label changes | the previous label is named |
+| CapturedIdentity | View (disclose) | F2 | the reply on a relabelling revive | a match whose label changes | the previous label is named on a CLI revive made with `--rename`; a socket relabel is refused (design § 12.3, C-3, C-6) |
 | CapturedIdentity | Create (measure) | F7 | the operator's real login | the operator's walk | a measured premise |
 | StashedCredential | Create (write) | F3 ! F6 | `capture`, `login`, socket `capture`, `import` | a planned entry | the stash is written; F6 refuses a mismatched import entry before this |
 | StashedCredential | Compare | F3 | in memory, against every other entry | a credential was just written | a byte-identical pair is detected |
@@ -946,10 +968,10 @@ feature column of `—` marks an existing CTA that no feature here changes.
 | StashedCredential | Delete (reap) | F10 | the reaper | the policy is to reap | orphan items are deleted |
 | MigrationArtifact | Import (payload check) | F5 | before the swap lock | an artifact is read | a duplicate or unmatched credential entry is reported |
 | MigrationArtifact | Import (entry identity check) | F6 | per entry | an entry carries a credential | a mismatched entry is refused |
-| OperatorNotice | Create (collision) | F1 | CLI line; socket acknowledgement | F1 detects a collision | the operator is told |
+| OperatorNotice | Create (collision) | F1 | CLI line; socket acknowledgement | F1 detects a collision | the operator is told (since 2026-11-03: the write is refused, and the CLI refusal names the holder, design § 12.3 C-9) |
 | OperatorNotice | View (collision) | F1 | terminal; panel | a report was emitted | the label is shown |
-| OperatorNotice | Create (relabel) | F2 | CLI reply; `refreshed` acknowledgement | a relabelling revive | the previous label is carried |
-| OperatorNotice | View (relabel) | F2 | terminal; panel, once #1474 lands | a disclosure was emitted | both labels are shown |
+| OperatorNotice | Create (relabel) | F2 | CLI reply; `refreshed` acknowledgement | a relabelling revive | the previous label is carried in the CLI reply only; the `refreshed` acknowledgement never carries one (design § 12.3, C-6) |
+| OperatorNotice | View (relabel) | F2 | terminal; panel, once #1474 lands | a disclosure was emitted | both labels are shown (since 2026-11-03: only on a CLI revive made with `--rename`; the panel never shows a previous label, design § 12.3 C-6, C-8) |
 | OperatorNotice | Create (shared credential) | F3 | the writing surface | F3 detects a pair | the operator is told |
 | OperatorNotice | Create (payload) | F5 | `import`'s report | F5 detects a duplicate or unmatched entry | the operator is told |
 | OperatorNotice | Create (identity mismatch) | F6 | `import`'s per-account report | F6 refuses an entry | the account is reported failed |
@@ -1038,7 +1060,9 @@ claim; the resolution for each follows the table.
 - **RosterEntry Edit, claimed by F1 and F2.** One relabelling revive can both create a collision and
   rename a different account. Resolved as one CTA with conditional behaviour: the one reply carries
   F1's report when REQ-ROS-B-002 counts a collision, and F2's previous label when the revive changed
-  the label.
+  the label. Since 2026-11-03 such a write cannot proceed whatever flags are given, because overwrite consent applies
+  only to a new account (design § 12.3 C-4, C-5); the way through is to free the label first, then repeat
+  the write with `--rename`, so a completed reply carries F2's previous label only, never F1's report.
 - **StashedCredential Create, claimed by F3 and F6.** Resolved by order: F6 decides before the write,
   so a refused import entry writes nothing and F3 never compares it; F3 compares every credential that
   is written.
@@ -1064,8 +1088,8 @@ Answers gap `duplicate-label-silent-at-entry` (§ 2.3). The form of the report i
 
 | ID | EARS pattern | Statement | Priority | Origin | Confidence |
 |---|---|---|---|---|---|
-| REQ-ROS-B-001 | Event-driven | When a CLI `capture`, a CLI `login`, a socket `capture` command or a socket `config-set` command would create a label collision as REQ-ROS-B-002 defines it, the system shall report that collision to the operator on the surface that requested the write, naming the label, as a report on the completed write or as a refusal before any write, whichever `duplicate-label-policy` selects. | Must | `AI-inferred-expansion` | VALIDATED: the four paths are observed silent (§ 2.3) |
-| REQ-ROS-B-002 | Ubiquitous | The system shall count a write as creating a label collision when, for some label, the number of roster entries carrying it after the write is above one and above the number carrying it before the write. | Must | `AI-inferred-expansion` | ASSUMED: it reuses import's rule (§ 2.3) |
+| REQ-ROS-B-001 | Event-driven | When a CLI `capture`, a CLI `login`, a socket `capture` command or a socket `config-set` command would create a label collision as REQ-ROS-B-002 defines it, the system shall report that collision to the operator on the surface that requested the write, naming the label, as a report on the completed write or as a refusal before any write, whichever `duplicate-label-policy` selects. | Must | `AI-inferred-expansion` | VALIDATED: the four paths are observed silent (§ 2.3); the form is the refusal since 2026-11-03 (design § 12.3, C-2), and a uuid-derived label is made free with a suffix rather than reported |
+| REQ-ROS-B-002 | Ubiquitous | The system shall count a write as creating a label collision when, for some label, the number of roster entries carrying it after the write is above one and above the number carrying it before the write. Since 2026-11-03 the four governed write paths (CLI `capture`, CLI `login`, socket `capture`, `config-set`) count per account instead: a write creates a collision when it gives an account a label it did not carry before and another account carries that label after the write (design § 12.3, Terms); `import` keeps the count rule above. | Must | `AI-inferred-expansion` | ASSUMED: it reuses import's rule (§ 2.3); refined 2026-11-03 (design § 12.3, Terms): the count rule lets a save move an account onto a label two others already share, so the refuse form counts a collision per account, a label an account did not carry before and another account carries after the write |
 | REQ-ROS-I-001 | Optional | Where the socket `capture` or `config-set` command reports a collision, the daemon shall carry the report in a form that the menu-bar app's `CaptureAck` and `ConfigSetAck` decoders, as changed in the same commit, decode without error. | Must | `AI-inferred-expansion` | VALIDATED: both decoders throw on a value they do not model (§ 6) |
 | REQ-ROS-I-002 | Optional | Where the daemon reports a collision on the socket, the menu-bar app shall present it on the surface that requested the write, at parity with the CLI report. | Must | `AI-inferred-expansion` | ASSUMED: parity is ratified (`gui-cli-capability-parity` R-1); the presentation is not designed |
 | REQ-ROS-C-001 | Ubiquitous | The `test` job shall gate the parity between every new Rust acknowledgement value or field and its Swift decoder case, as `every_rust_rejection_tag_has_a_swift_case` gates rejection tags today. | Must | `AI-inferred-expansion` | VALIDATED: `panel-goldens` runs every step with `continue-on-error` |
@@ -1096,6 +1120,8 @@ Answers gap `duplicate-label-silent-at-entry` (§ 2.3). The form of the report i
 > **BUT NOT** a report when the harvested uuid is `A` itself, which refreshes the same account;
 > **BUT NOT** a refusal that takes effect after the stash is written, which would leave an orphan stash;
 > **BUT NOT** renaming either account, or naming either account's email.
+> *Re-keyed 2026-11-03 (design § 12.3, C-2, C-5): the form is a refusal before any write, naming `work`,
+> unless `--overwrite` is given, which replaces `A` because `B` is new and `A` is the only holder.*
 
 **AC-ROS-002 — REQ-ROS-B-002, REQ-ROS-Q-001**
 
@@ -1112,6 +1138,8 @@ Answers gap `duplicate-label-silent-at-entry` (§ 2.3). The form of the report i
 > **And** the `test` job fails whenever a Rust acknowledgement value has no Swift case.
 > **BUT NOT** a decode error, which is what an unmodelled `result` value produces today (#1474);
 > **BUT NOT** a `panel-goldens` result standing in for the parity gate.
+> *Re-keyed 2026-11-03 (design § 12.3, C-6, C-9): the capture is refused with `label-in-use`, and the card
+> shows the refusal; no capture completes with a collision.*
 
 **AC-ROS-004 — REQ-ROS-C-002**
 
@@ -1136,9 +1164,9 @@ is `login-mismatch-policy`'s to decide (§ 8.1).
 
 | ID | EARS pattern | Statement | Priority | Origin | Confidence |
 |---|---|---|---|---|---|
-| REQ-IDN-B-001 | Event-driven | When a `capture`, a `login` or a socket `capture` command matches an already-rostered account and gives it a label different from the one it carried, the system shall name in its reply both the label the account carried before the write and the label it carries after it. | Must | `AI-inferred-expansion`; `capture` and the socket `capture` are a same-class addition | VALIDATED: the reply cannot show the previous label (§ 2.4) |
-| REQ-IDN-I-001 | Optional | Where the socket `capture` command refreshes an account under a different label, the daemon shall carry the previous label as an additive field of the `refreshed` acknowledgement. | Must | `AI-inferred-expansion` | ASSUMED |
-| REQ-IDN-I-002 | Optional | Where the menu-bar app decodes a `refreshed` acknowledgement that carries a previous label, the app shall show both labels on the capture card. | Should | `AI-inferred-expansion` | ASSUMED: it waits on #1474 |
+| REQ-IDN-B-001 | Event-driven | When a `capture`, a `login` or a socket `capture` command (since 2026-11-03 the socket path refuses a relabel and never completes one, design § 12.3 C-6, so only a CLI revive made with `--rename` names both labels) matches an already-rostered account and gives it a label different from the one it carried, the system shall name in its reply both the label the account carried before the write and the label it carries after it. | Must | `AI-inferred-expansion`; `capture` and the socket `capture` are a same-class addition | VALIDATED: the reply cannot show the previous label (§ 2.4) |
+| REQ-IDN-I-001 | Optional | Where the socket `capture` command refreshes an account under a different label, the daemon shall carry the previous label as an additive field of the `refreshed` acknowledgement. | Must | `AI-inferred-expansion` | VACUOUS since 2026-11-03: the socket `capture` never completes a rename (design § 12.3, C-6), so this condition never holds; the refusal's card names no account's label; a write that also collides is refused `label-in-use`, whose card names only the label asked for (C-6, C-9) |
+| REQ-IDN-I-002 | Optional | Where the menu-bar app decodes a `refreshed` acknowledgement that carries a previous label, the app shall show both labels on the capture card. | Should | `AI-inferred-expansion` | VACUOUS since 2026-11-03, with REQ-IDN-I-001 (design § 12.3, C-6). Before that: ASSUMED: it waits on #1474 |
 | REQ-IDN-C-001 | Ubiquitous | The project shall author, before the change, a test in which `login X` lands on a rostered account labelled `Y` and the reply names `Y`, failing against the tree before the change. | Must | `AI-inferred-expansion` | ASSUMED |
 | REQ-IDN-C-002 | Optional | Where `login-mismatch-policy` selects a refusal, the system shall take that refusal before the credential stash is written, leaving no stash and no roster change. | Must, where chosen | `AI-inferred-expansion` | SPECULATIVE until 2026-11-03; `login-mismatch-policy` now selects the refusal (§ 8.1), so this requirement applies |
 
@@ -1151,6 +1179,10 @@ is `login-mismatch-policy`'s to decide (§ 8.1).
 > **And** REQ-ROS-B-001's report accompanies it, because `work` now names two accounts.
 > **BUT NOT** the harvested email address, a token, or any credential-derived value;
 > **BUT NOT** a changed reply when the label given equals the one the account already carries.
+> *Re-keyed 2026-11-03 (design § 12.3, C-4, C-9): `login work` here renames `B` onto a label `A` carries,
+> which no flag makes one write; the refusal names `spare` as the label the account carries and says
+> `work` is carried by another account. REQ-IDN-B-001's disclosure is exercised by `login <free-label>
+> --rename` landing on `B`.*
 
 **AC-IDN-002 — REQ-IDN-B-001**
 
@@ -1159,6 +1191,8 @@ is `login-mismatch-policy`'s to decide (§ 8.1).
 > **Then** the reply is `Onboarded "work" (now N in rotation).`, plus REQ-ROS-B-001's report if
 > another entry already carries `work`.
 > **BUT NOT** a previous-label disclosure, because a new account has none.
+> *Re-keyed 2026-11-03 (design § 12.3, C-2, C-5): if another entry already carries `work`, the login is
+> refused unless `--overwrite` is given, which replaces that entry when it is the only holder.*
 
 **AC-IDN-003 — REQ-IDN-C-002**
 
@@ -1176,6 +1210,8 @@ is `login-mismatch-policy`'s to decide (§ 8.1).
 > **And** once #1474 lets the app decode `refreshed`, the capture card shows both labels.
 > **BUT NOT** a new `result` value for the relabel, which today's decoder would throw on;
 > **BUT NOT** the previous label shown before the app can decode `refreshed` at all.
+> *Re-keyed 2026-11-03 (design § 12.3, C-6, C-9): the capture is refused with `relabels-another-account`
+> before any write; the card names no account's label, since the watch snapshot cannot say for certain which account the capture landed on, and offers Settings to rename.*
 
 **Invariants.** No reply names an email address the label does not carry, or any credential-derived
 value. An onboarding reply keeps its verb and its count.
@@ -1492,7 +1528,7 @@ and the sites outside this repository are out of scope (§ 3).
 |---|---|---|---|---|---|
 | REQ-DOC-B-001 | Ubiquitous | The project shall amend ADR-0032 with a dated note, keeping its original text, stating that `SPAWN_ENV_REMOVE` has removed the refresh-token triple since commit `86ab6aa`. | Must | `AI-inferred-expansion` | VALIDATED: the drift is observed (§ 2.11) |
 | REQ-DOC-B-002 | Ubiquitous | The migration PRD's stale line anchors shall each cite the symbol they mean, as § 2.11 lists them, so that `scripts/check-doc-citation-rot.sh` checks each symbol against its number, unless #1476's policy is decided first and governs instead. | Must | `AI-inferred-expansion` | VALIDATED: the drift is observed (§ 2.11) |
-| REQ-DOC-B-003 | Ubiquitous | The `login` usage text, `LOGIN_USAGE`, shall say what a label given for an already-rostered account does, which is to rename that account, coordinated with #1379's edit of the same constant. | Must | `AI-inferred-expansion` | VALIDATED: the text says "a name for the new account" (§ 2.11); the wording "which is to rename that account" predates the 2026-11-03 ruling, under which such a label is refused unless `--rename` is given, so the usage text and this requirement are re-keyed with #1570 (§ 8.1) |
+| REQ-DOC-B-003 | Ubiquitous | The `login` usage text, `LOGIN_USAGE`, shall say what a label given for an already-rostered account does, which is to rename that account, coordinated with #1379's edit of the same constant. | Must | `AI-inferred-expansion` | VALIDATED: the text says "a name for the new account" (§ 2.11); the wording "which is to rename that account" predates the 2026-11-03 ruling, under which such a label is refused unless `--rename` is given, so the usage text and this requirement are re-keyed with #1570 (§ 8.1; the refuse-form sentence is design § 12.3, C-10) |
 | REQ-DOC-B-004 | Ubiquitous | The migration PRD's A-1 shall be regraded, by a dated amendment, from "Validated" to an unmeasured assumption whose validation plan is F7's premise 2. | Should | `AI-inferred-expansion`; a same-class addition | VALIDATED: it rests on code comments (§ 2.9) |
 | REQ-DOC-C-001 | Ubiquitous | The project shall land every correction to ratified text as a dated amendment note that preserves the original wording, as #1116 records. | Must | `AI-inferred-expansion` | VALIDATED: #1116 is the precedent |
 
@@ -1518,6 +1554,9 @@ and the sites outside this repository are out of scope (§ 3).
 > **When** the operator reads the `<label>` line,
 > **Then** it says that a label given for a rostered account renames that account.
 > **BUT NOT** a promise that #1379 is removing.
+> *Re-keyed 2026-11-03 (design § 12.3, C-10): the line says that a label which would rename the landed
+> account is refused unless `--rename` is given, which renames it, and, for an account new to the roster,
+> that a label one other account carries is refused unless `--overwrite` is given.*
 
 **AC-DOC-004 — REQ-DOC-B-004, REQ-DOC-C-001**
 
@@ -1615,7 +1654,7 @@ why. Where a state keeps today's presentation, the row says so rather than inven
 | Loading | N/A: the CLI prints one line after the write completes; during a `login` the operator is in Claude Code's own login flow, which this PRD does not change |
 | Empty — first use | A first capture on a machine with no roster: `Captured "X" (now 1 in rotation).`; no collision or shared credential is possible; ADR-0036's witness may refuse first, unchanged |
 | Empty — no results | N/A: a write always has an outcome, never a result set |
-| Populated | `Captured`, `Refreshed`, `Onboarded` or `Revived`, plus F1's collision report, F2's previous label and F3's shared-credential report, each only when it applies |
+| Populated | `Captured`, `Refreshed`, `Onboarded` or `Revived`, plus F1's collision report, F2's previous label and F3's shared-credential report, each only when it applies (since 2026-11-03, design § 12.3 C-8: F2's previous label only on a CLI revive made with `--rename`, a replaced holder named by uuid under `--overwrite`, and no collision report, since no completed write creates one) |
 | Error — network | The login spawn fails: today's error, with no roster change and no report |
 | Error — auth | An incomplete login, timed out or cancelled: today's message, with no roster change |
 | Error — permission | A locked keychain: today's error, with no write |
@@ -1630,10 +1669,10 @@ why. Where a state keeps today's presentation, the row says so rather than inven
 | Loading | The capture is in flight: as the mock authors it today; F1 and F2 add no loading state |
 | Empty — first use | N/A: the card exists only once a capture has been requested |
 | Empty — no results | N/A: an acknowledgement always carries a result |
-| Populated | `captured` with the label and the count, or `refreshed`, which decodes as an error until #1474 lands; plus F1's report and F2's previous label |
+| Populated | `captured` with the label and the count, or `refreshed`, which decodes as an error until #1474 lands; plus F1's report and F2's previous label (since 2026-11-03, design § 12.3 C-6 and C-8: neither; a capture that would create a collision or relabel an account is `rejected` before any write) |
 | Error — network | The daemon is unreachable: the panel's existing daemon-down presentation |
 | Error — auth | `no-active-account`: the existing rejection |
-| Error — permission | `keychain-locked` or `prior-configuration`: the existing rejections; a refusal under `duplicate-label-policy` would join them as a new tag that Swift models in the same commit |
+| Error — permission | `keychain-locked` or `prior-configuration`: the existing rejections; a refusal under `duplicate-label-policy` would join them as a new tag that Swift models in the same commit (since 2026-11-03 both `label-in-use` and `relabels-another-account` join them, design § 12.3 C-12) |
 | Partial | `failed`: the stash landed and the roster save did not (F10) |
 | Stale | N/A: an acknowledgement answers one request |
 | Offline | The daemon is down: the existing presentation |
@@ -1645,7 +1684,7 @@ why. Where a state keeps today's presentation, the row says so rather than inven
 | Loading | The save is in flight: the existing Settings behaviour, unchanged |
 | Empty — first use | `no-config`: the existing rejection, since there is no roster to relabel yet |
 | Empty — no results | N/A: a save always has an outcome |
-| Populated | `applied`, with the effect `live`, `restart_required` or `unchanged`, plus F1's collision report |
+| Populated | `applied`, with the effect `live`, `restart_required` or `unchanged`, plus F1's collision report (since 2026-11-03, design § 12.3 C-7: `applied` carries no collision report; a colliding save is `rejected` with `label-in-use` and `collisions`) |
 | Error — network | The daemon is unreachable: the Settings window's existing daemon-down handling |
 | Error — auth | N/A: the control socket's peer check refuses another user at connect, before any command |
 | Error — permission | N/A: the same peer check; `config-set` has no permission tier of its own |
@@ -1725,7 +1764,7 @@ section; "tree" is the re-verification in § 2 at `d9d75ba`. All three are repli
 | Req ID | Source | Object | CTA | Feature | Layer | Confidence |
 |---|---|---|---|---|---|---|
 | REQ-ROS-B-001 | seed `duplicate-label-silent-at-entry`; report § Findings (b); tree § 2.3 | RosterEntry | Create, Edit | F1 | B | VALIDATED |
-| REQ-ROS-B-002 | import's rule (tree § 2.3) | AccountLabel | Compare (exact) | F1 | B | ASSUMED |
+| REQ-ROS-B-002 | import's rule (tree § 2.3); per account since 2026-11-03 for the four write paths (design § 12.3 Terms) | AccountLabel | Compare (exact) | F1 | B | ASSUMED |
 | REQ-ROS-I-001 | seed constraints (#1474, #1441); § 6 | OperatorNotice | Create (collision) | F1 | I | VALIDATED |
 | REQ-ROS-I-002 | `gui-cli-capability-parity` R-1 | OperatorNotice | View (collision) | F1 | I | ASSUMED |
 | REQ-ROS-C-001 | `docs/specs/capture-rejection-parity.feature.md`; the soft `panel-goldens` job | OperatorNotice | Create (collision) | F1 | C | VALIDATED |
@@ -1934,3 +1973,4 @@ sub-surfaces sit in the risk lane above.
 | 1.2 | 2026-10-30 | A-5's confidence and evidence cells updated after #1582's readiness gate (run 2026-10-28, re-run 2026-10-30) | the assumption was measured on a stand-in, not the real roster | none on the requirements |
 | 1.3 | 2026-11-02 | `file:line` citations re-resolved against `363698d`; pre-submit polish corrections: § 2.11 row 1 and § 2.14 row 4 (ADR-0032 line range), § 7's #1018 row, § 8.1's REQ-DOC-B-003 exception, § 8.4 items 9 and 10, § 11's view count, § 15's disclosure line; header Version and Last Updated advanced and rows 1.1–1.2 recorded | corrections found by the pre-submit review of the branch | none on the requirements |
 | 1.4 | 2026-11-03 | § 1 TL;DR and § 4 benefit hypothesis composed by the `/scope` orchestrator after the operator ruled the TL;DR is never theirs to write; § 8.1 records the operator's rulings on `duplicate-label-policy` (refuse unless `--overwrite`) and `login-mismatch-policy` (refuse unless `--rename`) with the orchestrator's readings marked as such; § 8.4 item 12 | the operator's words of 2026-11-03, recorded where the decisions live | AC-6 of the migration PRD narrowed by an amendment note; the items that built the warn or keep-rename default (#1556, #1558, #1559, #1560, #1561, #1570) re-enter the ready gate; `dor_status` unchanged |
+| 1.5 | 2026-11-03 | § 8.1's two Ruling paragraphs gain the readings settled for the re-authoring (design § 12.3); REQ-IDN-I-001 and REQ-IDN-I-002 marked vacuous; AC-ROS-001, AC-ROS-003, AC-IDN-001, AC-IDN-002 and AC-IDN-004 re-keyed to the refuse form | the six items that read the two answers were re-authored on one contract, critiqued in a fresh context first | #1556, #1558, #1559, #1560, #1561 and #1570 re-authored and re-gated; `dor_status` unchanged |
