@@ -402,8 +402,8 @@ Scenario: a template declared and not registered fails the module's completeness
   Given a template added to the module with no registration for the scan
    When the module's tripwire runs
    Then it fails, and it names the template
-    # No pre-authored oracle: the module is created by whichever of #1556 and #1557 lands first, so a
-    # test cannot name it yet. Covers AC `templates-pass-the-scans`.
+    # No pre-authored oracle: the module is #1556's to create (the scope brief's `shared-piece-owners`),
+    # so a test cannot name it before #1556 lands. Covers AC `templates-pass-the-scans`.
     # The tripwire in `src/cli.rs` covers that file only. Its register is `INLINE_PROSE_REGISTER` (src/cli.rs:14321).
 
 Scenario: an injected banned token is caught

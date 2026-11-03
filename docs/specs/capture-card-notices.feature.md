@@ -37,6 +37,7 @@ Example Mapping: 🟦 8 rules · 🟩 50 examples · 🟥 0 open
 > REQ-NTC-C-001 say the same. The stub builds on that and tables it among its calls. If the operator
 > answers the other way, the uuid parts of the shared line go and its facts stay. The refused card names
 > no uuid under either answer, because neither the rejection nor a roster row carries one.
+> **Decided 2026-11-03 by the operator: keep the uuid** (design § 14.6 item 10a), so the call above is the ruling.
 >
 > **Questions no example here depends on.** The orchestrator's list also holds `account-key-form`
 > (DQ-1), `label-normalization-policy`, `import-duplicate-uuid-policy`, `orphan-stash-policy` and PRD
@@ -47,7 +48,7 @@ Example Mapping: 🟦 8 rules · 🟩 50 examples · 🟥 0 open
 > that differ only in case or form. DQ-6 is a call, tabled below. The rest concern import, the usage
 > store, `stats`, orphan stashes or the CLI's count wording, none of which reaches this card.
 > The item also names these, and none gates an example either: `panel-switches-by-identifier` (design
-> § 14.6 item 15) no longer reaches the card, because the only line that spoke of switching was the
+> § 14.6 item 15; decided 2026-11-03: keep the switch blocked) no longer reaches the card, because the only line that spoke of switching was the
 > collision line the refuse form removes; `mock-page-restructure` gates the mock's render, not an
 > outcome (see the criteria no scenario expresses); `swift-red-landing-form` picks the oracle's marker,
 > not an outcome (see Oracle authorship); `ready-items-before-ratification` decides when the item is
@@ -699,7 +700,7 @@ Each is a call made without the operator, and each is ratification-pending.
 
 | Call | Why | If the answer is otherwise |
 |---|---|---|
-| `panel-notices-name-the-uuid` is built as the item builds it: a notice names an entry by its uuid only beside a label with more than one bearer | Design § 14.6 item 10a: "If unanswered, the requirements as written govern and the notices name the uuid." REQ-STSH-B-002 (Must) and REQ-NTC-C-001 name the uuid | The uuid parts of Rules 4 and 8 go; the facts stay |
+| `panel-notices-name-the-uuid` is built as the item builds it: a notice names an entry by its uuid only beside a label with more than one bearer | Design § 14.6 item 10a: "If unanswered, the requirements as written govern and the notices name the uuid." REQ-STSH-B-002 (Must) and REQ-NTC-C-001 name the uuid. Decided 2026-11-03 by the operator: keep the uuid | None: the operator decided it on 2026-11-03 |
 | The shared line's rule is the item's: an ambiguous side is named by label and uuid, without an ordinal | The item states it, and says it is this pipeline's reading of the design. Under the refuse form the acknowledgement carries no `collisions` (design § 12.3, C-12), so nothing on the wire places a side; design § 9.6 takes the ordinal from the watch frame, which needs the frame to carry identifiers (#1571, #1578) | Rule 4's two ambiguous-side scenarios change; the others do not |
 | The card reads `shared_with` from the acknowledgement (DQ-6 closed as "both channels") | Design § 14.8 records it, REQ-STSH-B-002 (Must) says "on the surface that performed the write", and #1559 builds on it | Rule 4, Rule 6's shared sentences and Rule 5's notice fixtures go |
 | The item is Must-have | The tracker gives it no priority label, and it serves REQ-ROS-I-002 and REQ-STSH-B-002, both Must | At Should the Red Card Gate would not block |

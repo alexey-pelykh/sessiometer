@@ -4,7 +4,7 @@ Issue #1573 · PRD § 10.4 (F4), which names no requirement for the blocked swit
 § 9.1, § 9.3 TF-3, § 9.5, § 9.6, § 11.4, and § 11.5 CAP-11 (REQ-ROW-B-001, REQ-ROW-C-001,
 REQ-ROW-C-002) · **Tier B** (every scenario pending binding)
 
-Example Mapping: 🟦 5 rules · 🟩 21 examples · 🟥 3 open (`panel-switches-by-identifier`; `callout-swap-accessible-label`; `shared-label-frame-visual-form`)
+Example Mapping: 🟦 5 rules · 🟩 21 examples · 🟥 2 open (`callout-swap-accessible-label`; `shared-label-frame-visual-form`); `panel-switches-by-identifier` was decided on 2026-11-03
 
 > **PROVISIONAL.** The PRD's `dor_status` is `failed`: every requirement is unratified and the problem
 > framing is unvalidated. Everything below is provisional, and that includes the wording. The sentences
@@ -291,8 +291,9 @@ Scenario: the new copy passes the framing vocabulary, and the screen can fail
 
 ## 🟥 Open
 
-- **`panel-switches-by-identifier`** (operator decision; design § 14.6 item 15, weighed with
-  `account-key-form`) — whether the panel's switch should send an identifier as its target, in which
+- **`panel-switches-by-identifier`** — **resolved 2026-11-03**: the operator chose to keep the switch blocked, the
+  default this item builds, so every scenario above stands. As it stood (design § 14.6 item 15, weighed with
+  `account-key-form`): whether the panel's switch should send an identifier as its target, in which
   case the block "would stay only for frames without identifiers". This item builds the default, the
   blocked switch, and the item states it is correct under either answer for the daemon as it is. Every
   scenario above uses a frame without identifiers, which is the only frame any daemon sends today. None
