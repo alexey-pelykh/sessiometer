@@ -124,7 +124,7 @@ items, those that wait on no decision first — the uuid on new samples with the
 tokens on F3's `credential_shared` line (D-9); then, once the mock frame exists (REQ-ROW-C-002), the app-side
 duplicate-set items, #1566 (the row fallback, UX-4, and the panel ordinal, UX-3), #1573 (the blocked switch, UX-10)
 and #1574 (the Settings ordinal), a split Stage 3 made and left ratification-pending — which remove the duplicate-row defect with no wire change, the Settings half waiting on the
-Accounts row anatomy (owner open, § 14.7); then the wire-and-panel item as the tracer bullet, once `account-key-form` is
+Accounts row anatomy (owned by #1652 since 2026-11-03, § 14.7); then the wire-and-panel item as the tracer bullet, once `account-key-form` is
 decided; the store backfill last, and only if the PRD keeps it
 (§ 14.6 item 11); F9's amendments any time, except the `LOGIN_USAGE` line, which lands after
 `login-mismatch-policy` is answered or is worded to its answer, coordinated with #1379; F7's walk whenever
@@ -577,7 +577,8 @@ The CLI's text is in § 8.5. This section covers the app only: no new screen, no
 new call to action. The existing surfaces in the Screen Inventory gain states and cues. The design mock
 (`apps/menubar/design/menubar-preview.html`) is the canonical build reference and authors none of these
 states yet, so each is authored there before Swift builds it. The mock authors the Settings window too, as
-Group 8 (#763); its Accounts row anatomy is the one open axis there (register R-11, owner open, § 14.7), so the
+Group 8 (#763); its Accounts row anatomy is the one open axis there (register R-11, owned by #1652 since 2026-11-03,
+§ 14.7), so the
 Settings half of these states waits on it.
 
 ### 9.1 Information architecture
@@ -749,7 +750,7 @@ Purpose: rename accounts; parking, adding and removing stay CLI-only (#268). Ent
 status item's menu, which closes the panel. Zones: the existing accounts table, with an ordinal badge
 beside the label field of each row whose label has more than one bearer; the existing save status; a
 persistent collision note. Responsive: none. The Accounts row anatomy is the mock's open axis (register
-R-11, owner open, § 14.7), so the badge and the note are drawn there before Swift builds them.
+R-11, owned by #1652 since 2026-11-03, § 14.7), so the badge and the note are drawn there before Swift builds them.
 
 | Data field | Source | Display format | Priority |
 |---|---|---|---|
@@ -910,7 +911,7 @@ full uuid; if the Settings row's uuid line is built (UX-9), it belongs to its ro
 (1.3.1) and is spoken as a short prefix. A blocked switch states its reason to VoiceOver before any click
 (UX-10). Dynamic Type and Reduce Transparency are outside the mock's authority and are checked by hand. The
 Settings window is authored in the mock, as Group 8 (#763); only its Accounts row anatomy is open (register
-R-11, owner open, § 14.7), and the ordinal badge, the note and any uuid line are drawn there first
+R-11, owned by #1652 since 2026-11-03, § 14.7), and the ordinal badge, the note and any uuid line are drawn there first
 (`apps/menubar/design/README.md`, § The Settings window).
 
 ### 11.5 Master Test Plan
@@ -1436,14 +1437,20 @@ describes the rename on a refresh, the label prompt or the append-only shape (`d
 append-only comments beside the daemon notifications, one of which says a login "drops none"),
 because it changes what they describe and none of them carries the sweep's search words.
 
-#### C-11 Oracles (the scope brief's `oracle-authorship` rule, unchanged)
+#### C-11 Oracles (the scope brief's `oracle-authorship` rule, unchanged, and how a seam bears on it)
 
 A deterministic-output item whose expected outcomes are all decidable under this contract gets its
 own `(test)` oracle item, RED before any fix, delivered by a party other than the fix's executor, and
-the fix item is `Blocked by` it. An item whose oracle still waits on a seam another item lands, or on
-another open operator decision, records that and files nothing. A prose/config item names its existing
+the fix item is `Blocked by` it. An item whose oracle still waits on another open operator decision
+records that and files nothing. An item whose oracle reads a seam another item lands says which of two
+forms it takes. Either its oracle item is filed now and is itself `Blocked by` the item that lands the
+seam (#1584 by #1566, #1649 by #1559, and #1560's oracle by #1558), or the item records that its oracle
+waits on the seam and files nothing until the seam lands (#1559). A prose/config item names its existing
 checks and owes no oracle (`ready-gate` § Work-Class Split for Oracle Authorship). Authors DRAFT oracle
 bodies; the orchestrator files them after the planning pull request merges.
+
+Amended 2026-11-03 at #1560's re-gate. The text before had every oracle that waits on a seam file
+nothing, which the filed oracles #1584 and #1649 already contradicted.
 
 #### C-12 Wire names, fixed so the Rust and Swift halves cannot drift (orchestrator)
 
@@ -1479,11 +1486,12 @@ bodies; the orchestrator files them after the planning pull request merges.
 
 #### Open decisions these items still meet, unchanged by the rulings
 
-`panel-notices-name-the-uuid` (design § 14.6 item 10a), `panel-switches-by-identifier` (item 15),
-`label-normalization-policy`, `account-key-form` (DQ-1), `settings-accounts-frame-owner`,
-`mock-page-restructure`, `swift-red-landing-form`, `orphan-stash-policy`,
-`ready-items-before-ratification`, and the operator's ratification of the PRD. An item that holds
-under every option of one of them is not blocked by it.
+`label-normalization-policy`, `account-key-form` (DQ-1), `mock-page-restructure`, `swift-red-landing-form`,
+`orphan-stash-policy`, `ready-items-before-ratification`, and the operator's ratification of the PRD. An item
+that holds under every option of one of them is not blocked by it. Three more were decided by the operator
+on 2026-11-03, after the rulings: `panel-notices-name-the-uuid` (keep the uuid, § 14.6 item 10a),
+`panel-switches-by-identifier` (keep the switch blocked, item 15) and `settings-accounts-frame-owner` (a new
+design item, #1652).
 
 ## 12b. Alternatives Considered and Drawbacks
 
@@ -1705,7 +1713,9 @@ nothing until it is answered:
     always next to its ordinal (UX-9). Under the first reading the notices keep their ordinals and drop the
     uuids, and both REQ-STSH-B-002's and REQ-NTC-C-001's uuid clauses narrow for the panel; the ordinal still
     tells the entries apart, so "Rename one in Settings" stays. If unanswered, the requirements as written
-    govern and the notices name the uuid.
+    govern and the notices name the uuid. **Decided 2026-11-03 by the operator: keep the uuid.** The notices
+    name an entry's uuid beside an ambiguous label, next to its ordinal, as the requirements as written say,
+    so no PRD change follows.
 10b. **`settings-row-shows-uuid`.** Should an ambiguous Settings row also show its own uuid under its label
     field? It is the narrowest form of the affordance § 3 defers until "The operator adds it", so it is not
     built until the operator answers yes. Telling the rows apart does not wait on it: the ordinal does that
@@ -1744,7 +1754,9 @@ nothing until it is answered:
     ruling of 2026-07-31 ("Choosing a surface is not accepting reduced capability") favours the alternative
     once the wire carries the uuid, with the blocked switch kept for an older daemon; the blocked switch
     meets the ruling's letter, because a rename makes either account reachable from the app. If unanswered,
-    the blocked switch stands.
+    the blocked switch stands. **Decided 2026-11-03 by the operator: keep the switch blocked.** The panel keeps
+    sending the label, a switch to a row whose label has more than one bearer is shown blocked before the
+    click until one account is renamed (UX-10), and the CLI's `use <uuid>` still reaches either account.
 16. **`stored-key-name-and-form`.** The usage store's per-sample key is named `account_uuid`, holds the
     uuid verbatim and is left out of a line that has none (D-5, D-7). A ruling on the name or the value is
     a two-line edit in #1580's tests and #1562's code; a ruling on the form, a `null` instead of an omitted
@@ -1775,6 +1787,9 @@ the #160 vocabulary.
   Settings row, to #946, but #946's body covers only the launch-at-login approval sub-block and the inline
   per-field format-error row. #1560 and #1574 draw their badge and note in that section first, so both wait
   on a frame nobody is tasked to author. Widening #946 or filing a frame item is the operator's call.
+  **Decided 2026-11-03 by the operator: a new design item, #1652, draws the Accounts-section frames** #1560
+  and #1574 build against. Both are blocked by it, so neither feature's executor draws the reference its own
+  work is compared against; the render budget is that item's precondition (`mock-page-restructure`).
 
 ### 14.8 Decisions awaiting ratification
 

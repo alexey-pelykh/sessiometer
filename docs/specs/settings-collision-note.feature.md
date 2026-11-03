@@ -1,16 +1,16 @@
 # Feature: the Settings accounts section keeps a persistent note while one label names more than one account
 
-Issue #1560 · parent #1550 · PRD REQ-ROS-B-001 / REQ-ROS-I-002 / REQ-ROS-Q-001 / REQ-NTC-C-001 / REQ-NTC-C-002 · design UX-3 / UX-7 / UX-8 / UX-11, § 9.5, § 9.6, § 11.5 CAP-04, § 12.3 Terms / C-7 / C-8 / C-9 / C-12 · **Tier B** — scenarios pending binding
+Issue #1560 · parent #1550 · PRD REQ-ROS-B-001 / REQ-ROS-I-002 / REQ-ROS-Q-001 / REQ-NTC-C-001 / REQ-NTC-C-002 · design UX-3 / UX-7 / UX-8 / UX-9 / UX-10 / UX-11, § 9.5, § 9.6, § 11.5 CAP-04, § 12.3 Terms / C-7 / C-8 / C-9 / C-12, § 14.6 items 10a and 15, § 14.7 · **Tier B** — scenarios pending binding
 
-Example Mapping: 🟦 5 rules · 🟩 31 examples · 🟥 4 open (panel-notices-name-the-uuid; panel-switches-by-identifier; label-normalization-policy; the Accounts-row frame)
+Example Mapping: 🟦 5 rules · 🟩 34 examples · 🟥 1 open (label-normalization-policy); panel-notices-name-the-uuid, panel-switches-by-identifier and the Accounts-row frame's owner were decided by the operator on 2026-11-03 (cards 2, 3 and 5)
 
 Sources: the PRD, `docs/requirements/account-label-integrity.md`, and the design, `docs/design/account-label-integrity-solution-design.md`. Both are on `main` since the scoping pull request #1638 merged. Every requirement id, `UX-` id, `CAP-` id and section number below points into them.
 
-> **Provisional.** The PRD's `dor_status` is `failed`: every requirement is unratified and its problem framing is unvalidated. Nothing below is the operator's decision except the refusal itself: the operator ruled on 2026-11-03 that a write which would make a label name a second account is refused (PRD § 8.1). Which saves count as a collision, judged per account; how `config-set` carries that refusal, with no override and with `collisions` on its `rejected` acknowledgement; and what Settings shows for it are the orchestrator's readings in design § 12.3 (Terms, C-7, C-9, C-12), confirmed or changed at ratification. A scenario whose outcome hangs on an open decision is not written as a scenario. It is held, named by its slug, under 🟥 Open.
+> **Provisional.** The PRD's `dor_status` is `failed`: every requirement is unratified and its problem framing is unvalidated. Nothing below is the operator's decision except four rulings of 2026-11-03. A write that would make a label name a second account is refused (PRD § 8.1). The note names each bearer's uuid beside its ordinal (`panel-notices-name-the-uuid`, design § 14.6 item 10a). The panel's switch to a label with more than one bearer stays blocked until one account is renamed, so the note keeps its closing sentence (`panel-switches-by-identifier`, item 15). A new design item, #1652, draws the Accounts-section frames this feature is built against (`settings-accounts-frame-owner`, § 14.7); that it draws the rows, the ordinal badge, the note and a refused save's marked rows, in light and dark, is the orchestrator's reading of that answer, ratification-pending. Which saves count as a collision, judged per account; how `config-set` carries that refusal, with no override and with `collisions` on its `rejected` acknowledgement; and what Settings shows for it are the orchestrator's readings in design § 12.3 (Terms, C-7, C-9, C-12), confirmed or changed at ratification. A scenario whose outcome hangs on an open decision is not written as a scenario. It is held, named by its slug, under 🟥 Open.
 >
 > **Not executable.** This repo has no Gherkin runner (`docs/specs/import-duplicate-label.feature.md` records the convention). No test binds these scenarios yet. A scenario counts as covered once a named test binds it.
 >
-> **Facts, not bytes.** The draft wording is copy review's. The scenarios pin the facts the issue calls binding: the label, the count, the ordinals, their order, what is absent, and which rows a refused save marks. The view's fit against the design mock and a marked row under VoiceOver are manual steps (§ Not scenarios).
+> **Facts, not bytes.** The draft wording is copy review's. The scenarios pin the facts the issue calls binding: the label, the count, the ordinals, the uuid beside each ordinal, their order, that the panel cannot switch to either account until one is renamed, what is absent, and which rows a refused save marks. The view's fit against the Accounts-section frames from #1652 and a marked row under VoiceOver are manual steps (§ Not scenarios).
 
 The draft text, from design § 9.6:
 
@@ -18,7 +18,7 @@ The draft text, from design § 9.6:
 note          ‘work’ names 2 accounts: work 1 of 2 (<uuid-A>) and work 2 of 2 (<uuid-B>). Until one is renamed, you can't switch to either from the panel.
 ```
 
-Two parts of the note rest on open decisions and are not pinned below: the uuid beside each ordinal (card 2) and the closing sentence about switching (card 3). The design's announcement of a save that created a collision is retired: under the refusal no save creates one (design § 12.3, C-8). The reason's own sentence, in the footer, is #1558's, and it is fixed: it names no label. This feature names the label and pins the rows the refusal marks (Rule 4; design § 12.3, C-9).
+The two parts of the note that waited on the operator are pinned below since their rulings of 2026-11-03: the uuid beside each ordinal (card 2) and the closing sentence about switching (card 3). The closing sentence's draft is written for two bearers. With three, or with two colliding labels, its words are copy review's and its fact stands: the panel cannot switch to an account whose label has more than one bearer (design UX-10). The design's announcement of a save that created a collision is retired: under the refusal no save creates one (design § 12.3, C-8). The reason's own sentence, in the footer, is #1558's, and it is fixed: it names no label. This feature names the label and pins the rows the refusal marks (Rule 4; design § 12.3, C-9).
 
 ## Rule 1 — the note's groups come from the saved roster, and from nothing else
 
@@ -121,26 +121,52 @@ Scenario Outline: the ordinal counts only the accounts that share the label
 src/config/settings.rs:65 `ConfigView`
 ```
 
-## Rule 3 — the note names every bearer by ordinal, one sentence per label, and wraps without eliding anything
+## Rule 3 — the note names every bearer by ordinal and uuid, one sentence per label, says what the duplicate costs, and wraps without eliding anything
 
-Traces: § 9.5 collision note · § 9.6 · REQ-ROS-I-002 · CAP-04. Seam: the pure note function in `SettingsFormat`. The wrap scenario sits in `SettingsTextMetricsTests`.
+Traces: § 9.5 collision note · § 9.6 · UX-9 · UX-10 · § 14.6 items 10a and 15 · REQ-ROS-I-002 · REQ-NTC-C-001 · CAP-04. Seam: the pure note function in `SettingsFormat`. The wrap scenario sits in `SettingsTextMetricsTests`.
 
 ```gherkin
 Scenario: one sentence per colliding label, in the order of each label's first bearer
   # AC: oracle-a-duplicate-in-the-roster-shows-the-note
   Given the roster holds `b` on uuid-A, `a` on uuid-B, `a` on uuid-C and `b` on uuid-D
    When the note is built
-   Then it holds two sentences, the first for `b` and the second for `a`
+   Then it names `b` and `a` each in a sentence of its own, the sentence for `b` first
     # `b`'s first bearer (uuid-A) precedes `a`'s (uuid-B). Alphabetical order would put `a` first.
+    # Whether the closing sentence follows each label's sentence or ends the note once is copy review's;
+    # the order of the labels is not.
 
-Scenario: a sentence names the label, how many accounts bear it, and every bearer by ordinal in roster order
+Scenario: a sentence names the label, how many accounts bear it, and every bearer by ordinal and uuid in roster order
   # AC: oracle-a-duplicate-in-the-roster-shows-the-note
   Given the roster holds `work` on uuid-A, uuid-B and uuid-C
    When the note is built
    Then its sentence says that `work` names 3 accounts
     And it names the bearers in roster order as `work 1 of 3`, `work 2 of 3` and `work 3 of 3`
-    # Held, so not asserted here: the uuid beside each ordinal (card 2) and the closing sentence about
-    # switching (card 3).
+    And it names each bearer's uuid beside its own ordinal: uuid-A beside `work 1 of 3`, uuid-B beside `work 2 of 3` and uuid-C beside `work 3 of 3`
+    # The operator's ruling of 2026-11-03 on `panel-notices-name-the-uuid` (design § 14.6 item 10a): keep
+    # the uuid, next to the ordinal (UX-9), as REQ-NTC-C-001 already says. The ordinal finds the row; the
+    # uuid ties that row to `sessiometer list` and to the event log.
+
+Scenario: a uuid is named only beside a label that has more than one bearer
+  # AC: oracle-a-duplicate-in-the-roster-shows-the-note · design UX-9
+  Given the roster holds `work` on uuid-A and on uuid-B, and `spare` on uuid-C
+   When the note is built
+   Then it names uuid-A and uuid-B, each beside its own ordinal
+    And it names neither `spare` nor uuid-C
+    # `spare` has one bearer, so nothing about it is ambiguous, and the note names only what is.
+
+Scenario: the note says the panel cannot switch to either account until one is renamed
+  # AC: oracle-a-duplicate-in-the-roster-shows-the-note · design § 14.6 item 15 · UX-10
+  Given the roster holds `work` on uuid-A and on uuid-B
+   When the note is built
+   Then after naming both bearers it says that, until one of them is renamed, neither can be switched to from the panel
+    # The operator's ruling of 2026-11-03 on `panel-switches-by-identifier`: keep the switch blocked. The
+    # panel's switch sends the label, and the daemon refuses an ambiguous one, so the panel shows that
+    # switch blocked before the click (UX-10):
+    #   apps/menubar/Sources/AccountSwapModel.swift:140 `SwapCommand`
+    #   src/daemon/commands.rs:109 `resolve_target`
+    # "From the panel" is load-bearing: the daemon's own rotation and the CLI's `use <uuid>` still reach
+    # either account. The draft's words are written for two bearers; with three, or with two colliding
+    # labels, the wording is copy review's and this fact holds for each label that has more than one bearer.
 
 Scenario: the note wraps and loses no character
   # AC: wrap-not-truncate
@@ -148,22 +174,23 @@ Scenario: the note wraps and loses no character
         | one label with two bearers          |
         | one label with three bearers        |
         | two labels with two bearers each    |
-   When each is measured against the form row text budget at the shipped window width
+   When each is measured against the text budget of the row the frames from #1652 give the note, at the shipped window width
    Then it is drawn in full over as many lines as it needs, with no line limit
-    And nothing it shows is elided, and a uuid it shows is never cut
+    And nothing it shows is elided, and each uuid it names is shown whole
     And the measured line count of each fixture is stated in the test
     And a mutation canary shows the predicate trips on an over-wide fixture
-    # The budget and the measuring tool, as SettingsTextMetricsTests already uses them:
+    # The measuring tool, and the budget if the frames put the note in a form row, as
+    # SettingsTextMetricsTests already uses them:
     #   apps/menubar/Sources/SettingsModel.swift:786 `formRowTextBudget`
     #   apps/menubar/Tests/TextMetrics.swift:113 `wrapped`
     # The window is not resizable, so the shipped width is the only width the note gets.
 ```
 
-## Rule 4 — a save that would leave an account it relabels sharing a label with another account is refused and marks its rows, and every other save marks nothing
+## Rule 4 — a save that would leave an account it relabels sharing a label with another account is refused, the rows its refusal names are marked, and every other save marks nothing
 
 Traces: REQ-ROS-B-001 · REQ-ROS-I-002 · REQ-ROS-Q-001 (`CollisionReportPrecision`, goal 0) · PRD AC-ROS-002 · design UX-7 · § 12.3 Terms, C-7, C-9, C-12. Seam: `SettingsModel.apply` over the same fake connection, with the daemon's reply scripted, and the pure marking function in `SettingsFormat`.
 
-The daemon decides a collision: a save collides when an account it relabels would, after the save, carry a label another account also carries. It is judged per account, so a save can collide while no label's count of bearers rises (design § 12.3, Terms and C-7). The daemon refuses such a save whole, with zero writes and the reason `label-in-use`, and its `rejected` acknowledgement carries `collisions`: a list of `{label, bearers}`, where `bearers` names, in roster order, every account that would carry the label (C-7, C-12). #1558 adds the reason, decodes `collisions`, and writes the reason's sentence, which is fixed and names no label, because the Settings client renders a reason and its detail only (C-9). The sentence sits in the footer's apply-status slot, Settings' existing rejected-save state, as every rejection's does (design UX-7). This feature keeps the edit unsaved, as every rejection already does, and names the label and marks the rows from `collisions` (C-9): each marked row carries words that name the label it would share. Every label in `collisions` has at least one listed bearer, the account the save relabels, so each colliding label is named on a row. The sentence and the marking read the same rejected outcome, so they show together and clear together. Settings offers no override, because `config-set` can add or remove no account (C-7): the way through is renaming the holder first, or choosing another label. The marking's look waits on the Accounts-row frame (card 5); the facts below do not. A rejected outcome is set at the first line below and moves no baseline, since only an `applied` one reaches the second; the third is the footer arm that draws it:
+The daemon decides a collision: a save collides when an account it relabels would, after the save, carry a label another account also carries. It is judged per account, so a save can collide while no label's count of bearers rises (design § 12.3, Terms and C-7). The daemon refuses such a save whole, with zero writes and the reason `label-in-use`, and its `rejected` acknowledgement carries `collisions`: a list of `{label, bearers}`, where `bearers` names, in roster order, every account that would carry the label (C-7, C-12). #1558 adds the reason, decodes `collisions`, and writes the reason's sentence, which is fixed and names no label, because the Settings client renders a reason and its detail only (C-9). The sentence sits in the footer's apply-status slot, Settings' existing rejected-save state, as every rejection's does (design UX-7). This feature keeps the edit unsaved, as every rejection already does, and names the label and marks the rows from `collisions` (C-9): each marked row carries words that name the label it would share. Every label in `collisions` has at least one listed bearer, the account the save relabels, so each colliding label is named on a row. The sentence and the marking read the same rejected outcome, so they show together and clear together. Settings offers no override, because `config-set` can add or remove no account (C-7): the way through is renaming the holder first, or choosing another label. The marking's look is the frames' from #1652, which this item is blocked by (card 5); the facts below do not depend on it. A rejected outcome is set at the first line below and moves no baseline, since only an `applied` one reaches the second; the third is the footer arm that draws it:
 
 ```text
 apps/menubar/Sources/SettingsModel.swift:442 `.rejected`
@@ -212,8 +239,6 @@ Scenario Outline: the refusal marks every listed row that would bear the label, 
     # marking names uuid-A and uuid-C, the rows the save would make share `work`, while the note still
     # names the saved pair, uuid-A and uuid-B. A marking taken from the saved duplicate would mark
     # uuid-B in place of uuid-C.
-    # A `collisions` the decoder drops as malformed leaves the refusal standing and marks no row
-    # (C-12, register row `malformed-key-drops-the-fact`).
     # The marking reads the daemon's own `bearers`, so it needs no label comparison of its own. Only the
     # note's grouping re-implements one (card 4).
 
@@ -229,9 +254,9 @@ Scenario Outline: the marking lasts only as long as the refusal that made it
     | the operator saves uuid-B as `c`, and the daemon acknowledges `applied` with the effect `live`                         |
     | the operator also sets a tunable out of range and saves, and the daemon refuses with `invalid`, which takes precedence |
     | the Settings model loads the roster again                                                                              |
-    # Row 2 is the edge: `label-in-use` is reported only for a save that would otherwise be applied (C-7),
-    # so a refusal for another reason carries no `collisions` and marks nothing, while uuid-B's draft
-    # still reads `a`.
+    # Row 2 is the edge: `label-in-use` is reported only for a save that passes every check made before
+    # the write (C-7), so a refusal for another reason carries no `collisions` and marks nothing, while
+    # uuid-B's draft still reads `a`.
 
 Scenario: a swap of two labels is applied and marks nothing
   # AC: only-a-refusal-marks-rows · PRD AC-ROS-002
@@ -263,6 +288,19 @@ Scenario: the `unchanged` effect marks nothing
    Then no row is marked
     # `unchanged`: the daemon found the submitted values already in place, through a stale baseline or a
     # concurrent change. Nothing was written, so there is nothing to report.
+
+Scenario: a refusal whose `collisions` decodes to an empty list keeps the refusal and marks no row
+  # AC: only-a-refusal-marks-rows
+  Given the roster holds `a` on uuid-A and `b` on uuid-B
+   When the operator saves uuid-B as `a`
+    And the daemon refuses the save with `label-in-use`, its `collisions` present but malformed
+   Then the save is refused with `label-in-use`, uuid-B's label draft is still `a`, and its saved label is still `b`
+    And no row is marked
+    And the accounts section shows no note
+    # The decoder drops a malformed `collisions` to an empty list and keeps the refusal (C-12; register
+    # rows `malformed-key-drops-the-fact` and `refuse-form-settings-rename-no-consent`). The fixture
+    # scripts the malformed field on the reply line, so the test runs #1558's decoder too. A marking taken
+    # from the save's own edits rather than from `collisions` would mark uuid-B here.
 
 Scenario: a daemon that predates `label-in-use` applies the save, and the note follows the saved roster
   # AC: only-a-refusal-marks-rows · the-note-follows-the-saved-roster
@@ -298,10 +336,13 @@ Scenario: the note and a marked row carry labels and uuids and no other identify
   # AC: only-labels-and-uuids · invariant: Settings never reads or writes a credential
   Given a roster whose labels and uuids are sentinels
    When the note is built, and a refused save naming those sentinels marks its rows
-   Then the note and each marked row's words hold the template text and the sentinels
-    And they hold nothing else that identifies an account
+   Then the note holds the template text, each colliding label's sentinel, and each bearer's uuid sentinel beside its ordinal
+    And each marked row's words hold the template text and the sentinel of the label the row would share
+    And neither holds anything else that identifies an account
     # No email, no token, no digest of a credential. The only inputs are the roster the window holds and
-    # the refusal it received.
+    # the refusal it received. The note's uuids are the operator's ruling of 2026-11-03 on
+    # `panel-notices-name-the-uuid` (card 2). A marked row's words name the label and not the row's own
+    # uuid: a Settings row shows its own uuid only if `settings-row-shows-uuid` is answered yes (design UX-9).
 
 Scenario: the note says what import's notice says, and never that anything was refused
   # AC: output conforms to import-duplicate-label.feature.md (concretize-and-compare)
@@ -326,7 +367,8 @@ Scenario: the note says what import's notice says, and never that anything was r
 
 ## Not scenarios — manual by design
 
-- **The view against the mock.** Open the window on a roster that holds a duplicate, open the mock's Settings frame beside it, and compare the note's text, place and wrapping. Then make a save the daemon refuses with `label-in-use`, and compare the marked rows and the footer's refusal with the frame. Record the result in the pull request, with any intended divergence entered under the README's Expected reconciliations. The Settings window has no render harness (the issue's own words), so this stays manual. The mock does not author the Accounts section today (card 5).
+- **The view against the frames.** Open the window on a roster that holds a duplicate, open the Accounts-section frames from #1652 in the mock beside it, in light and dark, and compare the note's text, place and wrapping. Then make a save the daemon refuses with `label-in-use`, and compare the marked rows and the footer's refusal with the frame that draws them. Record the result in the pull request, with any intended divergence entered under the README's Expected reconciliations. The Settings window has no render harness (the issue's own words), so this stays manual. The frames are #1652's, which this item is blocked by, so they exist before it starts (card 5).
+- **The frames come first, and from another item.** Two process checks replace the issue's earlier `mock-first` criterion, which had this item draw its own frames (card 5). `frames-precede-the-build`: the commit that closed #1652, the one whose subject carries `(issue #1652)`, is an ancestor of the merge-base of this item's branch with `main`. `draws-nothing-in-the-mock`: this item's diff under `apps/menubar/design/` is empty, or touches only `README.md` to enter an intended divergence under its Expected reconciliations.
 - **A marked row under VoiceOver.** `SettingsView` is outside the test bundle, so whether VoiceOver reads a marked row's words on that row is checked by hand with VoiceOver on, and recorded in the pull request. The words come from the pure function Rules 4 and 5 pin, so the marking is never colour alone. Nothing is announced: the warn form's announcement is retired (card 1), and the refusal reuses the rejected-save state, which no announcement accompanies today. Design § 12.3, C-9 does not call for one.
 - **The Swift gates.** `xcodebuild test`, and an armed `panel-goldens` run that prints its `[panel-goldens] max drift` line. A run that says tests were skipped compared nothing.
 - **Out of scope, stated so the silence is not read as a gap.** A window left open keeps the roster it loaded. A duplicate another surface makes while it stays open appears at the next open, and so does an account another surface adds, which a refusal can name as a bearer the window does not list (Rule 4):
@@ -339,21 +381,23 @@ Scenario: the note says what import's notice says, and never that anything was r
 
 | Criterion on #1560 | Lands in |
 |---|---|
-| `oracle-a-duplicate-in-the-roster-shows-the-note` | Rules 1, 2 and 3; the uuid half is held (card 2) |
+| `oracle-a-duplicate-in-the-roster-shows-the-note` | Rules 1, 2 and 3 |
 | `the-note-follows-the-saved-roster` | Rule 1, and Rule 4's first and last scenarios |
 | `oracle-a-colliding-save-is-refused-and-its-rows-marked` | Rule 4, first and second scenarios |
-| `only-a-refusal-marks-rows` | Rule 4, third to seventh scenarios |
-| `wrap-not-truncate` | Rule 3, third scenario; a marked row's words, if the frame draws them in the row, are held with the frame (card 5) |
+| `only-a-refusal-marks-rows` | Rule 4, third to eighth scenarios |
+| `wrap-not-truncate` | Rule 3, fifth scenario; a marked row's words are measured the same way if the frames from #1652 draw them in the row |
 | `copy-passes-the-framing-scan` | Rule 5, first scenario |
 | `only-labels-and-uuids` | Rule 5, second scenario |
-| `mock-first` | no scenario: a process check on the diff of `apps/menubar/design/` and the commit order (card 5) |
-| Invariant: a save that creates no collision marks no row | Rule 4, fourth to seventh scenarios |
+| `frames-precede-the-build` | no scenario: a process check on the history of `main` (§ Not scenarios) |
+| `draws-nothing-in-the-mock` | no scenario: a process check on the diff of `apps/menubar/design/` (§ Not scenarios) |
+| Invariant: a save that creates no collision marks no row | Rule 4, fourth to sixth, and eighth scenarios |
 | Invariant: Settings never reads or writes a credential | Rule 5, second scenario |
 | Output conforms to `docs/specs/import-duplicate-label.feature.md` | Rule 5, third scenario, and Rule 4's swap and unrelated-save scenarios |
-| Output conforms to `apps/menubar/design/menubar-preview.html` | manual (§ Not scenarios) |
+| Output conforms to `apps/menubar/design/menubar-preview.html` (the Accounts-section frames from #1652, on the mock page that holds them) | manual (§ Not scenarios) |
+| The oracle tests from #1560's `(test)` oracle item pass with their RED markers removed | the oracle item's tests, which bind the scenarios of the three criteria marked RED owed |
 | The repo's Swift gates | manual (§ Not scenarios) |
 
-Changed from the warn form on 2026-11-03, because no save creates a collision for an announcement to report: `announcement-sentence` and `announce-is-wired` are retired, and `oracle-a-save-that-creates-a-collision-announces-it-once` and `quiet-saves-announce-nothing` are replaced by `oracle-a-colliding-save-is-refused-and-its-rows-marked` and `only-a-refusal-marks-rows`.
+Changed from the warn form on 2026-11-03, because no save creates a collision for an announcement to report: `announcement-sentence` and `announce-is-wired` are retired, and `oracle-a-save-that-creates-a-collision-announces-it-once` and `quiet-saves-announce-nothing` are replaced by `oracle-a-colliding-save-is-refused-and-its-rows-marked` and `only-a-refusal-marks-rows`. Changed again the same day, after the operator's panel rulings: `mock-first`, which had this item draw its own frames, is replaced by `frames-precede-the-build` and `draws-nothing-in-the-mock`, and the criterion on the oracle's tests is added.
 
 ## 🟥 Open
 
@@ -361,24 +405,24 @@ Changed from the warn form on 2026-11-03, because no save creates a collision fo
 
 Re-authored on 2026-11-03 to the operator's refuse ruling of that day (PRD § 8.1; design § 12.3, C-7 to C-9): the held examples H1, H3, H4 and H5 are Rule 4's Green examples now, and H2, the announcement's ordinal clause, is retired with the announcement.
 
-### 2. `panel-notices-name-the-uuid` (design § 14.6 item 10a)
+### 2. `panel-notices-name-the-uuid` — resolved
 
-Does the note name each bearer by uuid beside its ordinal, or by ordinal alone? PRD § 3 defers a display of the uuid. REQ-NTC-C-001 and REQ-STSH-B-002 name the uuid where the label alone is ambiguous. The design follows the requirements and records "If unanswered, the requirements as written govern and the notices name the uuid". Held: the uuid beside each ordinal, the uuid half of the sentinel assertion in Rule 5, and the "a uuid it shows is never cut" clause in Rule 3. Under the other answer the uuid parts go and the ordinals stay.
+Resolved on 2026-11-03 by the operator's ruling "Keep the uuid" (design § 14.6 item 10a; the scope brief's register row `panel-notices-name-the-uuid-ruling`): the note names each bearer's uuid beside its ordinal, as the requirements as written say (REQ-NTC-C-001), so no PRD change follows. The three holds are Green examples now: the uuid beside each ordinal (Rule 3's second scenario), the uuid half of Rule 5's sentinel assertion, and Rule 3's wrap clause that no uuid is cut. Rule 3 gains one example from it: a uuid is named only beside a label that has more than one bearer (UX-9).
 
-### 3. `panel-switches-by-identifier` (design § 14.6 item 15; weighed with `account-key-form`, DQ-1)
+### 3. `panel-switches-by-identifier` — resolved
 
-Will the panel switch to either account of a shared label by identifier, or stay blocked until one is renamed? The note's closing sentence, "Until one is renamed, you can't switch to either from the panel", is true only while the panel switches by label. The design records "If unanswered, the blocked switch stands". The claim about today's panel comes from the design and was not re-verified here. Held: the closing sentence of the note.
+Resolved on 2026-11-03 by the operator's ruling "Keep it blocked" (design § 14.6 item 15; the scope brief's register row `panel-switches-by-identifier-ruling`): the panel keeps sending the label, and its switch to a row whose label has more than one bearer stays blocked until one account is renamed (UX-10). The note's closing sentence, "Until one is renamed, you can't switch to either from the panel", is Rule 3's fourth scenario now. The claim about today's panel, which this card once left unverified, was read at `b434419`: the panel's swap sends the label (`SwapCommand`, `apps/menubar/Sources/AccountSwapModel.swift:140`), and the daemon refuses a label two accounts carry (`resolve_target`, `src/daemon/commands.rs:109`).
 
 ### 4. `label-normalization-policy` — what makes two labels the same (design § 12.2, PRD § 8.1)
 
 No scenario here depends on it: every scenario uses byte-identical labels, which are the same under every option. It stays open because the Swift derivation re-implements a comparison the daemon owns. Today the resolver compares labels exactly (`src/use_account.rs:486` `resolve_target`). Under any option other than "none", the daemon's comparison key changes (design D-1), and the issue names no mechanism that keeps the Swift derivation in step with it. Left open: whether `Work` and `work`, or two NFC variants, form a group.
 
-### 5. The Accounts-row frame in the design mock (`settings-accounts-frame-owner`; the issue's own precondition)
+### 5. The Accounts-row frame in the design mock (`settings-accounts-frame-owner`) — resolved
 
-Who authors the mock frame for the Accounts section's rows and the note? The mock's four Settings frames do not render that section. The README routes the row anatomy to #946 (register R-11), and the issue records that #946's open scope names other surfaces. The issue carries this as a precondition and not as a blocker edge. Held: the `mock-first` criterion, the manual comparison, and the note's place and wrap in the view. Nothing in Rules 1 to 5 depends on it.
+Resolved on 2026-11-03 by the operator's ruling "New design item" (design § 14.7; the scope brief's register row `settings-accounts-frame-owner-ruling`): a new design item, #1652, draws the Accounts-section frames this item and #1574 are built against. Both items are blocked by it, the design README routes the row anatomy to it, and no feature's executor draws the reference its own work is compared against. That #1652 draws the rows, the ordinal badge, the note and a refused save's marked rows, in light and dark, is the orchestrator's reading, ratification-pending. The holds lift. The manual comparison and the note's place and wrap are re-keyed to those frames (§ Not scenarios; Rule 3's wrap scenario). The issue's `mock-first` criterion, which had this item draw its own frames, is replaced by two process checks, `frames-precede-the-build` and `draws-nothing-in-the-mock`. They check the history and the diff, not behaviour, so no rule is added. The mock's page restructure is #1652's precondition (`mock-page-restructure`), not this item's.
 
 ### Noted, not open for this feature
 
 - `settings-row-shows-uuid` (design § 14.6 item 10b) is not built until the operator answers yes. No scenario depends on it.
-- `import-duplicate-uuid-policy` and `orphan-stash-policy` belong to other features of #1550. `account-key-form` reaches this feature only through card 3.
+- `import-duplicate-uuid-policy` and `orphan-stash-policy` belong to other features of #1550. `account-key-form` reached this feature only through card 3, which the operator's ruling of 2026-11-03 resolved: the panel keeps sending the label, so the key's form changes nothing here.
 - `login-mismatch-policy` was ruled by the operator on 2026-11-03: a rename is refused unless `--rename` is given (PRD § 8.1). It does not reach this feature. It gates CLI `capture`, CLI `login` and the socket `capture` (design § 12.3, C-3), while `config-set` renames with no consent, because Settings is the panel's way to a deliberate rename (C-6). Rule 1's renames are such saves.

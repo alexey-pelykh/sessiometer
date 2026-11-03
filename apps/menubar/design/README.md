@@ -1282,7 +1282,7 @@ Go and settle these; do not infer them from the mock.
 | Open axis | Home |
 |---|---|
 | the next-swap callout for a *degenerate* target; the reset cell past three digits of days | hq `strategy/design-menubar.md` § D-UX-PATHOLOGICAL |
-| Settings **Accounts** section row anatomy (incl. the 160 pt label cell of #846); loading placeholder; six remaining apply-status arms; launch-at-login approval sub-block; inline per-field format-error row | register R-11, hq `strategy/design-menubar.md` — routed to #946 |
+| Settings **Accounts** section row anatomy (incl. the 160 pt label cell of #846); loading placeholder; six remaining apply-status arms; launch-at-login approval sub-block; inline per-field format-error row | register R-11, hq `strategy/design-menubar.md` — routed to #946; the Accounts section row anatomy to #1652 since 2026-11-03, the operator's `settings-accounts-frame-owner` decision |
 | the four **canary** fault ranks — no matching mock frames, so the harness has nothing to pair | #571 |
 | the 856 pt height bound (or a screen-adaptive rule); whether the Swap action and the daemon-fault banner are the right things to PIN; scroll vs condense for a long roster | § *The scroll boundary (#818)* — **decided in code and shipped**, from measurement, because #818 could not be fixed without an answer. Ratify or overrule it; hq `strategy/design-menubar.md` |
 
@@ -1547,7 +1547,7 @@ single frame can show all 15 tunables**, which is why the normative grouping is 
 **Accounts section** is unrendered in all four — below the viewport in the `loaded` pair, absent
 entirely in the `disconnected` pair, where the whole daemon zone is the failure card. Its row
 anatomy — including the 160 pt label cell that issue #846 reports as too narrow — is therefore
-prose-only in hq; the mock carries no width rule for a cell no frame renders. Also unauthored, and named rather than guessed: the
+prose-only in hq; the mock carries no width rule for a cell no frame renders. Since 2026-11-03 the Accounts section's frames belong to issue #1652, the operator's `settings-accounts-frame-owner` decision. Also unauthored, and named rather than guessed: the
 **loading placeholder** and the six remaining **apply-status arms** (a frame-budget call — the
 render's GPU height ceiling admits four frames, spent on the states that carry decisions), plus two
 surfaces an adversarial validation pass caught after the fact — the **launch-at-login approval

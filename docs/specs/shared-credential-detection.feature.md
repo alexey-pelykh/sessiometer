@@ -15,8 +15,8 @@ Example Mapping: 🟦 5 rules · 🟩 52 examples · 🟥 2 open
 > before the fix. The examples without one say "No pre-authored oracle" where they occur: the import
 > examples that depend on how `import` derives the set of entries it wrote (the item leaves that shape
 > open), the order of lines in the CLI reply and in the import report, the example that judges
-> ambiguity on the roster after the write, the template examples (their module is created by whichever
-> of #1556 and #1557 lands first), and the swap-lock example (no acceptance criterion owes it a RED).
+> ambiguity on the roster after the write, the template examples (their module is #1556's to create, the scope
+> brief's `shared-piece-owners`), and the swap-lock example (no acceptance criterion owes it a RED).
 >
 > **Calls this stub makes.** Each waits for ratification and none is the operator's decision.
 > - The PRD's questions DQ-5 and DQ-6 stand as design D-4 answers them: no start-up sweep, and both
@@ -402,8 +402,8 @@ Scenario: a template declared and not registered fails the module's completeness
   Given a template added to the module with no registration for the scan
    When the module's tripwire runs
    Then it fails, and it names the template
-    # No pre-authored oracle: the module is created by whichever of #1556 and #1557 lands first, so a
-    # test cannot name it yet. Covers AC `templates-pass-the-scans`.
+    # No pre-authored oracle: the module is #1556's to create (the scope brief's `shared-piece-owners`),
+    # so a test cannot name it before #1556 lands. Covers AC `templates-pass-the-scans`.
     # The tripwire in `src/cli.rs` covers that file only. Its register is `INLINE_PROSE_REGISTER` (src/cli.rs:14321).
 
 Scenario: an injected banned token is caught

@@ -2,7 +2,7 @@
 
 Issue #1574 · parent #1550 · PRD § 10.4 (F4, Invariants) and § 10.11 (REQ-NTC-C-001, REQ-NTC-C-002, REQ-NTC-C-003; AC-NTC-002, AC-NTC-003) · design § 9.1 (UX-3, UX-8), § 9.5 (Settings accounts section), § 9.6, § 11.4, § 11.5 · **Tier B** — scenarios pending binding
 
-Example Mapping: 🟦 5 rules · 🟩 17 examples · 🟥 3 open (`label-normalization-policy`; `duplicate-label-policy`; the Accounts-row frame)
+Example Mapping: 🟦 5 rules · 🟩 17 examples · 🟥 1 open (`label-normalization-policy`); `duplicate-label-policy` was ruled and the Accounts-row frame's owner decided on 2026-11-03 (cards 2 and 3)
 
 Sources: the PRD, `docs/requirements/account-label-integrity.md`, and the design, `docs/design/account-label-integrity-solution-design.md`. Both are on `main` since the scoping pull request #1638 merged. Every requirement id, `UX-` id and section number below points into them.
 
@@ -95,7 +95,7 @@ Scenario: a parked account is a bearer like any other
 
 ## Rule 2 — the ordinal is a bearer's place among the rows that carry its label, in roster order, labels compared as exact strings
 
-Traces: UX-3 · REQ-ROS-I-002. The function that numbers the bearers is the panel-rows item's (#1566), reused here. #1560 and #1561 need it too, and whichever of the three lands first adds it. These scenarios grade it through Settings. Its own table belongs to #1566's feature file.
+Traces: UX-3 · REQ-ROS-I-002. The function that numbers the bearers is the panel-rows item's (#1566), which adds and owns it (the scope brief's `shared-piece-owners`); this item and #1560 reuse it, and both are `Blocked by #1566`. These scenarios grade it through Settings. Its own table belongs to #1566's feature file.
 
 ```gherkin
 Scenario: three bearers are numbered one to three in roster order
@@ -270,13 +270,10 @@ Scenario: the cues name no identifier
   ```
 
   Settings has no render harness (issue #1324), so this comparison is manual. `design/build-comparison.py` has no row for Settings frames (README § The Settings window), so it does not check this frame either.
-- **The mock frame (AC `mock-frame-precondition`).** A design artifact, so no oracle is owed. The check that exists is the render command, judged on whether the image file is written and never on the command's exit status, because a page past the height cap writes no image:
-
-  ```text
-  apps/menubar/design/README.md:23 `Regenerating the render`
-  ```
-
-  The judgment aspects go to an independent design-fidelity reviewer who reads the mock: whether the frame shows two rows a reader can tell apart, and whether the Expected reconciliations list is complete. A green render says the page renders, not that the frame is right.
+- **The mock frame (AC `mock-frame-precondition`).** Since 2026-11-03 #1652 draws it, and that item's own checks render
+  the page and send the frame to a design-fidelity reviewer (the operator's `settings-accounts-frame-owner` decision,
+  card 3). This item's check is that the frame is on `main` before any Swift draws the badge, and that its diff
+  leaves everything under `apps/menubar/design/` other than its `README.md` untouched.
 - **VoiceOver (AC `voiceover-check-recorded`).** The view is outside the test bundle, and its accessibility tree is issue #840's:
 
   ```text
@@ -288,7 +285,7 @@ Scenario: the cues name no identifier
   The README's checklist gains a line under its Settings window list: with two duplicate rows, VoiceOver reads `Label, 1 of 2` and then the value for the first, `Label, 2 of 2` and then the value for the second, and reads each badge only once. The badge is hidden from VoiceOver where the field's label already speaks it. The result of running the line by hand is recorded on #1574.
 - **The badge's contrast.** The Specification says the badge's text meets 4.5:1 and its boundary 3:1 in both themes (WCAG 1.4.3 and 1.4.11). AC `badge-contrast-recorded` enforces it by hand: the colours come from the mock frame and Settings has no render harness, so the executor reads the four ratios off the built window with the Accessibility Inspector's colour-contrast calculator in both themes and records them on #1574, and the design-fidelity reviewer reads the frame's colours.
 - **A window left open.** It keeps the roster it loaded until it is shown again. The model half is the last scenario of Rule 3. The controller half is `show`, the single load trigger, which the test bundle does not compile.
-- **The Swift gates.** `./scripts/check-menubar-zero-egress.sh`, then `cd apps/menubar && xcodegen generate && xcodebuild test -project Menubar.xcodeproj -scheme Menubar -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO`, and an armed `panel-goldens` run that prints its `[panel-goldens] max drift` line. A run that says tests were skipped compared nothing. The mock lives under `apps/menubar/`, so the `swift` and `panel-goldens` jobs are owed even before any Swift changes.
+- **The Swift gates.** `./scripts/check-menubar-zero-egress.sh`, then `cd apps/menubar && xcodegen generate && xcodebuild test -project Menubar.xcodeproj -scheme Menubar -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO`, and an armed `panel-goldens` run that prints its `[panel-goldens] max drift` line. A run that says tests were skipped compared nothing. The design README lives under `apps/menubar/`, so the `swift` and `panel-goldens` jobs are owed even before any Swift changes.
 
 ## Acceptance criteria → where they land
 
@@ -302,6 +299,7 @@ Scenario: the cues name no identifier
 | `strings-are-scanned` | Rule 5 |
 | `voiceover-check-recorded` | manual (§ Not scenarios) |
 | `badge-contrast-recorded` | manual (§ Not scenarios) |
+| `row-value-column-charged` | no scenario: the extended bound in `apps/menubar/Tests/SettingsTextMetricsTests.swift` (`rowContent`) and its canary |
 | Invariant: a relabel never changes an account's identifier | Rule 3, the intro and the third scenario's last clause |
 | Output conforms to the mock | manual (§ Not scenarios) |
 | The repo's pre-push gates | manual (§ Not scenarios) |
@@ -317,7 +315,7 @@ The item compares labels as exact strings, which is what the daemon does today w
 src/use_account.rs:490 `account.label == query`
 ```
 
-Under any other answer the daemon's comparison key changes (design D-1), and a Settings row's ordinal has to follow it. The ordinal function is shared with #1566, #1560 and #1561, so it is the one place to change. Held, so no scenario states them: whether `Work` and `work`, two labels that differ only by surrounding whitespace, or two Unicode forms of one label form a duplicate set. Every scenario above uses labels that are byte-identical, or that differ under every option (`work-alice` and `work`).
+Under any other answer the daemon's comparison key changes (design D-1), and a Settings row's ordinal has to follow it. The ordinal function is #1566's, reused by this item and #1560, so it is the one place to change. Held, so no scenario states them: whether `Work` and `work`, two labels that differ only by surrounding whitespace, or two Unicode forms of one label form a duplicate set. Every scenario above uses labels that are byte-identical, or that differ under every option (`work-alice` and `work`).
 
 Settings adds a wrinkle of its own. It trims surrounding whitespace from a draft when it saves, while the daemon refuses only an empty label, so which labels the comparison sees depends on this answer too:
 
@@ -331,21 +329,25 @@ src/config/validate.rs:312 `label.trim().is_empty()`
 > rejected rather than applied, so the scenario that scripts an `applied` reply for such a save describes today's
 > daemon, which the ruling retires. The scenario holds under both answers, as this card says, and #1574 stays
 > READY; its executor binds the scenario against whichever daemon is in the tree. Rosters that already hold
-> duplicates still render the ordinals. The header's count predates the ruling.
+> duplicates still render the ordinals.
 
 
 Does a daemon answer a Settings save that makes a label name a second account with `applied` (warn) or with a rejection such as `label-in-use` (refuse)? The issue lists no such decision, yet one acceptance criterion rests on it: "after one that creates a duplicate they appear". The scenario for it scripts the daemon's `applied` reply and pins only the model's reaction, which holds under both answers. Held: whether that save can happen at all. Under refuse, a duplicate reaches Settings only by a load, the creating-save scenario has no case in operation, and nothing else changes.
 
 ### 3. The Accounts-row frame in the design mock — who authors it, and whether it fits (`settings-accounts-frame-owner`)
+> **Ruling, 2026-11-03.** The operator decided `settings-accounts-frame-owner`: a new design item, #1652, draws the
+> Accounts-section frames this item and #1560 build against, the ordinal badge among them. This item is blocked by
+> it, and its executor draws nothing in the mock. The render budget below is that item's precondition
+> (`mock-page-restructure`).
 
-The mock's Settings frames do not render the Accounts section, and the README lists its row anatomy among the axes nobody has decided, routed to #946 (whose open scope names other surfaces):
+The mock's Settings frames do not render the Accounts section. The README lists its row anatomy among the axes nobody has decided; it routed the anatomy to #946 (whose open scope names other surfaces) and, since 2026-11-03, routes it to #1652:
 
 ```text
 apps/menubar/design/README.md:1546 `What these frames deliberately do not author`
 apps/menubar/design/README.md:1285 `Accounts`
 ```
 
-The issue leaves the author open under `settings-accounts-frame-owner`: the operator either assigns the row anatomy to an owner whose frame this item waits for, or lets whichever of #1560 and this item is picked up first author the frame it needs; this item does not invent the row anatomy from silence. The render budget bears on it too:
+The issue left the author open under `settings-accounts-frame-owner` until the operator decided it on 2026-11-03 (the ruling note above): #1652 draws the frame, and this item does not invent the row anatomy from silence. The render budget bears on it too:
 
 ```text
 apps/menubar/design/README.md:42 `Only ~686 px of genuine bump room is left`
@@ -369,4 +371,4 @@ Nothing in Rules 1 to 5 depends on it.
   apps/menubar/Sources/SettingsView.swift:199 `accountUuid`
   ```
 
-- `panel-notices-name-the-uuid` and `panel-switches-by-identifier` belong to #1560 and #1573. `colour-seed-from-identifier` and DQ-4 (the panel frame) belong to #1566.
+- `panel-notices-name-the-uuid` and `panel-switches-by-identifier` belong to #1560 and #1573. The operator decided both on 2026-11-03: keep the uuid, and keep the switch blocked. `colour-seed-from-identifier` and DQ-4 (the panel frame) belong to #1566.
