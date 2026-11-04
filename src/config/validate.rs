@@ -80,30 +80,32 @@ impl Config {
         // (#417 — without the clamp a `session_ceiling < 80` config loads with an
         // unchecked reserve of 80 and then bricks after a render→parse round-trip, since
         // #398 renders the default as a live line; an equal reserve is inert per
-        // ADR-0013). When present, its lower bound is 1 (an explicit 0 admits no
-        // target that has a session window, silently disabling proactive swapping) and
-        // its upper bound is session_ceiling (a higher reserve could never admit a
-        // target), the latter a distinct cross-field error.
+        // ADR-0013). When present, its lower bound is 1 (an explicit 0
+        // admits no target that has a session window, silently disabling proactive
+        // swapping to every account that reports one) and its upper bound is
+        // session_ceiling (a higher reserve could never admit a target), the latter a
+        // distinct cross-field error.
         let target_max_session_usage = match t.target_max_session_usage {
             None => DEFAULT_TARGET_MAX_SESSION_USAGE.min(t.session_ceiling as u8),
             Some(value) => {
                 if value == 0 {
                     // The swap predicate is `floor.is_none_or(|f| usage.session.is_none_or(|s|
-                    // s < f))` (issue #1602: a target whose reply carries no session window
-                    // passes the floor vacuously), so 0 admits NO account that has a session
-                    // window and silently disables proactive swapping among them (the daemon
-                    // just holds). 0 is the natural wrong guess for "no restriction" — its
-                    // exact opposite (#414) — so reject it with the remedy spelled out, rather
-                    // than let a live, hand-editable line brick swapping in silence. The
-                    // message's "no swap target" reads "no swap target that has a session
-                    // window"; its literal text is byte-pinned by the committed
+                    // s < f))`: a target whose reply carries no session window passes the floor
+                    // vacuously (issue #1602), so 0 admits NO account that has a session window
+                    // and silently disables proactive swapping among them (only a spare without
+                    // a session window stays admissible; with none, the daemon just
+                    // holds). 0 is the natural wrong guess for "no restriction" — its exact
+                    // opposite (#414) — so reject it with the remedy spelled out, rather than
+                    // let a live, hand-editable line brick swapping in silence. The message's
+                    // literal text is byte-pinned by the committed
                     // `build/fixtures/config-set-reject-details.json` golden and the menu-bar
-                    // Swift parity test, so rewording it is a cross-language re-baseline of
-                    // its own, not this item's.
+                    // Swift parity test, so any rewording is a cross-language re-baseline of
+                    // its own (as issue #1655 did).
                     return Err(Error::ConfigInvalid(format!(
-                        "target_max_session_usage = 0 admits no swap target and silently disables \
-                         proactive swapping; it must be in 1..={}. Raise it toward \
-                         session_ceiling to admit more targets.",
+                        "target_max_session_usage = 0 admits no swap target that has a session \
+                         window and silently disables proactive swapping to every account that \
+                         reports one; it must be in 1..={}. Raise it toward session_ceiling to \
+                         admit more targets.",
                         t.session_ceiling
                     )));
                 }
@@ -745,7 +747,8 @@ mod tests {
         // `floor.is_none_or(|f| usage.session.is_none_or(|s| s < f))` admit no account that has
         // a session window (a target whose reply carries no session window passes the floor
         // vacuously, issue #1602), so proactive swapping is silently disabled among the accounts
-        // that have one and the daemon just holds.
+        // that have one; only a spare without a session window stays admissible, and with none
+        // the daemon just holds.
         // Since #398 made target_max_session_usage a live, hand-editable line, 0 is the natural
         // (wrong) guess for "no restriction" — its exact opposite. validate must reject it
         // with a message that names the consequence AND points at the remedy (raise it
@@ -753,8 +756,11 @@ mod tests {
         let toml = with_tunables("target_max_session_usage = 0\nsession_ceiling = 90");
         match Config::parse(&toml) {
             Err(Error::ConfigInvalid(msg)) => assert!(
-                msg.contains("disables proactive swapping") && msg.contains("session_ceiling"),
-                "rejection must name the consequence and the remedy, got: {msg}"
+                msg.contains("disables proactive swapping")
+                    && msg.contains("session_ceiling")
+                    && msg.contains("session window"),
+                "rejection must name the consequence, the remedy and the session-window \
+                 scope, got: {msg}"
             ),
             Ok(_) => panic!("target_max_session_usage = 0 must be rejected, not accepted"),
             Err(e) => panic!("target_max_session_usage = 0 must be ConfigInvalid, got: {e}"),
