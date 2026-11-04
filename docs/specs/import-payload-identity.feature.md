@@ -109,7 +109,7 @@ Scenario: the findings are made before the swap lock is taken and before anythin
     # import before any finding was made.
     # The scan carries a canary that finds all three anchors it orders. A scan that finds none of its
     # anchors passes over nothing and reports green.
-    # Model: `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released` (`src/capture.rs:2184`)
+    # Model: `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released` (`src/capture.rs`)
     # AC `findings-precede-the-lock-and-every-write` (1) · PRD AC-MIG-001 · binds: pending
 ```
 

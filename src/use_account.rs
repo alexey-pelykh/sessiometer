@@ -2005,7 +2005,7 @@ mod tests {
         // Every delimiter currently open, innermost last. `depth` counts braces only and cannot
         // answer the question [`braced_binding_at`] asks — whether a bare `label` sits directly
         // in a BRACED group (`Account { label, .. }`) or in a parenthesised one
-        // (`run_login(login, store, stash, existing, label, claude_json)`, `src/capture.rs:776`).
+        // (`run_login(login, store, stash, existing, label, claude_json)`, in `src/capture.rs`).
         // Both spell the same three tokens; only the enclosing delimiter tells them apart.
         //
         // That is the INNERMOST delimiter, and it is the answer to that question alone. The two
@@ -2689,10 +2689,10 @@ mod tests {
     /// open delimiter is `{`. That is the whole discriminator, and it is what makes the rule
     /// below safe to state so loosely. `Account { label, .. }` and `run_login(…, label, …)` spell
     /// the same three tokens; the first sits in a braced group and the second in a parenthesised
-    /// one, and `src/capture.rs:237` and `:776` already ship the second in production code this
-    /// gate scans — `:776` measured, by removing the test and reading what the register then
-    /// refused. `:237` is not reached by that measurement: `label` is last in that call, so it is
-    /// followed by `)`, and the CLOSE test below admits only `,` or `}`.
+    /// one. `run_login_locked`'s `run_login` call and `capture_locked`'s `run_capture` call already
+    /// ship the second in production code this gate scans. A run with the delimiter test removed
+    /// showed the register refusing the `run_login` call but not the `run_capture` call. There
+    /// `label` is last, so `)` follows it, and the CLOSE test below admits only `,` or `}`.
     ///
     /// SHORTHAND only — the name must both OPEN its entry (preceded by `{` or `,`, through an
     /// optional `ref` / `mut`, which `src/capture.rs:446` already spells as `mut roster`) and
@@ -3775,10 +3775,10 @@ mod tests {
         // alone passes for the wrong reason: `is_empty()` is satisfied by a scan that matched
         // nothing anywhere, and the positive half is satisfied by a scan that matches everything.
         // Together they are the discrimination. Without the delimiter test the scan files
-        // ordinary argument lists as handle reads — measured on this tree by removing it:
-        // `run_login_locked` starts reporting `run_login(…, label, …)` (`src/capture.rs:776`) and
-        // `login` starts reporting the tuple pattern `Ok((outcome, label, count))` (`:276`), and
-        // every future one would too. `capture_locked`'s `run_capture(…, label)` (`:237`) does
+        // ordinary argument lists as handle reads. Measured on this tree by removing it:
+        // `run_login_locked` starts reporting `run_login(…, label, …)` (in `src/capture.rs`), and
+        // `login` starts reporting the tuple pattern `Ok((outcome, label, count))`. Every future
+        // one would too. `capture_locked`'s `run_capture(…, label)` does
         // NOT — `label` is last there, and the CLOSE test admits `,` or `}` rather than `)`.
         let delimited = |open: &str, close: &str| {
             injected(

@@ -1248,8 +1248,9 @@ mod tests {
     // --- pure helpers ------------------------------------------------------------
     //
     // The spawn env scrub (`SPAWN_ENV_REMOVE`) and the `IsolatedSession` teardown moved to
-    // `crate::isolated_spawn` (#131); their guards — the both-parametrizations scrub test and the
-    // armed-Drop teardown test — live there now, alongside the shared seam they protect.
+    // `crate::isolated_spawn` (#131). Their guards live there now, alongside the shared seam they
+    // protect, and include `all_parametrizations_apply_the_full_scrub_set` and
+    // `dropping_an_armed_session_synchronously_tears_down_the_item_and_dir`.
 
     #[test]
     fn backdate_sets_a_forcing_expiry_and_keeps_the_token() {

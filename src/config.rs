@@ -284,7 +284,7 @@ const DEFAULT_REFRESH_TIMEOUT_SECS: u64 = 90;
 pub(crate) const DEFAULT_REFRESH_SYSTEMIC_FAILURE_N: u32 = 3;
 
 /// Default seconds bounding one whole interactive `login` capture (issue #135). Mirrors
-/// [`crate::login::DEFAULT_LOGIN_TIMEOUT`] — the engine's per-call fallback — kept in sync by
+/// [`crate::login::DEFAULT_LOGIN_TIMEOUT`] — the engine's documented default — kept in sync by
 /// the `default_login_timeout_matches_the_engine_default` test. Far longer than the refresh
 /// timeout because a `/login` waits on a human completing a browser OAuth handoff, not a
 /// headless `claude -p` spawn; the operator-tunable range (60..=600) bounds both an impatient
@@ -1854,9 +1854,9 @@ mod tests {
 
     #[test]
     fn default_login_timeout_matches_the_engine_default() {
-        // The config default and the engine's per-call fallback ([`login::DEFAULT_LOGIN_TIMEOUT`])
+        // The config default and the engine's documented default ([`login::DEFAULT_LOGIN_TIMEOUT`])
         // must agree, so an operator who never writes a [login] block gets the SAME 180 s the
-        // engine would use standalone. A drift guard: if either constant moves, this fails.
+        // engine documents. A drift guard: if either constant moves, this fails.
         assert_eq!(
             LoginConfig::default().timeout(),
             crate::login::DEFAULT_LOGIN_TIMEOUT

@@ -22,8 +22,8 @@ The daemon's control socket serves 11 commands (`src/daemon/socket.rs:7-46`); th
 the reason held throughout the project was that **`login` cannot be served over a socket because
 it needs an inherited TTY**.
 
-That belief had real textual backing. `src/login.rs:331` calls
-`require_tty(std::io::stdout().is_terminal())`, and the module's own doc comment at `:27-29` states
+That belief had real textual backing. `src/login.rs` calls
+`require_tty(std::io::stdout().is_terminal())`, and the module's own doc comment states
 the design intent plainly:
 
 > *Inherit-terminal, never a mediated pty. […] the engine ABORTS if stdout is not a TTY rather than
@@ -105,8 +105,8 @@ not argv.
    The design assumed sequential, human-paced logins. Routing makes concurrency ordinary, and two
    concurrent logins delete each other's isolation directory mid-OAuth, orphaning a credential-bearing
    keychain item. The lock must **not** be `swap.lock`, which must never be held for a ~180 s
-   interactive flow, and `reap_login_orphan` (`src/refresh.rs:962`, `src/login.rs:338`) must honour
-   it or become a saboteur against a live login.
+   interactive flow, and `reap_login_orphan` (defined in `src/refresh.rs`, called at login start
+   from `src/login.rs`) must honour it or become a saboteur against a live login.
 3. **The zero-egress gate must reject `AuthenticationServices` and `WebKit`.**
    `scripts/check-menubar-zero-egress.sh` lists neither, and `ASWebAuthenticationSession` does not
    contain the substring `URLSession`. The two APIs that would most directly defeat the gate's own

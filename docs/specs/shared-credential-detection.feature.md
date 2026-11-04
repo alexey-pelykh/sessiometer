@@ -76,8 +76,8 @@ Scenario Outline: a CLI write of another entry's credential is reported in its r
     # Covers AC `oracle-a-write-of-another-entrys-credential-is-reported` through the capture row. The
     # item suggests the test name `a_write_of_another_entrys_credential_is_reported`.
     # Covers AC `all-write-paths` through the login row.
-    # The capture row is asserted at `run_capture` (src/capture.rs:546).
-    # The login row is asserted at `run_login` (src/capture.rs:777).
+    # The capture row is asserted at `run_capture` (src/capture.rs).
+    # The login row is asserted at `run_login` (src/capture.rs).
 
 Scenario: the socket capture reports a pair as an event that follows its own
   Given a daemon whose roster is A:work, B:spare
@@ -483,8 +483,8 @@ Scenario: the detector is called from exactly four places, and none runs on a po
     And in each of those four functions the call comes after the roster save and before the reply is printed
     And the walk finds all four, so it cannot pass over an empty corpus
     # Covers AC `cost` (the source scan), AC-STSH-002, and the Specification's order: after the save.
-    # The model is the scan `every_roster_verb_declares_the_intent_its_verb_implies` (src/capture.rs:2330).
-    # Its crate-wide walk is `crate_notify_mentions` (src/capture.rs:2452). It cuts each file above its
+    # The model is the scan `every_roster_verb_declares_the_intent_its_verb_implies` (src/capture.rs).
+    # Its crate-wide walk is `crate_notify_mentions` (src/capture.rs). It cuts each file above its
     # test block and checks the comment strip with a canary.
     # The oracle pins the count and the four host functions. The order clause is checked in review,
     # because the needles it needs depend on the fix's code shape.
@@ -624,7 +624,7 @@ Taken from the acceptance criteria, for whoever binds the scenarios.
 - Rule 5: a wrapper around `FakeAccountStash` that counts reads and can fail one; a source scan
   modelled on the one named in its row. `FakeAccountStash` cannot fail a read with a locked keychain
   today, so that row needs the wrapper.
-- No function returns a CLI write's whole reply today. `confirmation` (src/capture.rs:688) returns the
-  confirmation line only, and `CaptureReport` (src/capture.rs:81) and `LoginReport` (src/capture.rs:737)
+- No function returns a CLI write's whole reply today. In src/capture.rs, `confirmation` returns the
+  confirmation line only, and `CaptureReport` and `LoginReport`
   carry no credential. The item says they gain one. A test written before the change cannot read it
   from them, so the oracle builds the written credential from its own fixture.

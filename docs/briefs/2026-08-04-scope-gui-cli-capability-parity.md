@@ -30,7 +30,7 @@ it moved both sources RESHAPE → BUILD.
 ## The finding that unblocked it
 
 `login` was believed non-routable because it needs an inherited TTY. The belief had real backing:
-`src/login.rs:331` calls `require_tty(...)`, and `:27-29` states the engine "ABORTS if stdout is not
+`src/login.rs` calls `require_tty(...)`, and its module doc states the engine "ABORTS if stdout is not
 a TTY rather than allocate a pty the operator could not drive." It was cited that way in the audit
 and by **four of five** design-council panelists — a FALSIFIER-CONVERGENT verdict.
 

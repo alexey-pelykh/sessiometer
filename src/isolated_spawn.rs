@@ -320,10 +320,10 @@ impl SpawnPlan {
 
     /// The interactive-login parametrization: `claude /login`, inherit-terminal stdio, and a
     /// `timeout`-bounded run with an extra SIGINT cancel arm ([`RunBound::TimeoutOrCancel`],
-    /// wired in [`run`](Self::run)). The `timeout` is the caller's tunable login budget (the
-    /// login-capture engine defaults it to 180 s, #132) — comfortably longer than the refresh
-    /// path's fixed [`SPAWN_TIMEOUT`] because a `/login` waits on a human completing a browser
-    /// OAuth handoff, not a headless token refresh. Wired to its production caller (the
+    /// wired in [`run`](Self::run)). The `timeout` is the caller's tunable login budget. The
+    /// `[login]` config defaults it to 180 s, the value #132 set. That is comfortably longer than
+    /// the refresh path's fixed [`SPAWN_TIMEOUT`] because a `/login` waits on a human completing a
+    /// browser OAuth handoff, not a headless token refresh. Wired to its production caller (the
     /// login-capture engine) via [`SpawnClaudeLogin`]; the
     /// `all_parametrizations_apply_the_full_scrub_set` test also builds it to prove the
     /// [`SPAWN_ENV_REMOVE`] scrub applies here too.
