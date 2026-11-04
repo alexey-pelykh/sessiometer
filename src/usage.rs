@@ -458,18 +458,42 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 ///   - a `limits[]` entry whose `kind` matches the window, with a `percent`
 ///     (also `0..=100`).
 ///
-/// Each window is independently optional: a window the reply does not carry is
+/// Each window is independently optional: a window the reply does not carry — its
+/// top-level key missing or JSON `null`, and no `limits[]` entry of its `kind` — is
 /// reported as `None` (not applicable to this account), never a fabricated `0`;
 /// a reply carrying no window at all is a hard [`Error::UsageParse`] (decision D1),
 /// so the loop skips, not swaps. A window the reply carries but that no shape above
-/// yields a number for also reads as `None`, so it cannot yet be told from an absent
-/// one; whether it should become a parse error instead is issue #1614's open question.
+/// yields a number for — a present, non-null top-level value, or a matching
+/// `limits[]` entry, with no numeric fraction — is present but unreadable, and is
+/// the same hard error naming the window (issue #1614, the council's Answer 2): a
+/// reset stamp beside no number is never read as a window the account lacks
+/// (invariant I-1). The `limits[]` fallback still rescues an unreadable top-level
+/// value, so which shape is read is unchanged; only a window no shape yields is
+/// rejected. Every error text is a structural hint naming the window, never
+/// response bytes.
 fn parse_usage(body: &str) -> Result<UsageReport> {
     let root: Value =
         serde_json::from_str(body).map_err(|_| Error::UsageParse("body is not JSON".into()))?;
 
-    let session = dimension(&root, "five_hour", &["session", "five_hour"]);
-    let weekly = dimension(&root, "seven_day", &["weekly_all", "seven_day", "weekly"]);
+    let session_kinds: &[&str] = &["session", "five_hour"];
+    let weekly_kinds: &[&str] = &["weekly_all", "seven_day", "weekly"];
+    let session = dimension(&root, "five_hour", session_kinds);
+    let weekly = dimension(&root, "seven_day", weekly_kinds);
+    // A window the lookup yields nothing for is one of two things, and only the
+    // reply can tell them apart: carried but unreadable (issue #1614, Answer 2) is
+    // a hard parse error naming the window, never served as a window the account
+    // lacks; not carried at all is absent, `None`. Rejected before D1's guard, so
+    // that guard's text stays exact for every body that reaches it.
+    if session.is_none() && carries_window(&root, "five_hour", session_kinds) {
+        return Err(Error::UsageParse(
+            "session (five_hour) quota window present but unreadable".into(),
+        ));
+    }
+    if weekly.is_none() && carries_window(&root, "seven_day", weekly_kinds) {
+        return Err(Error::UsageParse(
+            "weekly (seven_day) quota window present but unreadable".into(),
+        ));
+    }
     if session.is_none() && weekly.is_none() {
         // Decision D1, option (a): a 200 reply with no applicable window stays a hard
         // parse error, so the loop skips (`PollOutcome::Transient`), never swaps. The
@@ -545,6 +569,30 @@ fn dimension(
         }
     }
     fallback
+}
+
+/// Whether the reply carries the window at all, readable or not: the top-level
+/// `{top_key: ...}` value is present and not JSON `null`, or some `limits[]` entry
+/// has a `kind` in `kinds`. The sibling of [`dimension`], consulted only once that
+/// lookup has returned `None` for the same window, which is where the two cases it
+/// folds together come apart (issue #1614, the council's Answer 2): a carried
+/// window with no fraction is present but unreadable, a hard [`Error::UsageParse`];
+/// an uncarried one is absent, `None`. A missing key and a JSON `null` read alike
+/// (decision D2); a matching entry counts whatever its `is_active` (inactive is
+/// "not the binding limit", never "absent" — issue #66); and an unreadable
+/// top-level value beside a readable entry never reaches here, because
+/// [`dimension`] reads the entry.
+fn carries_window(root: &Value, top_key: &str, kinds: &[&str]) -> bool {
+    if root.get(top_key).is_some_and(|value| !value.is_null()) {
+        return true;
+    }
+    let Some(limits) = root.get("limits").and_then(Value::as_array) else {
+        return false;
+    };
+    limits.iter().any(|entry| {
+        let kind = entry.get("kind").and_then(Value::as_str);
+        kind.is_some_and(|kind| kinds.contains(&kind))
+    })
 }
 
 /// Read a usage fraction in `[0.0, 1.0]` from an object: a `utilization`
@@ -1260,7 +1308,6 @@ mod tests {
     /// session window `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn a_five_hour_object_with_a_null_utilization_is_present_but_unreadable() {
         let body = r#"{"five_hour":{"utilization":null,"resets_at":"2026-11-02T03:00:00Z","severity":"normal"},"seven_day":{"utilization":40.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
         assert_rejected_as_unreadable(
@@ -1279,7 +1326,6 @@ mod tests {
     /// `1ced489`: `Ok`, the session window `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn a_limits_session_entry_with_no_readable_fraction_is_present_but_unreadable() {
         let body = r#"{"limits":[{"kind":"session","severity":"normal","resets_at":"2026-11-02T03:00:00Z","is_active":true},{"kind":"weekly_all","percent":40,"severity":"normal","resets_at":"2026-11-06T22:59:59.916061+00:00","is_active":true}]}"#;
         assert_rejected_as_unreadable(
@@ -2098,7 +2144,6 @@ mod tests {
     /// rejected naming the session window. RED at `1ced489`: `Ok`, the session window `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn a_renamed_fraction_field_is_an_unreadable_session_window_not_an_absent_one() {
         assert_rejected_as_unreadable(
             "AC-1",
@@ -2112,7 +2157,6 @@ mod tests {
     /// window. RED at `1ced489`: `Ok`, the session window `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn a_non_numeric_utilization_is_an_unreadable_session_window() {
         assert_rejected_as_unreadable(
             "AC-2",
@@ -2126,7 +2170,6 @@ mod tests {
     /// naming the session window. RED at `1ced489`: `Ok`, the session window `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn a_limits_session_entry_without_a_percent_is_an_unreadable_session_window() {
         assert_rejected_as_unreadable(
             "AC-3",
@@ -2141,7 +2184,6 @@ mod tests {
     /// `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn a_seven_day_object_without_a_fraction_is_an_unreadable_weekly_window() {
         assert_rejected_as_unreadable(
             "AC-4",
@@ -2209,7 +2251,6 @@ mod tests {
     /// seven_day)"))`, D1's text, which names `seven_day` and so fails the second assertion.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn an_unreadable_weekly_window_beside_an_absent_session_window_is_rejected_not_served_one_windowed(
     ) {
         assert_rejected_as_unreadable(
@@ -2227,7 +2268,6 @@ mod tests {
     /// that read the text only on an `Err` would pass vacuously. RED at `1ced489`: `Ok`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn the_unreadable_window_error_carries_no_response_bytes() {
         match parse_usage(SESSION_UTILIZATION_CARRYING_A_SENTINEL) {
             Err(err @ Error::UsageParse(_)) => {
@@ -2272,7 +2312,6 @@ mod tests {
     /// `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn the_sub_point_body_a_null_utilization_beside_a_reset_stamp_is_present_but_unreadable() {
         assert_rejected_as_unreadable(
             "AC-8 (the sub-point)",
@@ -2290,7 +2329,6 @@ mod tests {
     /// D1's text, which fails the second assertion.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn an_unreadable_session_window_beside_an_absent_weekly_window_is_rejected_naming_the_session_window(
     ) {
         assert_rejected_as_unreadable(
@@ -2308,7 +2346,6 @@ mod tests {
     /// fails the second assertion.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn two_unreadable_windows_are_rejected_without_the_windowless_text() {
         assert_rejected_as_unreadable(
             "derived: two unreadable windows",
@@ -2325,7 +2362,6 @@ mod tests {
     /// naming the session window. RED at `1ced489`: `Ok`, the session window `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn a_null_five_hour_beside_a_limits_session_entry_without_a_fraction_is_present_but_unreadable()
     {
         assert_rejected_as_unreadable(
@@ -2343,7 +2379,6 @@ mod tests {
     /// session window `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn a_non_object_five_hour_value_is_present_but_unreadable() {
         for (shape, body) in NON_OBJECT_FIVE_HOUR_VALUES {
             assert_rejected_as_unreadable(
@@ -2361,7 +2396,6 @@ mod tests {
     /// at `1ced489`: `Ok`, the session window `None`.
     /// Un-ignore obligation: #1614's fix removes the attribute and edits nothing else here.
     #[test]
-    #[ignore = "RED oracle: pre-authored ahead of issue #1614's parser fix, which un-ignores it"]
     fn an_inactive_limits_session_entry_without_a_fraction_and_nothing_else_is_present_but_unreadable(
     ) {
         assert_rejected_as_unreadable(
