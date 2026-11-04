@@ -246,8 +246,8 @@ Scenario: a capture of a new uuid under a look-alike label prints the notice
    But the reply carries no second notice line
     # Covers AC `oracle-new-account-under-a-lookalike-label`, whose test name is
     # `capturing_under_a_label_that_looks_like_another_accounts_is_not_silent`, and AC
-    # `notice-facts`. RED-owed. The verbs, arms and print sites: `run_capture` (src/capture.rs:546) and
-    # `run_login` (src/capture.rs:777) plan through `plan_capture` (src/capture.rs:635), and the two
+    # `notice-facts`. RED-owed. The verbs, arms and print sites: `run_capture` and `run_login` plan
+    # through `plan_capture` (all in src/capture.rs), and the two
     # oracles cover both of its arms (append, relabel) and both print sites. A write that sets one
     # label creates at most one confusable collision, so "one line per collision" is one line here.
 

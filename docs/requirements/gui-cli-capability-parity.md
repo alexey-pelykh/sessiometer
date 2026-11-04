@@ -55,8 +55,8 @@ Three things converged:
    as a single clause. `capture` graduated out of it and shipped daemon-routed (#359/#360/#394);
    `login` did not, and no record says why. The split was an absence of a decision, not a decision.
 2. **The stated blocker was empirically false.** `login` was believed non-routable because it needs
-   an inherited TTY — `src/login.rs:331` calls `require_tty(std::io::stdout().is_terminal())`, and
-   the module doc at `:27-29` states the engine "ABORTS if stdout is not a TTY rather than allocate a
+   an inherited TTY. `src/login.rs` calls `require_tty(std::io::stdout().is_terminal())`, and
+   the module doc states the engine "ABORTS if stdout is not a TTY rather than allocate a
    pty the operator could not drive." A spike against the shipping Claude Code binary disproved the
    premise: `claude auth login --claudeai` runs to completion with no TTY at all. The gate is
    sessiometer's own conservatism for the *slash-command* shape, not a Claude Code requirement.
@@ -174,8 +174,8 @@ daemon **shall** refuse the second, fail-closed, without disturbing the first.
 > other's isolation directory mid-OAuth and orphan a credential-bearing keychain item. The fixed path
 > is **correct and must not change** — its hash names the suffixed isolated item, which is how the
 > #133 orphan reaper targets precisely (`src/refresh.rs:952`). The remedy is a lock, not a path
-> change. `reap_login_orphan` (`src/refresh.rs:962`, `src/login.rs:338`) must honour the same lock or
-> it becomes a saboteur against a live login.
+> change. `reap_login_orphan` (defined in `src/refresh.rs`, called at login start from
+> `src/login.rs`) must honour the same lock or it becomes a saboteur against a live login.
 
 **R-12** *(event-driven)* — **When** a login is in flight, the panel **shall** be able to observe its
 phase without issuing a second `login`.
@@ -331,7 +331,7 @@ question, not a defect.
 | R-1, R-2, R-3 | Operator ruling 2026-07-31; verb inventories at `parse_subcommand` (`src/cli.rs`) and `src/daemon/socket.rs:7-46` | **A** (direct observation) + **B** (ratified) |
 | R-4, R-5, R-6 | Audit finding F-3 (2026-07-31); `DaemonLog.swift:120-125`, `SettingsView.swift:90` as the shipped `launch` precedent | A |
 | R-7, R-8, R-9 | `src/daemon/socket.rs:28-33` — routed `capture`, the 1:1 template, incl. its explicit REQ-MBR-C-005 satisfaction note | A |
-| R-10, R-11 | `src/paths.rs:235-237`, `:264`; `src/refresh.rs:952`, `:962`; `src/login.rs:338` | A |
+| R-10, R-11 | `isolated_login_dir` and `create_isolated_dir` (`src/paths.rs`); `reap_login_orphan` (defined in `src/refresh.rs`, called at login start from `src/login.rs`) | A |
 | R-12 | Inferred from the socket's request/reply shape vs a ~180 s command | **C** (inference) |
 | R-13 | `SPAWN_ENV_REMOVE` in `src/isolated_spawn.rs` (the scrub list, read directly) + a static read of the shipping Claude Code binary's `authLogin` short-circuit | A / **C** |
 | R-14 | `SpawnPlan::argv` in `src/isolated_spawn.rs` | A |

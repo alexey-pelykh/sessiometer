@@ -77,9 +77,9 @@ green. Add both to the forbidden lists. Independently valuable; urgent here beca
 is exactly the context that invites them.
 
 **SP-3 — `login.lock`.** A fail-closed single-flight lock over the isolated login directory.
-Explicitly **not** `swap.lock` (C-3). `reap_login_orphan` (`src/refresh.rs:962`, `src/login.rs:338`)
-must acquire it too — a reaper that runs against a live login is a saboteur, and it currently has no
-way to know one is in flight.
+Explicitly **not** `swap.lock` (C-3). `reap_login_orphan` (defined in `src/refresh.rs`, called at
+login start from `src/login.rs`) must acquire `login.lock` too. A reaper that runs against a live
+login is a saboteur, and it currently has no way to know one is in flight.
 
 > **Do not "fix" the fixed path.** An early design note specified an ephemeral-id-keyed login dir.
 > The as-built fixed leaf is correct (C-5) and the lock is the proper remedy. Changing the path to

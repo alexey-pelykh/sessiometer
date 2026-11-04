@@ -169,7 +169,7 @@ Scenario: a service whose two items carry different times
 > No lock spans a stash write and the roster save after it. Each of the four writers takes the swap
 > lock around its stash write and saves the roster once the lock is released:
 > - CLI `capture`: `capture_locked` at src/capture.rs:234.
-> - CLI `login`: `run_login_locked` at src/capture.rs:882.
+> - CLI `login`: `run_login_locked` in src/capture.rs.
 > - socket `capture`: the call to `capture_locked` at src/daemon/commands.rs:349.
 > - `import`: the `acquire` inside `apply_import` at src/cli.rs:5324, taken only when the artifact
 >   carries credentials.
@@ -210,7 +210,7 @@ Scenario: the swap lock is held from the first read to the last delete
    Then it cannot until the run has ended
     # Conditional on the swap lock being the means, as AC Concurrency property says ("if the swap
     # lock is the means"). The config-write lock is not taken with it: the code says the two are
-    # never nested (`reconcile_login` at src/capture.rs:968), so taking both needs a reason in the
+    # never nested (`reconcile_login` in src/capture.rs), so taking both needs a reason in the
     # pull request.
 
 Scenario: a swap lock that cannot be taken stops the run

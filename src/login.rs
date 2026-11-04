@@ -41,8 +41,8 @@
 //!      the isolated keychain seam.
 //!   4. seed the isolated `.claude.json` (0600) with the onboarding keys — **no** token.
 //!   5. spawn `claude /login` with `CLAUDE_CONFIG_DIR=<dir>`, the operator's terminal inherited,
-//!      no token env, bounded by a tunable timeout (default [`DEFAULT_LOGIN_TIMEOUT`]) + an
-//!      operator SIGINT ([`crate::isolated_spawn::SpawnPlan::login`]).
+//!      no token env, bounded by the `[login]` timeout (default [`DEFAULT_LOGIN_TIMEOUT`])
+//!      and an operator SIGINT ([`crate::isolated_spawn::SpawnPlan::login`]).
 //!   6. **Shared-item re-check** (AC5): re-hash the shared item; a mismatch is a SAFETY ALARM
 //!      ([`Error::SharedCredentialMutated`]) — the isolation premise was violated, so refuse to
 //!      harvest.
@@ -93,8 +93,14 @@ use crate::stash::StashedAccount;
 
 /// The default bound on one whole login capture: **180 s** (issue #132 AC6). Comfortably longer
 /// than the refresh path's ~40 s `claude -p` budget because a `/login` waits on a human completing
-/// a browser OAuth handoff. Tunable per call (the production entry threads it through to
+/// a browser OAuth handoff. Tunable per call (the production entry threads its `timeout` through to
 /// [`crate::isolated_spawn::SpawnPlan::login`]); on expiry the child is killed and teardown runs.
+// Only tests and docs read this constant. Production gives `login_account` the `[login]` timeout
+// (`login_cfg.timeout()` in `crate::capture::login`), which defaults to
+// `DEFAULT_LOGIN_TIMEOUT_SECS` in `config`. `default_login_timeout_matches_the_engine_default`
+// pins this constant equal to that default. Without this allowance
+// `cargo clippy --all-targets --all-features -- -D warnings` fails with
+// "constant `DEFAULT_LOGIN_TIMEOUT` is never used".
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -105,7 +111,6 @@ pub(crate) const DEFAULT_LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 /// the whole enum is un-formattable and cannot be accidentally logged. A caller reads the
 /// non-secret [`account_uuid`](Self::account_uuid) for a log line and [`into_captured`](Self::into_captured)
 /// for the harvest.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum LoginCapture {
     /// The operator completed the login: a fresh credential + identity were harvested, ready for
     /// the stash/roster write path (#134).
@@ -115,7 +120,6 @@ pub(crate) enum LoginCapture {
     Incomplete,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl LoginCapture {
     /// The captured account's uuid — the roster key, non-secret (exactly what `list` prints) — or
     /// `None` for an incomplete capture. The ONLY account-identifying value the engine surfaces to
@@ -142,7 +146,6 @@ impl LoginCapture {
 /// tty (the production entry passes `std::io::stdout().is_terminal()`). A non-terminal stdout — a
 /// pipe, a file, a CI runner — is [`Error::LoginRequiresTty`]; the engine never allocates a
 /// mediated pty the operator could not interact with.
-#[cfg_attr(not(test), allow(dead_code))]
 fn require_tty(is_tty: bool) -> Result<()> {
     if is_tty {
         Ok(())
@@ -153,7 +156,6 @@ fn require_tty(is_tty: bool) -> Result<()> {
 
 /// The isolated dir's `.claude.json` — the file the onboarding seed is written to and the
 /// `oauthAccount` identity is read back from after the login.
-#[cfg_attr(not(test), allow(dead_code))]
 fn claude_json_path(dir: &Path) -> PathBuf {
     dir.join(".claude.json")
 }
@@ -173,7 +175,6 @@ fn claude_json_path(dir: &Path) -> PathBuf {
 /// **No token / `oauthAccount`** is seeded — that fresh credential is exactly what the capture
 /// exists to obtain. This differs from the refresh path's `{}` (`MINIMAL_CLAUDE_JSON`, #101 AC-5),
 /// which suffices because headless `claude -p` skips onboarding.
-#[cfg_attr(not(test), allow(dead_code))]
 fn onboarding_seed(cwd: &Path) -> Vec<u8> {
     let seed = serde_json::json!({
         "hasCompletedOnboarding": true,
@@ -193,7 +194,6 @@ fn onboarding_seed(cwd: &Path) -> Vec<u8> {
 /// that is only ever compared in-process, never emitted. Any read error OTHER than "absent" is
 /// propagated: if the shared item cannot be read to baseline it, the capture must not proceed (it
 /// could not prove the item stays untouched).
-#[cfg_attr(not(test), allow(dead_code))]
 async fn shared_item_hash<C: CredentialStore>(shared_store: &C) -> Result<Option<String>> {
     match shared_store.read().await {
         Ok(credential) => Ok(Some(sha256_hex(credential.expose()))),
@@ -206,7 +206,6 @@ async fn shared_item_hash<C: CredentialStore>(shared_store: &C) -> Result<Option
 /// still hits the explicit teardown in [`login_capture`]. Hard failures (an FS error seeding the
 /// `.claude.json`, an un-spawnable binary, an unreadable shared item, a shared-item mutation)
 /// return `Err`; a login the operator did not complete returns [`LoginCapture::Incomplete`].
-#[cfg_attr(not(test), allow(dead_code))]
 async fn run_login<C, K, L>(
     session: &IsolatedSession<K>,
     shared_store: &C,
@@ -271,7 +270,6 @@ where
 /// `iso_dir` is the ephemeral isolated `CLAUDE_CONFIG_DIR`; `seed_json` the onboarding seed;
 /// `timeout` the login budget; `is_tty` the injected terminal observation (AC1). Teardown of the
 /// isolated item + dir runs on EVERY exit (AC6).
-#[cfg_attr(not(test), allow(dead_code))]
 async fn login_capture<C, K, L>(
     shared_store: &C,
     keychain: K,
@@ -315,12 +313,11 @@ where
 /// over the REAL seams: the shared `Claude Code-credentials` store (baseline-hashed for AC5),
 /// the suffixed isolated item, and the interactive `claude /login` spawner. `config_bin` is
 /// the operator's `[…].claude_bin` override (`None` defers to `$CLAUDE_BIN` / the harvested
-/// `PATH`); `timeout` the tunable login budget ([`DEFAULT_LOGIN_TIMEOUT`] by default).
+/// `PATH`); `timeout` the login budget (the `[login]` config, default [`DEFAULT_LOGIN_TIMEOUT`]).
 ///
-/// Wired into a CLI verb by the stash/roster write path (#134); until then reachable only from
-/// tests (which keep its production-only callees live), hence `allow(dead_code)` off-test. The
-/// real browser flow it drives is the #130 manual gate, not a CI test (AC7).
-#[cfg_attr(not(test), allow(dead_code))]
+/// Reached from the `login` verb through [`crate::capture::login`] (#135), which hands the harvest
+/// to the stash/roster write path. The real browser flow it drives is the #130 manual gate, not a
+/// CI test (AC7).
 pub(crate) async fn login_account(
     config_bin: Option<&Path>,
     timeout: Duration,
@@ -766,15 +763,5 @@ mod tests {
         // label. Neither may carry the fixture's tokens, blob, or email.
         crate::redaction::meter::assert_clean(&uuid, &secrets, &[]);
         crate::redaction::meter::assert_clean(&format!("captured account {uuid}"), &secrets, &[]);
-    }
-
-    // Keep the production entry (and its production-only callees — `SpawnClaudeLogin`,
-    // `paths::isolated_login_dir`, the real seam construction) reachable from the test target until
-    // #134 wires it to a CLI verb; the reference does not run the async body (no real keychain /
-    // `claude` / browser is touched). Mirrors how #131 keeps `SpawnPlan::login` alive by building
-    // it in a test.
-    #[test]
-    fn the_production_entry_stays_reachable() {
-        let _entry = login_account;
     }
 }

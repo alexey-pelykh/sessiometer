@@ -704,7 +704,6 @@ fn confirmation(outcome: CaptureOutcome, label: &str, count: usize) -> String {
 /// vocabulary because a login is a fresh interactive re-auth (a possibly-quarantined
 /// account brought back), not the active-account snapshot `capture` takes. Consumed by
 /// the `login` verb (#135) for its redacted `onboarded|revived` event.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginOutcome {
     /// The harvested account was not in the roster — a new entry was appended.
@@ -733,7 +732,6 @@ impl From<CaptureOutcome> for LoginOutcome {
 
 /// The result of reconciling a harvested login into the roster: the config to persist
 /// plus the facts the `login` verb (#135) needs for its event.
-#[cfg_attr(not(test), allow(dead_code))]
 struct LoginReport {
     config: Config,
     outcome: LoginOutcome,
@@ -878,7 +876,6 @@ where
 /// concurrent swap to serialize against. A contended acquire fails closed BEFORE any
 /// write; when the lock IS taken, the operator's fresh interactive login is the most
 /// recent authoritative write, so it wins a race with a concurrent swap (last-writer-wins).
-#[cfg_attr(not(test), allow(dead_code))]
 async fn run_login_locked<C, S>(
     lock: Option<(&Path, Duration)>,
     login: HarvestedLogin,
@@ -2024,16 +2021,6 @@ mod tests {
              — a swap interleaved between capture's identity read and token read",
         );
         assert_eq!(stashed.oauth_account.account_uuid(), uuid);
-    }
-
-    // Keep the production entry (and its production-only callees — the real seam
-    // construction, the swap-lock + config-save wiring) reachable from the test target
-    // until #135 wires it to the `login` CLI verb; the reference does not run the async
-    // body (no real keychain / config / lock is touched). Mirrors how #132 keeps
-    // `login_account` alive by referencing it in a test.
-    #[test]
-    fn the_login_reconcile_entry_stays_reachable() {
-        let _entry = reconcile_login;
     }
 
     // --- the prior-configuration witness at the append-only verbs (#1440) --------------

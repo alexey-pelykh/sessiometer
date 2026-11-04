@@ -52,7 +52,7 @@ Example Mapping: 🟦 10 rules · 🟩 103 examples · 🟥 0 open
 > string, its uuid followed by the first of `-2`, `-3` and so on that no account carries (Rule 5). A
 > *notice* is a line a completed write prints about what it did; a *refusal* is the message a refused
 > write prints instead of writing. `activate`
-> is `login`'s verdict from `should_activate` (src/capture.rs:911): true when the login is the account
+> is `login`'s verdict from `should_activate` (src/capture.rs): true when the login is the account
 > already signed in, or when none is. Every roster here holds enabled entries only unless a scenario
 > says an entry is parked, so "in rotation" reads the same whether it counts the roster or its enabled
 > entries (DQ-10 is not this item's).
@@ -250,13 +250,11 @@ Scenario: the plan is made before the stash is written, in both writers
   Given the source of `run_capture` and of `run_login`
    When the plan call and the stash write are located in each
    Then the plan call comes first
-    # In `run_capture` the plan call is `plan_capture` at src/capture.rs:577.
-    # In `run_capture` the stash write is `stash.write` at src/capture.rs:585.
-    # In `run_login` the plan call is `plan_capture` at src/capture.rs:825.
-    # In `run_login` the stash write is `stash.write` at src/capture.rs:830.
+    # `run_capture` and `run_login` are in src/capture.rs. In each, the plan call is `plan_capture`
+    # and the stash write is `stash.write`.
     # The order holds today, so this scenario passes before the change and after it. It pins the order
-    # against a refactor that moves the plan. The idiom is the source-order scans in this file.
-    # `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released` (src/capture.rs:2184) is one.
+    # against a refactor that moves the plan. The idiom is the source-order scans in src/capture.rs.
+    # `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released` (src/capture.rs) is one.
     # Covers AC `plan-returns-facts-before-any-write`, "runs before stash.write".
 ```
 
@@ -306,7 +304,7 @@ Scenario Outline: a write that would rename the account it lands on is refused u
     # The label personal has one bearer after the rename, so the rule reports nothing and no collision
     # line follows. The refusal names spare, the label B carries, which is REQ-IDN-C-001 in the refuse
     # form; the item suggests the test name `a_login_that_lands_on_another_account_names_the_label_it_had`
-    # for the login rows. `recapture_updates_the_label_when_a_new_one_is_given` (src/capture.rs:1198)
+    # for the login rows. `recapture_updates_the_label_when_a_new_one_is_given` (src/capture.rs)
     # keeps pinning the rename at the plan, given rename consent, and a sibling pins the refusal without
     # it. Covers AC `rename-needs-consent` and AC `oracle-login-names-the-label-it-had`, and
     # REQ-IDN-B-001 for `capture`, the same-class addition the PRD makes.
@@ -361,8 +359,8 @@ Scenario Outline: a write that creates no collision and changes no label prints 
     # command refreshes an entry whose label already had two bearers: it adds none, so the count stays
     # at two. The second row harvests A itself under the label A already carries; AC-ROS-001 names a
     # report there as a BUT NOT. The third row is an ordinary new account under a fresh label.
-    # `confirmation_lines_match_the_acceptance_criteria` (src/capture.rs:1280) and
-    # `login_confirmation_lines_name_the_account_by_label` (src/capture.rs:1294) pass with no edit.
+    # In src/capture.rs, `confirmation_lines_match_the_acceptance_criteria` and
+    # `login_confirmation_lines_name_the_account_by_label` pass with no edit.
 
 Scenario: every quiet scenario in the import stub has a capture or login counterpart that stays silent
   Given the quiet scenarios of docs/specs/import-duplicate-label.feature.md
@@ -698,9 +696,9 @@ Scenario: a replacement keeps the order stash, save, notify, delete, and still d
    Then they come in that order
     And the notify still declares `ReloadIntent::AppendOnly`
     And the roster save still comes after the swap lock is released
-    # `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released` (src/capture.rs:2184) pins
-    # the save outside the swap lock, and
-    # `every_roster_verb_declares_the_intent_its_verb_implies` (src/capture.rs:2330) pins both commands
+    # In src/capture.rs, `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released`
+    # pins the save outside the swap lock, and
+    # `every_roster_verb_declares_the_intent_its_verb_implies` pins both commands
     # to `AppendOnly`; a flip of either to `Mutating` is the edit
     # that reinstates the 2026-08-27 roster collapse. Both stay green unedited. Deleting after the
     # notify means a running daemon has dropped the holder before its stash is gone, so it does not swap
@@ -732,7 +730,7 @@ Scenario: a login with `--overwrite` that replaces the signed-in account does no
     And the canonical credential and `~/.claude.json` still hold A, and no rostered account is active
     And the reply says the account it replaced was the signed-in one, that no rostered account is active now, and names `sessiometer use work`
     # #274's rule stays: a login becomes active only when it is the account already signed in, or when
-    # none is (`should_activate`, src/capture.rs:911). Here A is signed in, so `activate` is false. The
+    # none is (`should_activate`, src/capture.rs). Here A is signed in, so `activate` is false. The
     # daemon's reconcile drops A and re-resolves the active account by uuid, to none. The orchestrator's
     # reading, design § 12.3, C-5. Covers AC `overwrite-replaces-one-holder-in-place`.
 ```
@@ -809,7 +807,7 @@ Scenario Outline: a refusal is taken before every write
     | capture |
     | login   |
     # REQ-IDN-C-002 and AC-IDN-003: the stash and the roster are left as they were, and the operator is
-    # told why, BUT NOT by a refusal after the stash write. `run_login` (src/capture.rs:777) re-points the
+    # told why, BUT NOT by a refusal after the stash write. `run_login` (src/capture.rs) re-points the
     # canonical item and co-writes `~/.claude.json` only when `activate` is true; a refusal takes neither
     # step whatever `activate` is. `capture` never writes either. Covers AC `refusal-precedes-every-write`.
 
@@ -966,25 +964,24 @@ item does not spell out.
   count-rule scenario name the fixture that fails for each.
 - *Existing tests*: they keep their assertions. The confirmation tests named in Rule 4, the
   `apply_import_*` tests named in Rule 1, and the source scans
-  `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released` (src/capture.rs:2184),
-  `both_append_only_verbs_consult_the_witness_before_they_can_write` (src/capture.rs:2255) and
-  `every_roster_verb_declares_the_intent_its_verb_implies` (src/capture.rs:2330) pass with no edit. A
-  test that calls `plan_capture`, `run_capture`, `run_login` or `capture_locked` changes only by the
-  consent argument the new input adds.
-  `recapture_updates_the_label_when_a_new_one_is_given` (src/capture.rs:1198) is the one whose call
+  `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released`,
+  `both_append_only_verbs_consult_the_witness_before_they_can_write` and
+  `every_roster_verb_declares_the_intent_its_verb_implies` (all in src/capture.rs) pass with no
+  edit. A test that calls `plan_capture`, `run_capture`, `run_login` or `capture_locked` changes
+  only by the consent argument the new input adds.
+  `recapture_updates_the_label_when_a_new_one_is_given` (src/capture.rs) is the one whose call
   gains rename consent on purpose, and a sibling pins the
   refusal without it. `cargo test` checks them.
 - *Local gates*: the pre-push gates in `CLAUDE.md`, plus `msrv` and both `deny` checks, because the
   change is under `src/**`.
 - *Doc comments*: every comment in `src/capture.rs` that describes a rename on a refresh, or says
-  what `plan_capture` does to the roster, describes the refuse form. They are the doc comments on
-  `prefill_label_from_identity` (src/capture.rs:166), `derive_label` (src/capture.rs:621),
-  `plan_capture` (src/capture.rs:635) and `run_login` (src/capture.rs:777); the comment on the refresh
-  arm, above `existing.label = l.to_owned();` (src/capture.rs:662); the comment in `run_login` above
-  `let label = roster` (src/capture.rs:850); the append-only comment above
-  `notify_daemon_roster_reload(ReloadIntent::AppendOnly)` (src/capture.rs:142) in `capture`; and the
-  one above `notify_daemon_roster_reload(ReloadIntent::AppendOnly)` (src/capture.rs:1023) in
-  `reconcile_login`. The last two say no account is dropped. Review reads them; no test does.
+  what `plan_capture` does to the roster, describes the refuse form. They include the doc comments on
+  `prefill_label_from_identity`, `derive_label`, `plan_capture` and `run_login`; the comment on the
+  refresh arm, above `existing.label = l.to_owned();`; the comment in `run_login` above
+  `let label = roster`; the append-only comment above
+  `notify_daemon_roster_reload(ReloadIntent::AppendOnly)` in `capture`; and the one above
+  `notify_daemon_roster_reload(ReloadIntent::AppendOnly)` in `reconcile_login`. The last two say no
+  account is dropped. Review reads them; no test does.
 - *Oracles*: a pre-authored RED oracle item, delivered by a party other than #1556's executor and filed
   after the planning pull request merges, carries the item's oracles, including the three the PRD and
   the item name (`onboarding_a_new_uuid_under_a_label_another_account_bears_is_not_silent`,
@@ -1015,10 +1012,10 @@ Taken from the acceptance criteria, for whoever binds the scenarios.
   the no-write outline; and, for the audit outline, a pure test over the event a refusal produces and
   its `to_log_line` (src/observability.rs:2592), with a source scan that both commands emit it.
 - Rule 10: `parse` (src/cli.rs:803), which is pure, and the usage constants.
-- No function returns a capture or login's whole reply today. `confirmation` (src/capture.rs:688)
-  and `login_confirmation` (src/capture.rs:508) return the confirmation line only.
-  `CaptureReport` (src/capture.rs:81) and `LoginReport` (src/capture.rs:737) carry no collision and no
-  previous label, and nothing renders a refusal. The item's acceptance criteria name "the pure reply
+- No function returns a capture or login's whole reply today. In src/capture.rs, `confirmation` and
+  `login_confirmation` return the confirmation line only, and `CaptureReport` and `LoginReport`
+  carry no collision and no
+  previous label. Nothing renders a refusal. The item's acceptance criteria name "the pure reply
   function" and the refusal as seams of Rules 3 to 5, 8 and 9, and neither exists yet. A test written
   before the change cannot call them, and a test of `confirmation` cannot turn green either: its three
   arguments carry no collision, and the item keeps `confirmation_lines_match_the_acceptance_criteria`
