@@ -237,8 +237,9 @@ final class SettingsTextMetricsTests: XCTestCase {
     /// the other. One fixture regardless, because each extra transcription is another copy of a Rust
     /// literal that can drift unobserved.
     static let zeroTargetRemedyDetail: String =
-        "\(TunableField.targetMaxSessionUsage.rawValue) = 0 admits no swap target and silently disables "
-        + "proactive swapping; it must be in 1..=95. Raise it toward "
+        "\(TunableField.targetMaxSessionUsage.rawValue) = 0 admits no swap target that has a session "
+        + "window and silently disables proactive swapping to every account that reports one; "
+        + "it must be in 1..=95. Raise it toward "
         + "\(TunableField.sessionCeiling.rawValue) to admit more targets."
 
     // MARK: - AC-1: every sentence the extracted seam can render is present, non-empty and distinct

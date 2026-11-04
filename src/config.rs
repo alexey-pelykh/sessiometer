@@ -437,9 +437,10 @@ pub(crate) struct Tunables {
     pub(crate) cooldown_secs: u64,
     /// Default-on swap-target reserve (issue #398): the most-full an account may be
     /// to receive the active session — only swap *to* an account whose session usage
-    /// is below this percent (`1..=session_ceiling`; an explicit `0` admits no target
-    /// and is rejected), so a freshly-swapped target keeps runway before the next
-    /// poll. Always valued — an absent key means [`DEFAULT_TARGET_MAX_SESSION_USAGE`], not
+    /// is below this percent (`1..=session_ceiling`; an explicit `0` is
+    /// rejected, since it would admit no target that has a session window), so a
+    /// freshly-swapped target keeps runway before the next poll. Always valued — an
+    /// absent key means [`DEFAULT_TARGET_MAX_SESSION_USAGE`], not
     /// "off" (this supersedes #10's opt-in `Option`). Raise it toward `session_ceiling`
     /// to admit busier targets (equal is inert); the always-on session gate
     /// (`session < session_ceiling`, [`crate::daemon`]) still prevents oscillation

@@ -477,7 +477,8 @@ impl Config {
             "# The most-full an account may be to receive the active session: only swap\n\
              # TO an account whose session usage is below this percent (1..=session_ceiling).\n\
              # This is NOT the level that triggers a swap. Default-on (#398); 0 is rejected\n\
-             # — it admits no target and would disable proactive swapping.\n",
+             # — it admits no target that has a session window and would disable proactive\n\
+             # swapping to every account that reports one.\n",
         );
         out.push_str(&format!(
             "target_max_session_usage = {}\n",
