@@ -458,18 +458,41 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 ///   - a `limits[]` entry whose `kind` matches the window, with a `percent`
 ///     (also `0..=100`).
 ///
-/// Each window is independently optional: a window the reply does not carry is
+/// Each window is independently optional: a window the reply does not carry — its
+/// top-level key missing or JSON `null`, and no `limits[]` entry of its `kind` — is
 /// reported as `None` (not applicable to this account), never a fabricated `0`;
 /// a reply carrying no window at all is a hard [`Error::UsageParse`] (decision D1),
 /// so the loop skips, not swaps. A window the reply carries but that no shape above
-/// yields a number for also reads as `None`, so it cannot yet be told from an absent
-/// one; whether it should become a parse error instead is issue #1614's open question.
+/// yields a number for — a present, non-null top-level value, or a matching
+/// `limits[]` entry, with no numeric fraction — is present but unreadable, and is
+/// the same hard error naming the window (issue #1614, the council's Answer 2): a
+/// reset stamp beside no number is never read as a window the account lacks
+/// (invariant I-1). The `limits[]` fallback still rescues an unreadable top-level
+/// value, so which shape is read is unchanged; only a window no shape yields is
+/// rejected. Every error text is a structural hint, never response bytes.
 fn parse_usage(body: &str) -> Result<UsageReport> {
     let root: Value =
         serde_json::from_str(body).map_err(|_| Error::UsageParse("body is not JSON".into()))?;
 
-    let session = dimension(&root, "five_hour", &["session", "five_hour"]);
-    let weekly = dimension(&root, "seven_day", &["weekly_all", "seven_day", "weekly"]);
+    let session_kinds: &[&str] = &["session", "five_hour"];
+    let weekly_kinds: &[&str] = &["weekly_all", "seven_day", "weekly"];
+    let session = dimension(&root, "five_hour", session_kinds);
+    let weekly = dimension(&root, "seven_day", weekly_kinds);
+    // A window the lookup yields nothing for is one of two things, and only the
+    // reply can tell them apart: carried but unreadable (issue #1614, Answer 2) is
+    // a hard parse error naming the window, never served as a window the account
+    // lacks; not carried at all is absent, `None`. Rejected before D1's guard, so
+    // that guard's text stays exact for every body that reaches it.
+    if session.is_none() && carries_window(&root, "five_hour", session_kinds) {
+        return Err(Error::UsageParse(
+            "session (five_hour) quota window present but unreadable".into(),
+        ));
+    }
+    if weekly.is_none() && carries_window(&root, "seven_day", weekly_kinds) {
+        return Err(Error::UsageParse(
+            "weekly (seven_day) quota window present but unreadable".into(),
+        ));
+    }
     if session.is_none() && weekly.is_none() {
         // Decision D1, option (a): a 200 reply with no applicable window stays a hard
         // parse error, so the loop skips (`PollOutcome::Transient`), never swaps. The
@@ -545,6 +568,30 @@ fn dimension(
         }
     }
     fallback
+}
+
+/// Whether the reply carries the window at all, readable or not: the top-level
+/// `{top_key: ...}` value is present and not JSON `null`, or some `limits[]` entry
+/// has a `kind` in `kinds`. The sibling of [`dimension`], consulted only once that
+/// lookup has returned `None` for the same window, which is where the two cases it
+/// folds together come apart (issue #1614, the council's Answer 2): a carried
+/// window with no fraction is present but unreadable, a hard [`Error::UsageParse`];
+/// an uncarried one is absent, `None`. A missing key and a JSON `null` read alike
+/// (decision D2); a matching entry counts whatever its `is_active` (inactive is
+/// "not the binding limit", never "absent" — issue #66); and an unreadable
+/// top-level value beside a readable entry never reaches here, because
+/// [`dimension`] reads the entry.
+fn carries_window(root: &Value, top_key: &str, kinds: &[&str]) -> bool {
+    if root.get(top_key).is_some_and(|value| !value.is_null()) {
+        return true;
+    }
+    let Some(limits) = root.get("limits").and_then(Value::as_array) else {
+        return false;
+    };
+    limits.iter().any(|entry| {
+        let kind = entry.get("kind").and_then(Value::as_str);
+        kind.is_some_and(|kind| kinds.contains(&kind))
+    })
 }
 
 /// Read a usage fraction in `[0.0, 1.0]` from an object: a `utilization`
@@ -873,6 +920,11 @@ mod tests {
         );
     }
 
+    /// The identity-field names that no fixture or synthetic body may carry. Every
+    /// quota-fields-only scan in this module searches the lower-cased body for each of them.
+    const IDENTITY_FIELD_NEEDLES: [&str; 6] =
+        ["email", "uuid", "label", "token", "organization", "account"];
+
     #[test]
     fn no_fixture_body_carries_an_identity_field() {
         for body in [
@@ -884,7 +936,7 @@ mod tests {
         ] {
             assert!(!body.contains('@'), "an `@` in {body}");
             let lowered = body.to_ascii_lowercase();
-            for needle in ["email", "uuid", "label", "token", "organization", "account"] {
+            for needle in IDENTITY_FIELD_NEEDLES {
                 assert!(!lowered.contains(needle), "`{needle}` in {body}");
             }
         }
@@ -1191,11 +1243,12 @@ mod tests {
         assert!(matches!(parse_usage(body), Err(Error::UsageParse(_))));
     }
 
-    /// A session-only body is served with its weekly window absent (REQ-RPL-B-002), and the one
-    /// rejection left, a windowless body, names both windows it lacks (decision D1 (a)) and
-    /// carries no response bytes. The text is read where the error is printed whole, the CLI's
-    /// `sessiometer: malformed usage response: …` line from `main`; the daemon's poll
-    /// diagnostics keep only the class, `transient`.
+    /// A session-only body is served with its weekly window absent (REQ-RPL-B-002). A
+    /// windowless body is rejected. Its error names both windows it lacks (decision D1 (a))
+    /// and carries no response bytes. That text is read where the error is printed whole, the
+    /// CLI's `sessiometer: malformed usage response: …` line from `main`; the daemon's poll
+    /// diagnostics keep only the class, `transient`. A window the reply carries but cannot
+    /// read is a different rejection (issue #1614), tested below.
     #[test]
     fn a_session_only_body_is_served_and_a_windowless_body_names_both_windows_it_lacks() {
         let session_only = r#"{"limits": [{"kind": "session", "percent": 10}]}"#;
@@ -1216,7 +1269,7 @@ mod tests {
         }
     }
 
-    // --- every shape the session lookup cannot read is served with the session window absent ---
+    // --- an absent session window is served; a present but unreadable one is rejected (#1614) ---
 
     /// Asserts the absent-session reading on `body`: served (`Ok`), the session window `None`
     /// with no reset stamp and no severity, and the weekly window read. The weekly fraction is
@@ -1240,9 +1293,11 @@ mod tests {
         assert!((read - weekly).abs() < 1e-9, "the weekly window is read");
     }
 
-    /// The absent window keys on the session LOOKUP returning `None`, not on `five_hour` being
-    /// JSON `null`: a reply with no `five_hour` key at all (and no session entry in `limits[]`)
-    /// is the same absent window (decision D2).
+    /// An absent session window takes more than the session LOOKUP returning `None`: the reply
+    /// also carries no session window, so no non-null `five_hour` value and no `limits[]` entry
+    /// of a session `kind` (a window the reply carries but the lookup cannot read is rejected
+    /// instead, issue #1614). A reply with no `five_hour` key at all, and no session entry in
+    /// `limits[]`, is the same absent window as a JSON-`null` `five_hour` (decision D2).
     #[test]
     fn a_reply_with_no_five_hour_key_is_served_without_a_session_window() {
         let body = r#"{"seven_day":{"utilization":40.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"},"limits":[{"kind":"weekly_all","group":"weekly","percent":40,"severity":"normal","resets_at":"2026-11-06T22:59:59.916061+00:00","is_active":true}]}"#;
@@ -1250,23 +1305,38 @@ mod tests {
     }
 
     /// A `five_hour` OBJECT whose `utilization` is `null` and which carries no `percent`
-    /// has no readable fraction, so the lookup returns `None` for it too. Its `resets_at`
-    /// and `severity` are deliberately present: the lookup found no window, so neither is
-    /// carried onto the reading (invariant I-1).
+    /// has no readable fraction. Under issue #1614's ruling (Answer 2, the sub-point) the window
+    /// is present but unreadable: the object is there, with a reset stamp and a severity, and
+    /// its fraction is not, and invariant I-1 forbids reading a stamp beside no number as a
+    /// window the account lacks. So the reply is rejected, `Err(UsageParse)` naming the session
+    /// window, never served with the session window absent as #1596 built it. The body is
+    /// #1596's, byte for byte (AC-10: no fixture body is edited). RED at `1ced489`: `Ok`, the
+    /// session window `None`.
     #[test]
-    fn a_five_hour_object_with_a_null_utilization_is_served_without_a_session_window() {
+    fn a_five_hour_object_with_a_null_utilization_is_present_but_unreadable() {
         let body = r#"{"five_hour":{"utilization":null,"resets_at":"2026-11-02T03:00:00Z","severity":"normal"},"seven_day":{"utilization":40.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
-        assert_served_without_a_session_window(body, 0.40);
+        assert_rejected_as_unreadable(
+            "AC-10's moved test (the sub-point)",
+            body,
+            &SESSION_WINDOW_NAMES,
+        );
     }
 
-    /// With no readable top-level `five_hour`, a `limits[]` entry of kind `session` that
-    /// carries neither `percent` nor `utilization` is skipped by the lookup (`fraction_of`
-    /// finds no fraction), so the lookup finds no readable session window here either —
-    /// again with a `resets_at` and `severity` on the entry that must NOT reach the reading.
+    /// With no top-level `five_hour`, a `limits[]` entry of kind `session` that carries neither
+    /// `percent` nor `utilization` yields no fraction. Under issue #1614's ruling (Answer 2) a
+    /// matching `limits[]` entry with no fraction, and no readable one beside it, is a window
+    /// the reply carries but cannot read: the reply is rejected, `Err(UsageParse)` naming the
+    /// session window, never served with the session window absent as #1596 built it (AC-3's
+    /// rule over #1596's body, byte for byte; AC-10: no fixture body is edited). RED at
+    /// `1ced489`: `Ok`, the session window `None`.
     #[test]
-    fn a_limits_session_entry_with_no_readable_fraction_is_served_without_a_session_window() {
+    fn a_limits_session_entry_with_no_readable_fraction_is_present_but_unreadable() {
         let body = r#"{"limits":[{"kind":"session","severity":"normal","resets_at":"2026-11-02T03:00:00Z","is_active":true},{"kind":"weekly_all","percent":40,"severity":"normal","resets_at":"2026-11-06T22:59:59.916061+00:00","is_active":true}]}"#;
-        assert_served_without_a_session_window(body, 0.40);
+        assert_rejected_as_unreadable(
+            "AC-10's moved test (AC-3's rule)",
+            body,
+            &SESSION_WINDOW_NAMES,
+        );
     }
 
     #[test]
@@ -1359,7 +1429,7 @@ mod tests {
             assert!(root.is_object(), "a JSON object: {body}");
             assert!(!body.contains('@'), "an `@` in {body}");
             let lowered = body.to_ascii_lowercase();
-            for needle in ["email", "uuid", "label", "token", "organization", "account"] {
+            for needle in IDENTITY_FIELD_NEEDLES {
                 assert!(!lowered.contains(needle), "`{needle}` in {body}");
             }
         }
@@ -1832,6 +1902,706 @@ mod tests {
                     Some(&Value::Null),
                     "{name}: seven_day must be JSON null"
                 );
+            }
+        }
+    }
+
+    // --- present but unreadable windows (#1614, umbrella #1590) ---
+    //
+    // The council's ruling on #1614 (Answer 2, 2026-11-04; its record is comment 6625059516 on
+    // #1590, restated in comment 6625228225 on #1614) keeps apart a window the reply does not carry
+    // from a window the reply carries but cannot read. Absent: the top-level key is missing or
+    // JSON `null`, and no `limits[]` entry has a matching `kind`; it stays `None` as #1596 built
+    // it. Readable: a fraction was found, on the top-level object or on a matching `limits[]`
+    // entry, through `utilization` or `percent` (a value outside `0..=100` is clamped and still
+    // readable; the clamp is out of #1614's scope). Unreadable: anything else that yields no
+    // fraction, so a present, non-null top-level value with no numeric `utilization` or
+    // `percent` and no readable `limits[]` entry, or a matching `limits[]` entry exists and none
+    // yields a fraction; `parse_usage` then returns `Err(UsageParse)` naming the window,
+    // "whatever the other window is", carrying no response bytes. The sub-point: an object whose
+    // `utilization` is JSON `null` is present but unreadable (invariant I-1 forbids reading its
+    // reset stamp beside no number as a window the account lacks). Decision D1 (a)'s guard keeps
+    // its text, "which becomes exact for every body that reaches it": only a body with no window
+    // at all reaches it, so its text is never the text for an unreadable window.
+    //
+    // At `1ced489`, whose `src/usage.rs` blob equals `458c9fa`'s (the merged compile unit of
+    // #1596), the parser conflated the two cases: an unreadable window read as absent. The tests
+    // below grade the distinction. Each test that asserts a rejection names in its doc how it is
+    // known to detect that conflation: the outcome its body gave at `1ced489`, or, for the weekly
+    // carrier tests near the end of the block, the carrier-check regressions that fail it. The
+    // rest are guards and owe no RED. The two tests re-asserted in place in the section "an
+    // absent session window is served; a present but unreadable one is rejected" above,
+    // `a_five_hour_object_with_a_null_utilization_is_present_but_unreadable` and
+    // `a_limits_session_entry_with_no_readable_fraction_is_present_but_unreadable`, belong to
+    // this set: their bodies are #1596's, byte for byte, re-asserted as the ruling says.
+    // The bodies are synthetic and carry quota fields only, never an identity field. `W` in the
+    // issue's criteria is the weekly fragment
+    // `"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}`, written
+    // out in full in every body below.
+
+    /// AC-1's body: the session fraction under a renamed field (`usage`), beside a reset stamp
+    /// and the weekly fragment W.
+    const RENAMED_SESSION_FRACTION_FIELD: &str = r#"{"five_hour":{"usage":42.0,"resets_at":"2026-11-02T03:00:00+00:00"},"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+
+    /// AC-2's body: a non-numeric session `utilization` (a JSON string) beside W.
+    const NON_NUMERIC_SESSION_UTILIZATION: &str = r#"{"five_hour":{"utilization":"42"},"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+
+    /// AC-3's body: a `limits[]` session entry with no `percent` beside a readable `weekly_all`.
+    const LIMITS_SESSION_ENTRY_WITHOUT_A_PERCENT: &str = r#"{"limits":[{"kind":"session","severity":"high"},{"kind":"weekly_all","percent":90,"is_active":true}]}"#;
+
+    /// AC-4's body: a readable session window beside a `seven_day` object whose fraction is under
+    /// a renamed field (`percent_used`).
+    const SEVEN_DAY_OBJECT_WITHOUT_A_FRACTION: &str =
+        r#"{"five_hour":{"utilization":10.0},"seven_day":{"percent_used":90.0}}"#;
+
+    /// AC-5's body as written: the incident reply's shape, `five_hour` JSON `null` beside a
+    /// readable top-level `seven_day` and a readable `weekly_all` entry.
+    const INCIDENT_REPLY_WITH_A_NULL_FIVE_HOUR: &str = r#"{"five_hour":null,"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"},"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true}]}"#;
+
+    /// AC-5's second body: `INCIDENT_REPLY_WITH_A_NULL_FIVE_HOUR` with the `five_hour` key
+    /// removed and nothing else changed.
+    const INCIDENT_REPLY_WITHOUT_A_FIVE_HOUR_KEY: &str = r#"{"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"},"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true}]}"#;
+
+    /// AC-6's body: an absent session window (`five_hour` JSON `null`, no session entry) beside
+    /// an unreadable weekly window (a `seven_day` object with no fraction).
+    const NULL_FIVE_HOUR_BESIDE_AN_UNREADABLE_SEVEN_DAY: &str =
+        r#"{"five_hour":null,"seven_day":{"percent_used":90.0}}"#;
+
+    /// AC-7's body: a non-numeric session `utilization` carrying a sentinel that must never
+    /// reach the error's text, beside W.
+    const SESSION_UTILIZATION_CARRYING_A_SENTINEL: &str = r#"{"five_hour":{"utilization":"ZZ-SENTINEL-77"},"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+
+    /// AC-8's rescue body: an unreadable top-level `five_hour` object beside a readable
+    /// `limits[]` session entry and W.
+    const UNREADABLE_FIVE_HOUR_OBJECT_RESCUED_BY_A_LIMITS_SESSION_ENTRY: &str = r#"{"five_hour":{"usage":42.0},"limits":[{"kind":"session","percent":42}],"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+
+    /// AC-8's sub-point body: a `five_hour` object whose `utilization` is JSON `null` beside a
+    /// reset stamp, and W.
+    const NULL_UTILIZATION_BESIDE_A_RESET_STAMP: &str = r#"{"five_hour":{"utilization":null,"resets_at":"2026-11-02T03:00:00+00:00"},"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+
+    /// Derived: AC-2's unreadable session window beside an ABSENT weekly window (no `seven_day`
+    /// key, no `limits[]`).
+    const UNREADABLE_SESSION_BESIDE_NO_WEEKLY_WINDOW: &str =
+        r#"{"five_hour":{"utilization":"42"}}"#;
+
+    /// Derived: both windows present and unreadable (AC-2's session shape beside AC-4's weekly
+    /// shape).
+    const TWO_UNREADABLE_WINDOWS: &str =
+        r#"{"five_hour":{"utilization":"42"},"seven_day":{"percent_used":90.0}}"#;
+
+    /// Derived: a JSON-`null` top-level `five_hour` beside a matching `limits[]` session entry
+    /// with no fraction, and W.
+    const NULL_FIVE_HOUR_BESIDE_A_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION: &str = r#"{"five_hour":null,"limits":[{"kind":"session","severity":"high"}],"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+
+    /// Derived: a present, non-null top-level `five_hour` that is not an object, one body per
+    /// JSON type (number, string, array, boolean), each beside W.
+    const NON_OBJECT_FIVE_HOUR_VALUES: [(&str, &str); 4] = [
+        (
+            "a number",
+            r#"{"five_hour":42.0,"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#,
+        ),
+        (
+            "a string",
+            r#"{"five_hour":"42.0","seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#,
+        ),
+        (
+            "an array",
+            r#"{"five_hour":[42.0],"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#,
+        ),
+        (
+            "a boolean",
+            r#"{"five_hour":true,"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#,
+        ),
+    ];
+
+    /// Derived: an inactive `limits[]` session entry with no fraction, and nothing else for the
+    /// session window, beside a readable `weekly_all`.
+    const INACTIVE_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION_ALONE: &str = r#"{"limits":[{"kind":"session","is_active":false,"severity":"high"},{"kind":"weekly_all","percent":90,"is_active":true}]}"#;
+
+    /// Derived: a readable top-level `five_hour` object beside a matching `limits[]` session
+    /// entry with no fraction, and W.
+    const READABLE_FIVE_HOUR_BESIDE_A_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION: &str = r#"{"five_hour":{"utilization":42.0},"limits":[{"kind":"session","severity":"high"}],"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+
+    /// Derived: two matching `limits[]` session entries, the first with no fraction and the
+    /// second with one, beside W.
+    const LIMITS_SESSION_ENTRIES_ONE_WITHOUT_AND_ONE_WITH_A_FRACTION: &str = r#"{"limits":[{"kind":"session","severity":"high"},{"kind":"session","percent":42}],"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+
+    /// Derived, the weekly counterpart of AC-3's body: a readable `limits[]` session entry beside
+    /// a `weekly_all` entry with no fraction, the reply's only weekly carrier.
+    const LIMITS_WEEKLY_ENTRY_WITHOUT_A_FRACTION: &str = r#"{"limits":[{"kind":"session","percent":10,"is_active":true},{"kind":"weekly_all","severity":"high"}]}"#;
+
+    /// Derived: a JSON-`null` top-level `seven_day` beside a matching `limits[]` weekly entry
+    /// with no fraction, and a readable session window.
+    const NULL_SEVEN_DAY_BESIDE_A_LIMITS_WEEKLY_ENTRY_WITHOUT_A_FRACTION: &str = r#"{"five_hour":{"utilization":10.0},"seven_day":null,"limits":[{"kind":"weekly_all","severity":"high"}]}"#;
+
+    /// Derived: a present, non-null top-level `seven_day` that is not an object, one body per
+    /// JSON type (number, string, array, boolean), each beside a readable session window.
+    const NON_OBJECT_SEVEN_DAY_VALUES: [(&str, &str); 4] = [
+        (
+            "a number",
+            r#"{"five_hour":{"utilization":10.0},"seven_day":90.0}"#,
+        ),
+        (
+            "a string",
+            r#"{"five_hour":{"utilization":10.0},"seven_day":"90.0"}"#,
+        ),
+        (
+            "an array",
+            r#"{"five_hour":{"utilization":10.0},"seven_day":[90.0]}"#,
+        ),
+        (
+            "a boolean",
+            r#"{"five_hour":{"utilization":10.0},"seven_day":true}"#,
+        ),
+    ];
+
+    /// Derived, the weekly counterpart of AC-8's rescue body: an unreadable top-level `seven_day`
+    /// object beside a readable `limits[]` `weekly_all` entry and a readable session window.
+    const UNREADABLE_SEVEN_DAY_OBJECT_RESCUED_BY_A_LIMITS_WEEKLY_ENTRY: &str = r#"{"five_hour":{"utilization":10.0},"seven_day":{"percent_used":90.0},"limits":[{"kind":"weekly_all","percent":90}]}"#;
+
+    /// Every body this block declares, named, so the quota-fields-only scan can list them.
+    const UNREADABLE_WINDOW_BODIES: [(&str, &str); 27] = [
+        (
+            "RENAMED_SESSION_FRACTION_FIELD",
+            RENAMED_SESSION_FRACTION_FIELD,
+        ),
+        (
+            "NON_NUMERIC_SESSION_UTILIZATION",
+            NON_NUMERIC_SESSION_UTILIZATION,
+        ),
+        (
+            "LIMITS_SESSION_ENTRY_WITHOUT_A_PERCENT",
+            LIMITS_SESSION_ENTRY_WITHOUT_A_PERCENT,
+        ),
+        (
+            "SEVEN_DAY_OBJECT_WITHOUT_A_FRACTION",
+            SEVEN_DAY_OBJECT_WITHOUT_A_FRACTION,
+        ),
+        (
+            "INCIDENT_REPLY_WITH_A_NULL_FIVE_HOUR",
+            INCIDENT_REPLY_WITH_A_NULL_FIVE_HOUR,
+        ),
+        (
+            "INCIDENT_REPLY_WITHOUT_A_FIVE_HOUR_KEY",
+            INCIDENT_REPLY_WITHOUT_A_FIVE_HOUR_KEY,
+        ),
+        (
+            "NULL_FIVE_HOUR_BESIDE_AN_UNREADABLE_SEVEN_DAY",
+            NULL_FIVE_HOUR_BESIDE_AN_UNREADABLE_SEVEN_DAY,
+        ),
+        (
+            "SESSION_UTILIZATION_CARRYING_A_SENTINEL",
+            SESSION_UTILIZATION_CARRYING_A_SENTINEL,
+        ),
+        (
+            "UNREADABLE_FIVE_HOUR_OBJECT_RESCUED_BY_A_LIMITS_SESSION_ENTRY",
+            UNREADABLE_FIVE_HOUR_OBJECT_RESCUED_BY_A_LIMITS_SESSION_ENTRY,
+        ),
+        (
+            "NULL_UTILIZATION_BESIDE_A_RESET_STAMP",
+            NULL_UTILIZATION_BESIDE_A_RESET_STAMP,
+        ),
+        (
+            "UNREADABLE_SESSION_BESIDE_NO_WEEKLY_WINDOW",
+            UNREADABLE_SESSION_BESIDE_NO_WEEKLY_WINDOW,
+        ),
+        ("TWO_UNREADABLE_WINDOWS", TWO_UNREADABLE_WINDOWS),
+        (
+            "NULL_FIVE_HOUR_BESIDE_A_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION",
+            NULL_FIVE_HOUR_BESIDE_A_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION,
+        ),
+        (
+            "NON_OBJECT_FIVE_HOUR_VALUES[0] (a number)",
+            NON_OBJECT_FIVE_HOUR_VALUES[0].1,
+        ),
+        (
+            "NON_OBJECT_FIVE_HOUR_VALUES[1] (a string)",
+            NON_OBJECT_FIVE_HOUR_VALUES[1].1,
+        ),
+        (
+            "NON_OBJECT_FIVE_HOUR_VALUES[2] (an array)",
+            NON_OBJECT_FIVE_HOUR_VALUES[2].1,
+        ),
+        (
+            "NON_OBJECT_FIVE_HOUR_VALUES[3] (a boolean)",
+            NON_OBJECT_FIVE_HOUR_VALUES[3].1,
+        ),
+        (
+            "INACTIVE_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION_ALONE",
+            INACTIVE_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION_ALONE,
+        ),
+        (
+            "READABLE_FIVE_HOUR_BESIDE_A_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION",
+            READABLE_FIVE_HOUR_BESIDE_A_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION,
+        ),
+        (
+            "LIMITS_SESSION_ENTRIES_ONE_WITHOUT_AND_ONE_WITH_A_FRACTION",
+            LIMITS_SESSION_ENTRIES_ONE_WITHOUT_AND_ONE_WITH_A_FRACTION,
+        ),
+        (
+            "LIMITS_WEEKLY_ENTRY_WITHOUT_A_FRACTION",
+            LIMITS_WEEKLY_ENTRY_WITHOUT_A_FRACTION,
+        ),
+        (
+            "NULL_SEVEN_DAY_BESIDE_A_LIMITS_WEEKLY_ENTRY_WITHOUT_A_FRACTION",
+            NULL_SEVEN_DAY_BESIDE_A_LIMITS_WEEKLY_ENTRY_WITHOUT_A_FRACTION,
+        ),
+        (
+            "NON_OBJECT_SEVEN_DAY_VALUES[0] (a number)",
+            NON_OBJECT_SEVEN_DAY_VALUES[0].1,
+        ),
+        (
+            "NON_OBJECT_SEVEN_DAY_VALUES[1] (a string)",
+            NON_OBJECT_SEVEN_DAY_VALUES[1].1,
+        ),
+        (
+            "NON_OBJECT_SEVEN_DAY_VALUES[2] (an array)",
+            NON_OBJECT_SEVEN_DAY_VALUES[2].1,
+        ),
+        (
+            "NON_OBJECT_SEVEN_DAY_VALUES[3] (a boolean)",
+            NON_OBJECT_SEVEN_DAY_VALUES[3].1,
+        ),
+        (
+            "UNREADABLE_SEVEN_DAY_OBJECT_RESCUED_BY_A_LIMITS_WEEKLY_ENTRY",
+            UNREADABLE_SEVEN_DAY_OBJECT_RESCUED_BY_A_LIMITS_WEEKLY_ENTRY,
+        ),
+    ];
+
+    /// The names an error "naming the session window" may use: the issue's criteria accept
+    /// either `five_hour` or `session` in the message.
+    const SESSION_WINDOW_NAMES: [&str; 2] = ["five_hour", "session"];
+
+    /// The names an error "naming the weekly window" may use: `seven_day` or `weekly`.
+    const WEEKLY_WINDOW_NAMES: [&str; 2] = ["seven_day", "weekly"];
+
+    /// The names an error naming either window may use, for a body in which both are unreadable.
+    const EITHER_WINDOW_NAMES: [&str; 4] = ["five_hour", "session", "seven_day", "weekly"];
+
+    /// Asserts the unreadable-window rejection on `body`: `parse_usage` returns
+    /// `Err(Error::UsageParse(message))`, and three checks hold on `message`. The name check:
+    /// `message` names the window through one of `names`. Two checks then exclude decision
+    /// D1 (a)'s windowless text, "which becomes exact for every body that reaches it" (the
+    /// ruling): a body carrying an unreadable window never reaches that guard, so its text is
+    /// never the rejection here. The wording check: `message` does not contain
+    /// `no quota window`. The other-window check: `message` names no window outside `names`,
+    /// which D1's text fails whatever its wording, because `parse_usage` writes it as a
+    /// structural hint naming both windows. With both windows in `names`, for a body whose two
+    /// windows are unreadable, the other-window check is empty, because a message about two
+    /// unreadable windows may name both, and the wording check stands alone. At `1ced489`,
+    /// where an unreadable window read as absent, a body with no readable window took exactly
+    /// that text, which is where AC-6 and the two derived tests over such bodies go RED.
+    /// `criterion` prefixes every panic line.
+    fn assert_rejected_as_unreadable(criterion: &str, body: &str, names: &[&str]) {
+        match parse_usage(body) {
+            Err(Error::UsageParse(message)) => {
+                assert!(
+                    names.iter().any(|name| message.contains(name)),
+                    "{criterion}: expected UsageParse naming the window through one of {names:?}, got {message:?}"
+                );
+                assert!(
+                    !message.contains("no quota window"),
+                    "{criterion}: expected UsageParse naming the unreadable window, got D1's windowless text {message:?}"
+                );
+                let other_window_names: Vec<&str> = EITHER_WINDOW_NAMES
+                    .iter()
+                    .copied()
+                    .filter(|name| !names.contains(name))
+                    .collect();
+                assert!(
+                    !other_window_names.iter().any(|name| message.contains(name)),
+                    "{criterion}: expected UsageParse naming only the unreadable window, got one that also names a window through one of {other_window_names:?}, as D1's windowless text does: {message:?}"
+                );
+            }
+            other => panic!(
+                "{criterion}: expected UsageParse naming the window through one of {names:?}, got {other:?}"
+            ),
+        }
+    }
+
+    /// AC-1, "a renamed field is an error, not a missing window": the session fraction under a
+    /// renamed field is a present, non-null `five_hour` with no numeric `utilization` or
+    /// `percent` and no readable `limits[]` entry, so the window is unreadable and the reply is
+    /// rejected naming the session window. RED at `1ced489`: `Ok`, the session window `None`.
+    #[test]
+    fn a_renamed_fraction_field_is_an_unreadable_session_window_not_an_absent_one() {
+        assert_rejected_as_unreadable(
+            "AC-1",
+            RENAMED_SESSION_FRACTION_FIELD,
+            &SESSION_WINDOW_NAMES,
+        );
+    }
+
+    /// AC-2, "a non-numeric fraction is an error": a `utilization` that is a JSON string yields
+    /// no fraction, so the window is unreadable and the reply is rejected naming the session
+    /// window. RED at `1ced489`: `Ok`, the session window `None`.
+    #[test]
+    fn a_non_numeric_utilization_is_an_unreadable_session_window() {
+        assert_rejected_as_unreadable(
+            "AC-2",
+            NON_NUMERIC_SESSION_UTILIZATION,
+            &SESSION_WINDOW_NAMES,
+        );
+    }
+
+    /// AC-3, "a `limits[]` entry without `percent` is an error": a matching `limits[]` entry
+    /// exists and none yields a fraction, so the window is unreadable and the reply is rejected
+    /// naming the session window. RED at `1ced489`: `Ok`, the session window `None`.
+    #[test]
+    fn a_limits_session_entry_without_a_percent_is_an_unreadable_session_window() {
+        assert_rejected_as_unreadable(
+            "AC-3",
+            LIMITS_SESSION_ENTRY_WITHOUT_A_PERCENT,
+            &SESSION_WINDOW_NAMES,
+        );
+    }
+
+    /// AC-4, "the weekly window gets the same rule": a `seven_day` object with its fraction
+    /// under a renamed field is unreadable, so the reply is rejected naming the weekly window,
+    /// whatever the (readable) session window is. RED at `1ced489`: `Ok`, the weekly window
+    /// `None`.
+    #[test]
+    fn a_seven_day_object_without_a_fraction_is_an_unreadable_weekly_window() {
+        assert_rejected_as_unreadable(
+            "AC-4",
+            SEVEN_DAY_OBJECT_WITHOUT_A_FRACTION,
+            &WEEKLY_WINDOW_NAMES,
+        );
+    }
+
+    /// Asserts AC-5's served reading on `body`: `Ok`, the session window `None` with no session
+    /// reset stamp and no session severity, and the weekly window within `1e-9` of `0.90`.
+    fn assert_incident_reply_is_served(criterion: &str, body: &str) {
+        let report = parse_usage(body).unwrap_or_else(|err| {
+            panic!("{criterion}: the incident reply must parse Ok, got {err:?}")
+        });
+        assert_eq!(
+            report.session, None,
+            "{criterion}: session window — absent, so None"
+        );
+        assert_eq!(
+            report.session_resets_at, None,
+            "{criterion}: session window — an absent window has no reset stamp"
+        );
+        assert_eq!(
+            report.session_severity, None,
+            "{criterion}: session window — an absent window has no severity"
+        );
+        assert!(
+            report
+                .weekly
+                .is_some_and(|fraction| (fraction - 0.90).abs() < 1e-9),
+            "{criterion}: weekly window — expected Some(0.90) within 1e-9, got {:?}",
+            report.weekly
+        );
+    }
+
+    /// AC-5, "an absent window is still served, so the incident reply still parses": `five_hour`
+    /// JSON `null` with no session entry is absent, not unreadable, so the reply is served with
+    /// the session window `None` and the weekly window read. A guard: GREEN at `1ced489`, where
+    /// an absent session window is served (#1596), and it owes no RED; it guards the Answer 2
+    /// cost of blinding a healthy account.
+    #[test]
+    fn the_incident_reply_with_a_null_five_hour_is_still_served_without_a_session_window() {
+        assert_incident_reply_is_served("AC-5", INCIDENT_REPLY_WITH_A_NULL_FIVE_HOUR);
+    }
+
+    /// AC-5's second half, "the same holds with the `five_hour` key removed": a missing key is
+    /// the same absent window (decision D2). The body is the first one with exactly the
+    /// `"five_hour":null,` member removed. A guard: GREEN at `1ced489`, and it owes no RED.
+    #[test]
+    fn the_incident_reply_with_no_five_hour_key_is_still_served_without_a_session_window() {
+        assert_eq!(
+            INCIDENT_REPLY_WITHOUT_A_FIVE_HOUR_KEY,
+            INCIDENT_REPLY_WITH_A_NULL_FIVE_HOUR.replacen("\"five_hour\":null,", "", 1),
+            "AC-5: the two bodies differ in exactly the one member"
+        );
+        assert_incident_reply_is_served("AC-5", INCIDENT_REPLY_WITHOUT_A_FIVE_HOUR_KEY);
+    }
+
+    /// AC-6, "an unreadable window is never served as a one-window account": the session window
+    /// is absent and the weekly window is unreadable, so the reply is rejected naming the weekly
+    /// window, never served as a session-less weekly reading, and (the strict reading of AC-6
+    /// recorded on #1614, comment 6626995098) never with D1's windowless text, which is exact
+    /// only for a body with no window at all. RED at `1ced489`: `Err(UsageParse("no quota window
+    /// (neither five_hour nor seven_day)"))`, D1's text, which passes the name check because it
+    /// contains `seven_day` and fails both checks that exclude D1's text: it contains
+    /// `no quota window`, and it names the session window (`five_hour`) as well.
+    #[test]
+    fn an_unreadable_weekly_window_beside_an_absent_session_window_is_rejected_not_served_one_windowed(
+    ) {
+        assert_rejected_as_unreadable(
+            "AC-6",
+            NULL_FIVE_HOUR_BESIDE_AN_UNREADABLE_SEVEN_DAY,
+            &WEEKLY_WINDOW_NAMES,
+        );
+    }
+
+    /// AC-7, "the error carries no response bytes": the reply with a sentinel in its unreadable
+    /// session `utilization` is rejected (`Err(UsageParse)`, as AC-2 says of the same shape), and
+    /// neither the error's `Display` text nor its `Debug` text contains the sentinel, as the
+    /// `Error::UsageParse` contract already requires. The criterion owes no RED proof of its
+    /// own, but the `Err` it inspects is AC-2's: at `1ced489` the body parses `Ok`, so a test
+    /// that read the text only on an `Err` would pass vacuously. RED at `1ced489`: `Ok`.
+    #[test]
+    fn the_unreadable_window_error_carries_no_response_bytes() {
+        match parse_usage(SESSION_UTILIZATION_CARRYING_A_SENTINEL) {
+            Err(err @ Error::UsageParse(_)) => {
+                let display = err.to_string();
+                assert!(
+                    !display.contains("ZZ-SENTINEL-77"),
+                    "AC-7: the error's Display text carries response bytes: {display:?}"
+                );
+                let debug = format!("{err:?}");
+                assert!(
+                    !debug.contains("ZZ-SENTINEL-77"),
+                    "AC-7: the error's Debug text carries response bytes: {debug:?}"
+                );
+            }
+            other => panic!("AC-7: expected UsageParse carrying no response bytes, got {other:?}"),
+        }
+    }
+
+    /// AC-8's first half, "a readable `limits[]` entry still rescues an unreadable top-level
+    /// value": selection is today's, so a readable `limits[]` session entry is the session
+    /// window beside an unreadable `five_hour` object, and the reply is served with the session
+    /// fraction `0.42`. A guard: GREEN at `1ced489` (`dimension` already falls through to
+    /// `limits[]`), and it owes no RED.
+    #[test]
+    fn a_readable_limits_session_entry_rescues_an_unreadable_five_hour_object() {
+        let report = parse_usage(UNREADABLE_FIVE_HOUR_OBJECT_RESCUED_BY_A_LIMITS_SESSION_ENTRY)
+            .unwrap_or_else(|err| panic!("AC-8: the rescued reply must parse Ok, got {err:?}"));
+        assert!(
+            report
+                .session
+                .is_some_and(|fraction| (fraction - 0.42).abs() < 1e-9),
+            "AC-8: session window — expected Some(0.42) within 1e-9 from the limits[] entry, got {:?}",
+            report.session
+        );
+    }
+
+    /// AC-8's second half, the sub-point as the council ruled it: a `five_hour` object whose
+    /// `utilization` is JSON `null` is present but unreadable, because the object is there,
+    /// with a reset stamp, and its fraction is not, and invariant I-1 forbids reading a stamp
+    /// beside no number as a window the account lacks. So the reply is rejected naming the
+    /// session window, never served in AC-5's form. RED at `1ced489`: `Ok`, the session window
+    /// `None`.
+    #[test]
+    fn the_sub_point_body_a_null_utilization_beside_a_reset_stamp_is_present_but_unreadable() {
+        assert_rejected_as_unreadable(
+            "AC-8 (the sub-point)",
+            NULL_UTILIZATION_BESIDE_A_RESET_STAMP,
+            &SESSION_WINDOW_NAMES,
+        );
+    }
+
+    /// Derived from "`parse_usage` returns `Err(Error::UsageParse(message))` when either window
+    /// is unreadable, whatever the other window is" (the issue, Behaviour under Answer 2): an
+    /// unreadable session window beside an ABSENT weekly window is rejected naming the session
+    /// window, and not with D1 (a)'s windowless text, "which becomes exact for every body that
+    /// reaches it" (the ruling): this body carries a window, so it never reaches that guard.
+    /// RED at `1ced489`: `Err(UsageParse("no quota window (neither five_hour nor seven_day)"))`,
+    /// D1's text, which passes the name check because it contains `five_hour` and fails both
+    /// checks that exclude D1's text: it contains `no quota window`, and it names the weekly
+    /// window (`seven_day`) as well.
+    #[test]
+    fn an_unreadable_session_window_beside_an_absent_weekly_window_is_rejected_naming_the_session_window(
+    ) {
+        assert_rejected_as_unreadable(
+            "derived: unreadable session beside an absent weekly",
+            UNREADABLE_SESSION_BESIDE_NO_WEEKLY_WINDOW,
+            &SESSION_WINDOW_NAMES,
+        );
+    }
+
+    /// Derived from the same two sentences: with both windows unreadable the reply is rejected,
+    /// the message names a window ("The message names the window"), and it is not D1 (a)'s
+    /// windowless text, which is exact only for a body with no window at all. Which of the two
+    /// windows the message names first is not decided, so either is accepted. RED at `1ced489`:
+    /// `Err(UsageParse("no quota window (neither five_hour nor seven_day)"))`, D1's text, which
+    /// fails the wording check, since it contains `no quota window`. With both windows unreadable
+    /// a message may name both, so the other-window check is empty here and the wording check
+    /// alone excludes D1's text.
+    #[test]
+    fn two_unreadable_windows_are_rejected_without_the_windowless_text() {
+        assert_rejected_as_unreadable(
+            "derived: two unreadable windows",
+            TWO_UNREADABLE_WINDOWS,
+            &EITHER_WINDOW_NAMES,
+        );
+    }
+
+    /// Derived from "Absent: the top-level key is missing or JSON `null`, and no `limits[]` entry
+    /// has a matching `kind`" and "Unreadable: ... a matching `limits[]` entry exists and none
+    /// has a numeric `percent`" (the issue, Behaviour under Answer 2): a JSON-`null` `five_hour`
+    /// beside a matching `limits[]` session entry with no fraction is not absent (an entry
+    /// matches) and not readable (no fraction), so it is unreadable and the reply is rejected
+    /// naming the session window. RED at `1ced489`: `Ok`, the session window `None`.
+    #[test]
+    fn a_null_five_hour_beside_a_limits_session_entry_without_a_fraction_is_present_but_unreadable()
+    {
+        assert_rejected_as_unreadable(
+            "derived: null five_hour beside a fractionless session entry",
+            NULL_FIVE_HOUR_BESIDE_A_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION,
+            &SESSION_WINDOW_NAMES,
+        );
+    }
+
+    /// Derived from "Unreadable: ... a present, non-null top-level value with no numeric
+    /// `utilization` or `percent` (and no readable `limits[]` entry)" (the issue, Behaviour under
+    /// Answer 2): a `five_hour` that is a number, a string, an array or a boolean is present and
+    /// non-null and has no such field, so it is unreadable and the reply is rejected naming the
+    /// session window, for each of the four. RED at `1ced489`: `Ok` on the first body, the
+    /// session window `None`.
+    #[test]
+    fn a_non_object_five_hour_value_is_present_but_unreadable() {
+        for (shape, body) in NON_OBJECT_FIVE_HOUR_VALUES {
+            assert_rejected_as_unreadable(
+                &format!("derived: five_hour is {shape}"),
+                body,
+                &SESSION_WINDOW_NAMES,
+            );
+        }
+    }
+
+    /// Derived from "Unreadable: ... a matching `limits[]` entry exists and none has a numeric
+    /// `percent`" (the issue, Behaviour under Answer 2), which does not condition on
+    /// `is_active`: an inactive matching entry with no fraction, and nothing else for the
+    /// session window, is unreadable, so the reply is rejected naming the session window. RED
+    /// at `1ced489`: `Ok`, the session window `None`.
+    #[test]
+    fn an_inactive_limits_session_entry_without_a_fraction_and_nothing_else_is_present_but_unreadable(
+    ) {
+        assert_rejected_as_unreadable(
+            "derived: an inactive fractionless session entry alone",
+            INACTIVE_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION_ALONE,
+            &SESSION_WINDOW_NAMES,
+        );
+    }
+
+    /// Derived from "Selection among a top-level object and `limits[]` entries is exactly
+    /// today's: a readable top-level object wins" (the issue, Behaviour under Answer 2): a
+    /// readable `five_hour` object is the session window, and a matching `limits[]` entry with
+    /// no fraction beside it neither replaces it nor makes the window unreadable. A guard: GREEN
+    /// at `1ced489` (the top-level object is read first), and it owes no RED; it detects a fix
+    /// that scans `limits[]` for unreadable entries after a readable top-level read.
+    #[test]
+    fn a_readable_five_hour_object_wins_over_a_limits_session_entry_without_a_fraction() {
+        let report =
+            parse_usage(READABLE_FIVE_HOUR_BESIDE_A_LIMITS_SESSION_ENTRY_WITHOUT_A_FRACTION)
+                .unwrap_or_else(|err| {
+                    panic!("derived: a readable top-level object wins, expected Ok, got {err:?}")
+                });
+        assert!(
+            report
+                .session
+                .is_some_and(|fraction| (fraction - 0.42).abs() < 1e-9),
+            "derived: session window — expected Some(0.42) from the top-level object, got {:?}",
+            report.session
+        );
+    }
+
+    /// Derived from "Readable: a fraction was found ... otherwise an active matching `limits[]`
+    /// entry" and from "Unreadable: ... a matching `limits[]` entry exists and NONE has a numeric
+    /// `percent`" (the issue, Behaviour under Answer 2): with two matching session entries, the
+    /// first without a fraction and the second with one, a fraction was found, so the window is
+    /// readable and the reply is served with the session fraction `0.42`. A guard: GREEN at
+    /// `1ced489` (the fractionless entry is skipped), and it owes no RED; it detects a fix that
+    /// rejects at the first fractionless matching entry.
+    #[test]
+    fn a_readable_limits_session_entry_beside_one_without_a_fraction_is_read() {
+        let report = parse_usage(LIMITS_SESSION_ENTRIES_ONE_WITHOUT_AND_ONE_WITH_A_FRACTION)
+            .unwrap_or_else(|err| {
+                panic!("derived: one readable entry suffices, expected Ok, got {err:?}")
+            });
+        assert!(
+            report
+                .session
+                .is_some_and(|fraction| (fraction - 0.42).abs() < 1e-9),
+            "derived: session window — expected Some(0.42) from the readable entry, got {:?}",
+            report.session
+        );
+    }
+
+    /// Derived from "Unreadable: ... a matching `limits[]` entry exists and none has a numeric
+    /// `percent`" (the issue, Behaviour under Answer 2), the weekly counterpart of AC-3: a
+    /// `weekly_all` entry with no fraction, the reply's only weekly carrier, makes the weekly
+    /// window one the reply carries but cannot read, so the reply is rejected naming the weekly
+    /// window although its session window is readable. It fails on a weekly carrier check that
+    /// drops the weekly kinds, `carries_window(&root, "seven_day", &[])`, and on a
+    /// `carries_window` that returns `false`: each serves this reply `Ok`.
+    #[test]
+    fn a_limits_weekly_entry_without_a_fraction_is_an_unreadable_weekly_window() {
+        assert_rejected_as_unreadable(
+            "derived: a fractionless weekly_all entry",
+            LIMITS_WEEKLY_ENTRY_WITHOUT_A_FRACTION,
+            &WEEKLY_WINDOW_NAMES,
+        );
+    }
+
+    /// Derived from the same sentence and from "Absent: the top-level key is missing or JSON
+    /// `null`, and no `limits[]` entry has a matching `kind`": a JSON-`null` `seven_day` beside
+    /// a matching `weekly_all` entry with no fraction is not absent (an entry matches) and not
+    /// readable (no fraction), so it is unreadable and the reply is rejected naming the weekly
+    /// window. It fails on the same two carrier checks as the test above.
+    #[test]
+    fn a_null_seven_day_beside_a_limits_weekly_entry_without_a_fraction_is_unreadable() {
+        assert_rejected_as_unreadable(
+            "derived: null seven_day beside a fractionless weekly_all entry",
+            NULL_SEVEN_DAY_BESIDE_A_LIMITS_WEEKLY_ENTRY_WITHOUT_A_FRACTION,
+            &WEEKLY_WINDOW_NAMES,
+        );
+    }
+
+    /// Derived from "Unreadable: ... a present, non-null top-level value with no numeric
+    /// `utilization` or `percent` (and no readable `limits[]` entry)": a `seven_day` that is a
+    /// number, a string, an array or a boolean is present and non-null and has no such field,
+    /// so it is unreadable and the reply is rejected naming the weekly window, for each of the
+    /// four, although its session window is readable. The top-level value, not a weekly kind,
+    /// makes the reply carry the window, so dropping the weekly kinds cannot fail this test; a
+    /// `carries_window` that returns `false` fails it, serving the reply `Ok`.
+    #[test]
+    fn a_non_object_seven_day_value_is_present_but_unreadable() {
+        for (shape, body) in NON_OBJECT_SEVEN_DAY_VALUES {
+            assert_rejected_as_unreadable(
+                &format!("derived: seven_day is {shape}"),
+                body,
+                &WEEKLY_WINDOW_NAMES,
+            );
+        }
+    }
+
+    /// Derived, the weekly counterpart of AC-8's first half, "a readable `limits[]` entry still
+    /// rescues an unreadable top-level value": a readable `weekly_all` entry is the weekly window
+    /// beside an unreadable `seven_day` object, and the reply is served with the weekly fraction
+    /// `0.90`. A guard, which owes no RED; it fails on a parser that rejects an unreadable
+    /// top-level `seven_day` value without first reading `limits[]`.
+    #[test]
+    fn a_readable_limits_weekly_entry_rescues_an_unreadable_seven_day_object() {
+        let report = parse_usage(UNREADABLE_SEVEN_DAY_OBJECT_RESCUED_BY_A_LIMITS_WEEKLY_ENTRY)
+            .unwrap_or_else(|err| panic!("derived: the rescued reply must parse Ok, got {err:?}"));
+        assert!(
+            report
+                .weekly
+                .is_some_and(|fraction| (fraction - 0.90).abs() < 1e-9),
+            "derived: weekly window — expected Some(0.90) within 1e-9 from the limits[] entry, got {:?}",
+            report.weekly
+        );
+    }
+
+    /// The bodies this block declares are well-formed JSON objects carrying quota fields only,
+    /// the scan #1592's `no_fixture_body_carries_an_identity_field` runs over the frozen
+    /// fixtures. A guard, so a test above that fails never fails on a malformed body.
+    #[test]
+    fn the_unreadable_window_bodies_carry_only_quota_fields() {
+        for (name, body) in UNREADABLE_WINDOW_BODIES {
+            let root: Value = serde_json::from_str(body)
+                .unwrap_or_else(|err| panic!("{name} is not well-formed JSON: {err}"));
+            assert!(root.is_object(), "{name} is not a JSON object: {body}");
+            assert!(!body.contains('@'), "{name}: an `@` in {body}");
+            let lowered = body.to_ascii_lowercase();
+            for needle in IDENTITY_FIELD_NEEDLES {
+                assert!(!lowered.contains(needle), "{name}: `{needle}` in {body}");
             }
         }
     }
