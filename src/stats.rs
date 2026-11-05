@@ -328,6 +328,14 @@ struct Report {
     /// [`build_report`] had the CONFIGURED roster, `false` when it did not and the census
     /// degraded to whoever held samples in the period.
     ///
+    /// Under either regime the set leaves out every account none of whose in-period samples
+    /// carries a session reading (decision D5): a structurally absent session window is excluded
+    /// from the session census, it is not an unobserved reading. So `true` names the roster's
+    /// session-bearing accounts; the flag's wire value, and its meaning for a roster-less read,
+    /// are unchanged. A rostered account with no in-period samples at all is not left out: it
+    /// stays in the set and empties the intersection, because unobserved is not the same as no
+    /// window.
+    ///
     /// Issue #804 introduced the two regimes and they are NOT interchangeable — under the
     /// fallback an unsampled account silently leaves the intersection, which is the one
     /// direction REQ-STA-B-005's amendment forbids. That amendment is narrow, and the flag is
@@ -375,8 +383,9 @@ struct AccountVelocity {
     /// reuses the identical definition, not a divergent one). `None` on the same cases.
     weekly_rate: Option<f64>,
     /// Approximate whole seconds until the session reading reaches `session_ceiling` at the
-    /// smoothed rate: `(ceiling − current) / rate`. `None` when the rate is unknown or `0`, or
-    /// the reading is already at/over the ceiling (no positive head-room to state as a fact), or
+    /// smoothed rate: `(ceiling − current) / rate`. `None` when the rate is unknown or `0`, when
+    /// the latest reading carries no value on this dimension, when the reading is already at/over
+    /// the ceiling (no positive head-room to state as a fact), or
     /// the quotient is not PLAUSIBLE — past one rolling session window
     /// ([`SESSION_RUNWAY_PLAUSIBLE_MAX_SECS`], issue #1075).
     session_runway_secs: Option<i64>,
@@ -387,8 +396,9 @@ struct AccountVelocity {
     weekly_runway_secs: Option<i64>,
     /// The account's remaining WEEKLY head-room as a usage fraction — `max(0, weekly_ceiling −
     /// latest weekly reading)` — the pool contribution the fleet aggregate (issue #544) sums. `Some`
-    /// EXACTLY when [`Self::weekly_rate`] is `Some` (a KNOWN weekly velocity), so head-room is
-    /// recorded only for an account whose burn is also known: a KNOWN-zero (flat, measured) account
+    /// EXACTLY when [`Self::weekly_rate`] is `Some` (a KNOWN weekly velocity) and the latest
+    /// reading carries a weekly value to measure from, so head-room is recorded only for an
+    /// account whose burn is also known: a KNOWN-zero (flat, measured) account
     /// keeps a `Some` head-room (real spare capacity, `0` burn), while an unknown / stale account is
     /// `None` and excluded from the aggregate — [`fleet_runway`] owns why. Distinct from
     /// [`Self::weekly_runway_secs`], which is `None` for a flat account even though its head-room is
@@ -954,8 +964,8 @@ fn replay_velocity_ema(series: &[(i64, f64)], alpha: f64) -> Option<f64> {
 /// Sharing the weekly bound here would wave absurd session figures straight through: 7 days is
 /// 33.6 session windows, so a 3-day "session runway" — asserting ~14 intervening resets — would
 /// pass it. The converse fails just as badly: bounding the weekly arm at 5 hours would refuse
-/// nearly every legitimate weekly runway. One bound for both dimensions is a wrong answer even
-/// where the arithmetic is right.
+/// nearly every legitimate weekly runway. One bound shared across dimensions is a wrong answer
+/// even where the arithmetic is right; each dimension an account's readings carry takes its own.
 ///
 /// The window ROLLS; usage does not drain continuously inside it. Those are separate claims, and
 /// only the first is the crate's. [`crate::swap::SessionHighWater`] (issue #614, calibrated over
@@ -1057,12 +1067,18 @@ fn runway_secs(
 }
 
 /// The per-account velocity + runway readout (issue #543) for `handle`, computed over its
-/// in-window samples. Both dimensions' rates come from [`replay_velocity_ema`] (the #539 recipe);
-/// each runway is [`runway_secs`] from the account's LATEST in-window reading to its trigger.
+/// in-window samples. Each dimension's rate — for every dimension the account's readings carry;
+/// an absent dimension has no rate — comes from [`replay_velocity_ema`] (the #539 recipe), over
+/// the readings that carry that dimension. Each runway is [`runway_secs`] from the account's
+/// LATEST in-window reading to its trigger, and is unknown when that reading does not carry the
+/// dimension.
 /// Returns the all-`None` default (honest degradation) when the account has no in-window reading,
 /// or its latest reading is STALE — older than the aggregator's forward-coverage horizon before
-/// the window end (the daemon stopped polling / an idle or blind account) — so a no-longer-current
-/// reading never backs a velocity or a fabricated runway.
+/// the window end (the daemon stopped polling / an idle or blind account) — so an account whose
+/// latest reading is no longer current backs no velocity and no fabricated runway. That staleness
+/// test is the ACCOUNT's latest reading, whichever dimensions it carries: a dimension's rate may
+/// stand on readings older than that one, which is how a window that disappeared mid-series keeps
+/// the rate its present readings gave while its runway, taken from the latest reading, is unknown.
 ///
 /// This is a faithful re-application of #539's rate DEFINITION over the STORED series, NOT a
 /// reconstruction of the daemon's transient in-memory EMA (an offline reader cannot see that). The
@@ -1093,33 +1109,52 @@ fn account_velocity(
     if window.end - last.ts > params.stale_after_secs {
         return AccountVelocity::default();
     }
-    let session_series: Vec<(i64, f64)> = rows.iter().map(|s| (s.ts, s.session)).collect();
-    let weekly_series: Vec<(i64, f64)> = rows.iter().map(|s| (s.ts, s.weekly)).collect();
+    // Each dimension's series holds the readings that carry it: a reading with no session (or
+    // weekly) window is no point on that dimension's series, and never a zero on it.
+    let session_series: Vec<(i64, f64)> = rows
+        .iter()
+        .filter_map(|s| s.session.map(|v| (s.ts, v)))
+        .collect();
+    let weekly_series: Vec<(i64, f64)> = rows
+        .iter()
+        .filter_map(|s| s.weekly.map(|v| (s.ts, v)))
+        .collect();
     let session_rate = replay_velocity_ema(&session_series, vparams.session_ema_alpha);
     let weekly_rate = replay_velocity_ema(&weekly_series, vparams.session_ema_alpha);
+    // A runway, and the head-room, start from the LATEST reading, so each exists only for a
+    // dimension that reading carries.
+    let session_now = last.session;
+    let weekly_now = last.weekly;
     AccountVelocity {
         session_rate,
         weekly_rate,
         // Each arm carries its OWN dimension's plausibility bound (issue #1075) — the session
         // quota resets every rolling 5 h and the weekly one every ~7 days, so one shared bound
         // would either wave through absurd session figures or refuse legitimate weekly ones.
-        session_runway_secs: runway_secs(
-            session_rate,
-            last.session,
-            vparams.session_ceiling,
-            SESSION_RUNWAY_PLAUSIBLE_MAX_SECS,
-        ),
-        weekly_runway_secs: runway_secs(
-            weekly_rate,
-            last.weekly,
-            vparams.weekly_ceiling,
-            WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS,
-        ),
+        session_runway_secs: session_now.and_then(|current| {
+            runway_secs(
+                session_rate,
+                current,
+                vparams.session_ceiling,
+                SESSION_RUNWAY_PLAUSIBLE_MAX_SECS,
+            )
+        }),
+        weekly_runway_secs: weekly_now.and_then(|current| {
+            runway_secs(
+                weekly_rate,
+                current,
+                vparams.weekly_ceiling,
+                WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS,
+            )
+        }),
         // The pool contribution for the fleet aggregate (issue #544): raw weekly head-room from the
         // SAME latest reading and trigger the weekly runway uses, recorded ONLY when the weekly
-        // velocity is known (so an unknown / stale account contributes neither head-room nor burn).
+        // velocity is known (so an unknown / stale account contributes neither head-room nor burn)
+        // and the latest reading carries a weekly value to measure the head-room from.
         // Clamped at `0` — an over-trigger account is exhausted (no spare capacity), never negative.
-        weekly_headroom: weekly_rate.map(|_| (vparams.weekly_ceiling - last.weekly).max(0.0)),
+        weekly_headroom: weekly_rate
+            .zip(weekly_now)
+            .map(|(_, current)| (vparams.weekly_ceiling - current).max(0.0)),
     }
 }
 
@@ -5540,6 +5575,22 @@ mod tests {
         Sample::new(ts, "claude", acct, Some(session), Some(weekly))
     }
 
+    /// A usage [`Sample`] decoded from the JSON line the store holds for it, so a reading can carry
+    /// `null` for a window the account lacks (issue #1600). A test about an absent window builds
+    /// EVERY sample it reads here, the present readings too: the line decodes on a tree whose
+    /// `Sample` can say `null`, and fails to decode, failing the test at its setup, on one that
+    /// cannot.
+    fn sample_from_line(ts: i64, acct: &str, session: Option<f64>, weekly: Option<f64>) -> Sample {
+        serde_json::from_value(serde_json::json!({
+            "ts": ts,
+            "provider": "claude",
+            "acct": acct,
+            "session": session,
+            "weekly": weekly,
+        }))
+        .expect("a store line carrying `null` for an absent window must decode")
+    }
+
     /// A `StoreData` from samples + event-log text (empty rollup).
     fn data(samples: Vec<Sample>, events: &str) -> StoreData {
         StoreData {
@@ -6813,6 +6864,48 @@ mod tests {
         );
     }
 
+    /// Issue #1600, decision D5, with no roster known: the census degrades to the SAMPLED accounts,
+    /// and of those to the ones that have a session window. `a` is weekly-only across the window,
+    /// so `b` alone decides the census.
+    #[test]
+    fn without_a_known_roster_the_all_high_census_is_over_the_sampled_accounts_that_have_a_session_window(
+    ) {
+        let now = epoch("2026-07-01T12:00:00Z");
+        let store = data(
+            vec![
+                sample_from_line(now - 600, "a", None, Some(0.40)),
+                sample_from_line(now - 300, "a", None, Some(0.40)),
+                sample_from_line(now - 600, "b", Some(0.98), Some(0.40)),
+                sample_from_line(now - 300, "b", Some(0.98), Some(0.40)),
+            ],
+            "",
+        );
+        let window = plan_window(Some("day"), None, now, &store).unwrap();
+        let report = build_report(
+            &store,
+            window,
+            vec![],
+            None,
+            &AggregateParams::new(300, 0.80, 0.95),
+            0,
+        );
+        assert!(
+            !report.census_over_roster,
+            "T9: no roster is known, so the census is over the sampled accounts"
+        );
+        let roster = &report.summary.roster;
+        assert_eq!(
+            roster.all_high_episodes, 1,
+            "T9: `b` was high across its readings, and `a` has no session window to be high or \
+             low on"
+        );
+        assert_eq!(roster.all_high_secs, 600, "T9: the episode spans both");
+        assert_eq!(
+            roster.all_high_covered_secs, 600,
+            "T9: the census was measured over `b`'s covered seconds"
+        );
+    }
+
     #[test]
     fn the_cli_run_path_wires_the_regime_all_the_way_to_the_human_render() {
         // The CLI's OWN call site, not just the seam it calls — the human-render sibling of
@@ -7555,6 +7648,42 @@ mod tests {
         );
     }
 
+    /// Issue #1600: a session series that mixes absent and present readings replays its EMA over
+    /// the PRESENT readings only. An absent reading is not a drop to zero, so it neither re-seeds
+    /// the EMA nor enters an interval.
+    #[test]
+    fn a_mixed_session_series_replays_its_ema_over_the_present_readings_only() {
+        let now = epoch("2026-07-01T12:00:00Z");
+        let session = [
+            None,
+            Some(0.10),
+            None,
+            Some(0.20),
+            None,
+            Some(0.30),
+            Some(0.40),
+        ];
+        let samples: Vec<Sample> = session
+            .iter()
+            .enumerate()
+            .map(|(k, &s)| sample_from_line(now - 2100 + 300 * k as i64, "work", s, Some(0.50)))
+            .collect();
+        let report = velocity_report(samples, now);
+        let v = report.velocity.get("work").expect("a readout");
+        let rate = v
+            .session_rate
+            .expect("T11: the four present readings give a session rate");
+        assert!(
+            (rate - 2.5e-4).abs() < 1e-12,
+            "T11: the EMA over the four present points, elapsed 600 s, 600 s and 300 s: {rate}"
+        );
+        assert_eq!(
+            v.session_runway_secs,
+            Some(1600),
+            "T11: the runway from the present latest reading, 0.40"
+        );
+    }
+
     #[test]
     fn weekly_runway_renders_in_days_when_it_is_meaningful() {
         // Session climbs (as above → ~2h), weekly climbs slowly +0.001/interval → 0.001/300 frac/s;
@@ -7623,6 +7752,74 @@ mod tests {
         );
     }
 
+    /// Issue #1600: an account whose readings carry no session value has NO session velocity and no
+    /// session runway — never the measured-flat `0.0` — while its weekly velocity, runway and
+    /// head-room are known from the weekly readings.
+    #[test]
+    fn a_weekly_only_account_has_no_session_velocity_and_a_weekly_one() {
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample_from_line(now - 1200, "work", None, Some(0.40)),
+                sample_from_line(now - 900, "work", None, Some(0.41)),
+                sample_from_line(now - 600, "work", None, Some(0.42)),
+                sample_from_line(now - 300, "work", None, Some(0.43)),
+            ],
+            now,
+        );
+        let v = report.velocity.get("work").expect("a readout");
+        assert_eq!(
+            v.session_rate, None,
+            "T6: no session reading, so no session rate"
+        );
+        assert_eq!(v.session_runway_secs, None, "T6: and no session runway");
+        assert!(v.weekly_rate.is_some(), "T6: the weekly rate is known");
+        assert!(
+            v.weekly_runway_secs.is_some(),
+            "T6: the weekly runway is known"
+        );
+        assert!(
+            v.weekly_headroom.is_some(),
+            "T6: the weekly head-room is known"
+        );
+    }
+
+    /// Issue #1600, the weekly twin of the test above: an account whose readings carry no weekly
+    /// value has no weekly velocity, runway or head-room, and its session velocity and runway are
+    /// known from the session readings.
+    #[test]
+    fn a_session_only_account_has_no_weekly_velocity_and_a_session_one() {
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample_from_line(now - 1200, "work", Some(0.10), None),
+                sample_from_line(now - 900, "work", Some(0.20), None),
+                sample_from_line(now - 600, "work", Some(0.30), None),
+                sample_from_line(now - 300, "work", Some(0.40), None),
+            ],
+            now,
+        );
+        let v = report.velocity.get("work").expect("a readout");
+        assert_eq!(
+            v.weekly_rate, None,
+            "T15: no weekly reading, so no weekly rate"
+        );
+        assert_eq!(v.weekly_runway_secs, None, "T15: and no weekly runway");
+        assert_eq!(v.weekly_headroom, None, "T15: and no weekly head-room");
+        let rate = v
+            .session_rate
+            .expect("T15: the four session readings give a session rate");
+        assert!(
+            (rate - 1.0 / 3000.0).abs() < 1e-12,
+            "T15: three steady intervals of +0.10 per 300 s: {rate}"
+        );
+        assert_eq!(
+            v.session_runway_secs,
+            Some(1200),
+            "T15: the runway from the latest reading, 0.40"
+        );
+    }
+
     #[test]
     fn too_few_samples_leave_the_velocity_unknown_and_the_wire_field_absent() {
         // A single reading cannot form even one interval → the velocity is unknown. The human band
@@ -7686,6 +7883,83 @@ mod tests {
         assert!(
             work.get("velocity").is_none(),
             "a stale velocity omits the wire object: {work}"
+        );
+    }
+
+    /// Issue #1600: when the latest reading carries no session value after ones that did, the
+    /// session RATE stands, from the present readings, and the session RUNWAY is unknown — a
+    /// runway is stated from a present latest reading, never from a fabricated `0 %`.
+    #[test]
+    fn an_account_whose_session_window_vanished_mid_window_has_a_session_rate_but_no_session_runway(
+    ) {
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample_from_line(now - 1200, "work", Some(0.10), Some(0.40)),
+                sample_from_line(now - 900, "work", Some(0.20), Some(0.41)),
+                sample_from_line(now - 600, "work", Some(0.30), Some(0.42)),
+                sample_from_line(now - 300, "work", None, Some(0.43)),
+            ],
+            now,
+        );
+        let v = report.velocity.get("work").expect("a readout");
+        let rate = v
+            .session_rate
+            .expect("T12: the three present readings give a session rate");
+        assert!(
+            (rate - 1.0 / 3000.0).abs() < 1e-12,
+            "T12: two intervals of +0.10 per 300 s, blended: {rate}"
+        );
+        assert_eq!(
+            v.session_runway_secs, None,
+            "T12: no session runway without a present latest session reading"
+        );
+        assert!(v.weekly_rate.is_some(), "T12: the weekly rate is known");
+        assert!(
+            v.weekly_runway_secs.is_some(),
+            "T12: the weekly runway is known"
+        );
+        assert!(
+            v.weekly_headroom.is_some(),
+            "T12: the weekly head-room is known"
+        );
+    }
+
+    /// Issue #1600, the weekly twin of the test above: the weekly rate stands on the three present
+    /// weekly readings, but the latest reading carries no weekly window, so neither the weekly
+    /// runway nor the weekly head-room exists. A fabricated `0 %` there would state a whole
+    /// ceiling of spare capacity and pool it into the fleet runway.
+    #[test]
+    fn an_account_whose_weekly_window_vanished_mid_window_has_a_weekly_rate_but_no_weekly_runway_or_headroom(
+    ) {
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample_from_line(now - 1200, "work", Some(0.10), Some(0.40)),
+                sample_from_line(now - 900, "work", Some(0.20), Some(0.41)),
+                sample_from_line(now - 600, "work", Some(0.30), Some(0.42)),
+                sample_from_line(now - 300, "work", Some(0.40), None),
+            ],
+            now,
+        );
+        let v = report.velocity.get("work").expect("a readout");
+        assert!(
+            v.weekly_rate.is_some(),
+            "the three present weekly readings give a weekly rate"
+        );
+        assert_eq!(
+            v.weekly_runway_secs, None,
+            "no weekly runway without a present latest weekly reading"
+        );
+        assert_eq!(
+            v.weekly_headroom, None,
+            "and no weekly head-room to pool into the fleet runway"
+        );
+        assert!(v.session_rate.is_some(), "the session rate is known");
+        assert_eq!(
+            v.session_runway_secs,
+            Some(1200),
+            "and the session runway stands on the latest reading, 0.40"
         );
     }
 
@@ -10212,6 +10486,78 @@ mod tests {
             WIRE_GOLDEN,
             "the schema:1 wire drifted — only an ADDITIVE change (a new key, as issue #804 \
              made) may move these bytes without a `schema` bump"
+        );
+    }
+
+    /// Issue #1600, the interim on the wire and in the table: under `"schema":1` an account whose
+    /// readings carry no session value serialises the all-zero `session` block, the `idle` band
+    /// and zero cap counts, and no `velocity` object; its table row reads `underused` and `0/0`,
+    /// with no `velocity` or `runway` column. Those zeros are the interim representation, not a
+    /// measurement. Issue #1601 replaces them with an omission under schema 2 and deletes this
+    /// test.
+    #[test]
+    fn an_account_with_no_session_reading_wires_the_interim_zero_block_and_no_velocity_under_schema_1(
+    ) {
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample_from_line(now - 900, "work", None, Some(0.30)),
+                sample_from_line(now - 600, "work", None, Some(0.31)),
+                sample_from_line(now - 300, "work", None, Some(0.32)),
+            ],
+            now,
+        );
+
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
+        assert_eq!(v["schema"], 1, "T8: the wire is still schema 1");
+        let work = &v["summary"]["accounts"]["work"];
+        assert_eq!(
+            work["session"],
+            serde_json::json!({"mean": 0.0, "peak": 0.0, "p95": 0.0}),
+            "T8: the interim zero session block: {work}"
+        );
+        assert_eq!(work["band"], "idle", "T8: the zero summary's band: {work}");
+        assert_eq!(work["cap_hits"], 0, "T8: no cap hit: {work}");
+        assert_eq!(
+            work["time_at_cap_secs"], 0,
+            "T8: no time at the cap: {work}"
+        );
+        assert_eq!(
+            work["weekly"]["peak"], 0.32,
+            "T8: the weekly figures are over the weekly readings: {work}"
+        );
+        assert!(
+            work.get("velocity").is_none(),
+            "T8: an unknown session rate omits the velocity object: {work}"
+        );
+
+        let table = render_chart_table(&report, &keys(&report), 120, false, false);
+        let header: Vec<&str> = table
+            .lines()
+            .next()
+            .expect("T8: the table has a header line")
+            .split_whitespace()
+            .collect();
+        assert!(
+            !header.contains(&"velocity"),
+            "T8: the all-unknown velocity column is elided: {table}"
+        );
+        assert!(
+            !header.contains(&"runway"),
+            "T8: the all-unknown runway column is elided: {table}"
+        );
+        let row: Vec<&str> = table
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some("work"))
+            .expect("T8: the table has a `work` row")
+            .split_whitespace()
+            .take(3)
+            .collect();
+        assert_eq!(
+            row,
+            ["work", "underused", "0/0"],
+            "T8: the zero summary's signal word and session cell: {table}"
         );
     }
 

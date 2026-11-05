@@ -14,8 +14,10 @@
 //!
 //! Per account, over the period:
 //!
-//! * mean / peak / p95 utilisation for BOTH quota dimensions (session + weekly),
-//!   mirroring the store's own refusal to blend the two windows into one scalar;
+//! * mean / peak / p95 utilisation per quota dimension (session, weekly), each over the
+//!   readings that carry that dimension — an account with no session window contributes to
+//!   the weekly figures and to no session figure — mirroring the store's own refusal to blend
+//!   the windows into one scalar;
 //! * `cap_hits` — samples whose session utilisation is at or above the trigger
 //!   (`session >= session_cap`, inclusive per the AC);
 //! * `time_at_cap_secs` — the sampled time spent at/above that cap;
@@ -29,9 +31,11 @@
 //! * `swap_count` + a per-reason [`SwapBreakdown`] — the swap frequency, INCLUDING the
 //!   manual `sessiometer use` verb (`reason=manual|forced`) and emergency swaps;
 //! * `all_high_episodes` + `all_high_secs` — the count and total duration of intervals
-//!   during which EVERY rostered account was simultaneously at/above the session
+//!   during which EVERY account in the census set was simultaneously at/above the session
 //!   high-water threshold: a UTILISATION CENSUS ("was the roster running hot?"), NOT a
-//!   capacity claim (issue #804 — "could the daemon still swap?" is its own fact);
+//!   capacity claim (issue #804 — "could the daemon still swap?" is its own fact). The
+//!   census set is the roster, or without one the sampled accounts, minus every sampled
+//!   account none of whose in-period samples carries a session reading (decision D5);
 //! * `all_high_covered_secs` + `high_threshold` — the census's own denominator and water,
 //!   so a reader can tell "measured, and it never happened" from "never measurable"
 //!   (issue #804) and every surface can state the threshold it actually used.
@@ -48,9 +52,9 @@
 //!   time that no metric fills (this is what drives `time_at_cap_secs`);
 //! * `coverage = seen ÷ expected` is reported per account/period so a consumer can
 //!   annotate a sparsely-sampled period rather than misread it as calm;
-//! * an all-high episode requires every rostered account to be KNOWN-and-high at the
-//!   instant — if any account has no covering sample there, the instant is UNKNOWN and
-//!   is NOT part of an episode.
+//! * an all-high episode requires every account in the census set to be KNOWN-and-high
+//!   at the instant — if any of them has no covering sample there, the instant is UNKNOWN
+//!   and is NOT part of an episode.
 //!
 //! Both CENSUSES refine that forward window rather than take it as written, because the
 //! cadence alone makes them unmeasurable in exactly the conditions they exist to report:
@@ -75,22 +79,16 @@
 //!
 //! # Units — fractions, not percents
 //!
-//! A [`Sample`]'s `session`/`weekly` are fractions in `[0.0, …]` (`1.0` = exhausted),
-//! whereas the config triggers ([`crate::config`]) are integer PERCENTS. The thresholds
+//! A [`Sample`]'s `session`/`weekly`, when present, are fractions in `[0.0, …]` (`1.0` =
+//! exhausted), whereas the config triggers ([`crate::config`]) are integer PERCENTS. The thresholds
 //! in [`AggregateParams`] are therefore FRACTIONS, in the sample's own units; the #158
 //! caller converts config percents once (e.g. via `Config::swap_threshold`) before
 //! calling in, so this module never has to reason about the mismatch.
 //!
-//! # Not-yet-wired seam
+//! # Who calls it
 //!
-//! Like [`crate::usage_store`], this module is pure data-plumbing that the binary does
-//! not call yet — the #158 `stats` verb wires [`aggregate`] to the read path and the
-//! CLI. Until then every item here is unused by the binary itself (main.rs only
-//! declares the module), hence the module-level `dead_code` allowance, mirroring the
-//! store and [`crate::migration`].
-
-// See the "Not-yet-wired seam" note above: #158 wires the CLI caller.
-#![allow(dead_code)]
+//! [`crate::stats`] is this module's one production caller: its report builder calls
+//! [`parse_swap_events`] and [`aggregate_with_roster`].
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -261,14 +259,25 @@ pub(crate) struct AccountStats {
     /// `seen ÷ expected`, clamped to `1.0`. Below 1 means the period is under-sampled
     /// for this account and its metrics should be read with that caveat.
     pub(crate) coverage: f64,
-    /// Session-dimension mean/peak/p95.
+    /// Session-dimension mean/peak/p95, over the samples that carry a session reading. An
+    /// account none of whose samples carries one holds the finite zero summary here: an INTERIM
+    /// representation, not a measurement, which issue #1601 replaces with an omission under
+    /// `JSON_SCHEMA_VERSION` 2.
     pub(crate) session: DimStats,
-    /// Weekly-dimension mean/peak/p95.
+    /// Weekly-dimension mean/peak/p95, over the samples that carry a weekly reading. An account
+    /// none of whose samples carries one holds the same interim zero summary — not a
+    /// measurement — until issue #1601 replaces it with an omission under `JSON_SCHEMA_VERSION` 2.
     pub(crate) weekly: DimStats,
-    /// Samples with `session >= session_cap` (inclusive at the boundary).
+    /// Samples whose session reading is present and `>= session_cap` (inclusive at the
+    /// boundary). The `0` of an account with no session reading is the same interim
+    /// representation as `session`'s zero summary, not a measured "never at the cap"; issue
+    /// #1601 replaces it with an omission under `JSON_SCHEMA_VERSION` 2.
     pub(crate) cap_hits: u32,
     /// Sampled seconds spent at/above the session cap — the summed forward-coverage
-    /// windows of the cap-hit samples (gap-honest: a gap adds nothing).
+    /// windows of the cap-hit samples (gap-honest: a gap adds nothing). The `0` of an account
+    /// with no session reading is the same interim representation as `cap_hits`'s, not a
+    /// measured "never at the cap"; issue #1601 replaces it with an omission under
+    /// `JSON_SCHEMA_VERSION` 2.
     ///
     /// Purely CADENCE-anchored ([`validity_windows`]) and DECIDED to stay so — unlike the two
     /// censuses, which anchor a qualifying reading to its own carried expiry. Since issue #1030
@@ -319,8 +328,10 @@ pub(crate) struct RosterStats {
     pub(crate) swap_count: u32,
     /// The `swap_count` split by reason.
     pub(crate) swaps: SwapBreakdown,
-    /// Number of maximal intervals during which every rostered account was
-    /// simultaneously KNOWN-and-at/above [`AggregateParams::high_threshold`].
+    /// Number of maximal intervals during which every account in the census set was
+    /// simultaneously KNOWN-and-at/above [`AggregateParams::high_threshold`]. The census set
+    /// is the roster, or the sampled accounts, minus every sampled account none of whose
+    /// in-period samples carries a session reading (decision D5).
     ///
     /// Meaningful ONLY alongside `all_high_covered_secs`: with no jointly-covered instant
     /// there is nothing to count, so this reads `0` for a window that was never
@@ -336,7 +347,7 @@ pub(crate) struct RosterStats {
     /// this aggregate to carry.
     ///
     /// `0` means the census was never measurable at all: no instant existed at which the
-    /// whole roster was observable, so "0 episodes" is UNKNOWN, not calm. That zero is a
+    /// whole census set was observable, so "0 episodes" is UNKNOWN, not calm. That zero is a
     /// measured quantity, not a sentinel — jointly-covered time really was nil.
     ///
     /// Measured over the SESSION-EXPIRY-ANCHORED windows since issue #1030 ([`high_windows`]):
@@ -487,7 +498,9 @@ pub(crate) fn parse_swap_events(text: &str) -> Vec<SwapEvent> {
 /// readily-firing one in general (issue #864): an unsampled rostered account cannot withhold
 /// the metric here, while an orphan handle the roster excludes IS admitted here and can end a
 /// joint hold. A caller that knows the configured roster should pass it to
-/// [`aggregate_with_roster`] instead — this is exactly that call with `None` (issue #804).
+/// [`aggregate_with_roster`] instead — this is exactly that call with `None` (issue #804). No
+/// production caller takes this roster-less form today, so only the tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn aggregate(
     samples: &[Sample],
     swaps: &[SwapEvent],
@@ -540,8 +553,11 @@ pub(crate) fn aggregate_with_roster(
 
     let mut per_account: BTreeMap<String, AccountStats> = BTreeMap::new();
     for (&acct, group) in &by_acct {
-        let session: Vec<f64> = group.iter().map(|s| s.session).collect();
-        let weekly: Vec<f64> = group.iter().map(|s| s.weekly).collect();
+        // Each dimension's figures are over the samples that carry it. A sample with no
+        // reading on a dimension still counts toward `seen`, coverage and contribution — it is
+        // an observation of the account — and toward no figure of that dimension.
+        let session: Vec<f64> = group.iter().filter_map(|s| s.session).collect();
+        let weekly: Vec<f64> = group.iter().filter_map(|s| s.weekly).collect();
         let seen = group.len() as u32;
 
         let windows = validity_windows(group, period, params.stale_after_secs);
@@ -549,7 +565,7 @@ pub(crate) fn aggregate_with_roster(
         let time_at_cap_secs = windows
             .iter()
             .zip(group.iter())
-            .filter(|(_, s)| s.session >= params.session_cap)
+            .filter(|(_, s)| s.session.is_some_and(|v| v >= params.session_cap))
             .map(|((lo, hi), _)| hi - lo)
             .sum();
 
@@ -711,10 +727,21 @@ fn swap_breakdown(swaps: &[SwapEvent], period: Period) -> SwapBreakdown {
 /// the short-circuit below trust an emptied covering intersection.
 ///
 /// The census set is `roster` when the caller knows it, else the sampled accounts (see
-/// [`aggregate_with_roster`]). A rostered account with NO samples therefore keeps its
-/// (empty) place in the intersection instead of vanishing from it. An EMPTY census set —
-/// an empty configured roster, or no samples at all under the fallback — has nothing to
-/// intersect over and yields `(0, 0, 0)`: unmeasurable, which the zero third return says.
+/// [`aggregate_with_roster`]), MINUS every account none of whose in-period samples carries a
+/// session reading. That is decision D5, recorded in
+/// `docs/adr/0033-weekly-saturated-session-low-stays-unknown.md` as amended by issue #1593 and
+/// settled by council on 2026-11-03:
+/// "a structurally absent session window is excluded from the session census: it is not an
+/// unobserved reading. The census set is the roster minus every account none of whose in-period
+/// readings carries a session reading; a reading with no session window anchors nothing and
+/// covers nothing; a rostered account with no in-period readings at all stays in the set and
+/// empties the intersection". So a rostered account with NO samples keeps its (empty) place in
+/// the intersection instead of vanishing from it — unobserved is not "no window" — and the drop
+/// is made BEFORE the intersection loop, never as a skip inside it, which would lose that rule.
+///
+/// An EMPTY census set has nothing to intersect over and yields `(0, 0, 0)`: unmeasurable, which
+/// the zero third return says. Three routes reach it: an empty configured roster, no samples at
+/// all under the fallback, and a set none of whose accounts has a session window.
 ///
 /// The third return is the intersection of every census account's COVERING intervals — the
 /// time over which the census could be taken at all. It is `0` exactly when no instant had
@@ -734,6 +761,17 @@ fn all_high(
         Some(r) => r.iter().map(String::as_str).collect(),
         None => by_acct.keys().copied().collect(),
     };
+    // D5: an account none of whose in-period samples carries a session reading has no session
+    // window to take a census of, so it leaves the set HERE, before the intersection. An account
+    // with no samples at all is not that case: it stays, and empties the intersection below.
+    let census: Vec<&str> = census
+        .into_iter()
+        .filter(|handle| {
+            by_acct
+                .get(handle)
+                .is_none_or(|group| group.iter().any(|s| s.session.is_some()))
+        })
+        .collect();
     // Nothing to intersect over: no account is observable, so the census is UNMEASURABLE
     // (covered `0`), not a calm zero.
     if census.is_empty() {
@@ -795,6 +833,12 @@ type Windows = Vec<(i64, i64)>;
 /// A HIGH reading covers `[ts, min(next_ts, max(ts + stale_after, session_resets_at)))`, clamped
 /// into the period exactly as [`validity_windows`] clamps its own; a LOW reading, or a high one
 /// carrying no session reset, keeps the plain cadence horizon [`validity_windows`] uses.
+///
+/// A sample with NO session reading is not a session observation: it contributes no covering
+/// window and no high one. For an account whose period mixes present and absent session readings
+/// the absent instants are therefore uncovered on this axis, and the jointly-covered time shrinks
+/// over them — nothing is interpolated across what was not observed. Such a sample still ends the
+/// window of the reading before it, as any later sample does.
 ///
 /// # Why anchoring is what makes this census measurable
 ///
@@ -871,7 +915,13 @@ fn high_windows(
     let mut highs: Windows = Vec::new();
     let mut covering: Windows = Vec::with_capacity(group.len());
     for (i, s) in group.iter().enumerate() {
-        let high = s.session >= high_threshold;
+        // D5, decided at this one site: a reading with no session window is no reading on this
+        // axis — it anchors nothing and covers nothing — and it still ends the window of the
+        // reading before it, through `next` below.
+        let Some(session) = s.session else {
+            continue;
+        };
+        let high = session >= high_threshold;
 
         let next = group.get(i + 1).map_or(period.end, |n| n.ts);
         let cadence_hi = s.ts + stale_after.max(0);
@@ -1043,6 +1093,10 @@ fn cause_count(episodes: &[HoldSpan], cause: HoldCause) -> u32 {
 /// The covering list extends over the SAME anchored windows, because "blocked until its stated
 /// reset" is knowledge about the account's state over that span, not a gap in it. That also makes
 /// `blocked ⊆ covering` true by construction, which the census's short-circuit relies on.
+///
+/// A dimension the reading does not carry never blocks it: a reading with no session window is
+/// viable or weekly-blocked, never session-blocked, and it is covering either way — the capacity
+/// census keeps every account, whichever windows it has.
 fn blocked_windows(
     group: &[&Sample],
     period: Period,
@@ -1052,8 +1106,8 @@ fn blocked_windows(
     let mut blocked: Vec<HoldSpan> = Vec::new();
     let mut covering: Vec<(i64, i64)> = Vec::with_capacity(group.len());
     for (i, s) in group.iter().enumerate() {
-        let session_blocked = boundary.session_blocked(s.session);
-        let weekly_blocked = boundary.weekly_blocked(s.weekly);
+        let session_blocked = s.session.is_some_and(|v| boundary.session_blocked(v));
+        let weekly_blocked = s.weekly.is_some_and(|v| boundary.weekly_blocked(v));
         let relief = relief_of(s, session_blocked, weekly_blocked);
 
         let next = group.get(i + 1).map_or(period.end, |n| n.ts);
@@ -1087,10 +1141,11 @@ fn blocked_windows(
 /// than a live reading.
 ///
 /// Deliberately mirrors `crate::daemon`'s `spare_relief` exactly, including both of its judgements:
-/// an account blocked on BOTH dimensions returns only once the LATER window clears (so the reset
-/// is a `max`, not a `min`), and an exact tie names WEEKLY — the scarcer window. A reading missing
-/// the reset for ANY dimension that blocks it yields `None`: its return time is genuinely unknown,
-/// and guessing it is what reset-anchoring exists to avoid.
+/// an account blocked on every dimension it has returns only once the LATER window clears (so the
+/// reset is a `max`, not a `min`; a dimension the account lacks never blocks it), and an exact
+/// tie names WEEKLY — the scarcer window. A reading missing the reset for ANY dimension that
+/// blocks it yields `None`: its return time is genuinely unknown, and guessing it is what
+/// reset-anchoring exists to avoid.
 fn relief_of(s: &Sample, session_blocked: bool, weekly_blocked: bool) -> Option<(i64, HoldCause)> {
     let session = if session_blocked {
         Some((s.session_resets_at?, HoldCause::Session))
@@ -1227,8 +1282,11 @@ fn intersect(a: &[(i64, i64)], b: &[(i64, i64)]) -> Vec<(i64, i64)> {
 }
 
 impl DimStats {
-    /// The all-zero summary — used only for an account with a contribution share but no
-    /// readings of its own (see [`aggregate`]); never produced from actual samples.
+    /// The all-zero summary. Two cases hold it: an account with a contribution share but no
+    /// readings of its own (see [`aggregate`]), and — the same value, from [`dim_stats`] over an
+    /// empty series — an account whose samples carry no reading on the dimension. In the second
+    /// case it is an INTERIM representation, not a measurement: issue #1601 replaces it with an
+    /// omission under `JSON_SCHEMA_VERSION` 2.
     const ZERO: DimStats = DimStats {
         mean: 0.0,
         peak: 0.0,
@@ -1236,9 +1294,12 @@ impl DimStats {
     };
 }
 
-/// Mean / peak / p95 over a dimension's values. `xs` is non-empty for every real
-/// account (each is in the roster because it has ≥1 sample); an empty slice yields the
-/// finite all-zero summary rather than a NaN/∞ that JSON could not represent.
+/// Mean / peak / p95 over a dimension's values. `xs` holds the readings that carry the
+/// dimension, so it IS empty for a real account whose samples carry no reading on it (an
+/// account with no session window). An empty slice yields the finite all-zero summary rather
+/// than a NaN/∞ that JSON could not represent: an INTERIM representation of "no reading on
+/// this dimension", not a measurement, until issue #1601 omits the summary under
+/// `JSON_SCHEMA_VERSION` 2.
 fn dim_stats(xs: &[f64]) -> DimStats {
     DimStats {
         mean: mean_of(xs),
@@ -1289,6 +1350,42 @@ mod tests {
     /// parser — used to build civil-calendar boundaries without magic numbers.
     fn epoch(s: &str) -> i64 {
         epoch_from_rfc3339(s).expect("valid RFC 3339 fixture")
+    }
+
+    /// A usage [`Sample`] decoded from the JSON line the store holds for it, so a reading can carry
+    /// `null` for a window the account lacks (issue #1600). A test about an absent window builds
+    /// EVERY sample it reads here, the present readings too: the line decodes on a tree whose
+    /// `Sample` can say `null`, and fails to decode, failing the test at its setup, on one that
+    /// cannot.
+    fn sample_from_line(ts: i64, acct: &str, session: Option<f64>, weekly: Option<f64>) -> Sample {
+        dated_sample_from_line(ts, acct, session, weekly, None, None)
+    }
+
+    /// [`sample_from_line`] with the window resets the reading carried; a reset the reading did not
+    /// carry is left off the line, as the store leaves it.
+    fn dated_sample_from_line(
+        ts: i64,
+        acct: &str,
+        session: Option<f64>,
+        weekly: Option<f64>,
+        session_resets_at: Option<i64>,
+        weekly_resets_at: Option<i64>,
+    ) -> Sample {
+        let mut line = serde_json::json!({
+            "ts": ts,
+            "provider": "claude",
+            "acct": acct,
+            "session": session,
+            "weekly": weekly,
+        });
+        if let Some(at) = session_resets_at {
+            line["session_resets_at"] = at.into();
+        }
+        if let Some(at) = weekly_resets_at {
+            line["weekly_resets_at"] = at.into();
+        }
+        serde_json::from_value(line)
+            .expect("a store line carrying `null` for an absent window must decode")
     }
 
     // --- swap-event parsing ---------------------------------------------------
@@ -1522,6 +1619,120 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         assert!((a.session.p95 - 1.2).abs() < 1e-9, "session p95");
         assert!((a.weekly.mean - 0.30).abs() < 1e-9, "weekly mean");
         assert!((a.weekly.peak - 0.30).abs() < 1e-9, "weekly peak");
+    }
+
+    /// Issue #1600: a reading with no session window is excluded from the session figures and kept
+    /// in the weekly ones, and it still counts as an observation of the account.
+    #[test]
+    fn a_sample_with_no_session_reading_is_excluded_from_the_session_figures_and_kept_in_the_weekly_ones(
+    ) {
+        let period = Period::new(0, 900);
+        let samples = [
+            sample_from_line(0, "work", None, Some(0.3)),
+            sample_from_line(300, "work", Some(0.9), Some(0.5)),
+            sample_from_line(600, "work", None, Some(0.7)),
+        ];
+        let report = aggregate(&samples, &[], period, &params());
+        let a = &report.per_account["work"];
+        assert_eq!(
+            a.session,
+            DimStats {
+                mean: 0.9,
+                peak: 0.9,
+                p95: 0.9
+            },
+            "T1: the session figures are over the one reading that carries a session value"
+        );
+        assert!(
+            (a.weekly.mean - 0.5).abs() < 1e-12,
+            "T1: the weekly mean is over all three readings: {}",
+            a.weekly.mean
+        );
+        assert_eq!(
+            a.seen, 3,
+            "T1: a weekly-only reading is still an observation"
+        );
+        assert_eq!(
+            a.coverage, 1.0,
+            "T1: and coverage counts all three: 3 seen over the 900 s period at the 300 s cadence"
+        );
+        assert_eq!(
+            a.cap_hits, 1,
+            "T1: one reading sits at or above the 0.8 session cap"
+        );
+        assert_eq!(
+            a.time_at_cap_secs, 300,
+            "T1: the cap time is that one reading's validity window, [300, 600)"
+        );
+    }
+
+    /// Issue #1600, the interim: an account none of whose readings carries a session value holds
+    /// the all-zero session summary ([`DimStats::ZERO`]) and no cap hit. That zero is the interim
+    /// representation, not a measurement: issue #1601 omits those figures on the wire and prints
+    /// `—` in the table, and this test moves with it.
+    #[test]
+    fn an_account_with_no_session_reading_holds_the_interim_zero_summary_until_the_wire_omits_it() {
+        let period = Period::new(0, 900);
+        let samples = [
+            sample_from_line(0, "work", None, Some(0.3)),
+            sample_from_line(300, "work", None, Some(0.5)),
+            sample_from_line(600, "work", None, Some(0.7)),
+        ];
+        let report = aggregate(&samples, &[], period, &params());
+        let a = &report.per_account["work"];
+        assert_eq!(a.session, DimStats::ZERO, "T2: the interim zero summary");
+        assert_eq!(a.cap_hits, 0, "T2: no session reading, so no cap hit");
+        assert_eq!(a.time_at_cap_secs, 0, "T2: and no time at the cap");
+        assert!(
+            (a.weekly.mean - 0.5).abs() < 1e-12,
+            "T2: the weekly mean is over the weekly readings: {}",
+            a.weekly.mean
+        );
+        assert_eq!(a.weekly.peak, 0.7, "T2: and so is the weekly peak");
+        assert_eq!(a.seen, 3, "T2: each reading is an observation");
+    }
+
+    /// Issue #1600, the weekly twin of the session test above: a reading with no weekly window is
+    /// excluded from the weekly figures and kept in the session ones, its cap hit included.
+    #[test]
+    fn a_sample_with_no_weekly_reading_is_excluded_from_the_weekly_figures_and_kept_in_the_session_ones(
+    ) {
+        let period = Period::new(0, 900);
+        let samples = [
+            sample_from_line(0, "work", Some(0.3), None),
+            sample_from_line(300, "work", Some(0.5), Some(0.9)),
+            sample_from_line(600, "work", Some(0.85), None),
+        ];
+        let report = aggregate(&samples, &[], period, &params());
+        let a = &report.per_account["work"];
+        assert_eq!(
+            a.weekly,
+            DimStats {
+                mean: 0.9,
+                peak: 0.9,
+                p95: 0.9
+            },
+            "T13: the weekly figures are over the one reading that carries a weekly value"
+        );
+        assert!(
+            (a.session.mean - 0.55).abs() < 1e-12,
+            "T13: the session mean is over all three readings: {}",
+            a.session.mean
+        );
+        assert_eq!(a.session.peak, 0.85, "T13: and so is the session peak");
+        assert_eq!(
+            a.seen, 3,
+            "T13: a session-only reading is still an observation"
+        );
+        assert_eq!(a.coverage, 1.0, "T13: three readings of three expected");
+        assert_eq!(
+            a.cap_hits, 1,
+            "T13: the third reading is at or above the session cap"
+        );
+        assert_eq!(
+            a.time_at_cap_secs, 300,
+            "T13: the window of the third reading, whose weekly is absent"
+        );
     }
 
     // --- cap-hit boundary (>=) ------------------------------------------------
@@ -1837,6 +2048,139 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             configured.roster.all_high_covered_secs, 0,
             "no instant had BOTH accounts covered — the census was unmeasurable, and this zero \
              is what stops a surface printing that `0` as a calm window"
+        );
+    }
+
+    /// Issue #1600, decision D5: the all-high census is over the accounts that have a session
+    /// window. `a` is weekly-only for the whole period, so it is no part of the census set and `b`
+    /// alone decides it. `a`'s readings are still observations of `a`, so its contribution share
+    /// is `b`'s.
+    #[test]
+    fn the_all_high_census_is_over_the_accounts_that_have_a_session_window() {
+        let period = Period::new(0, 600);
+        let params = AggregateParams::new(300, 0.80, 0.95);
+        let samples = [
+            sample_from_line(0, "a", None, Some(0.40)),
+            sample_from_line(300, "a", None, Some(0.40)),
+            sample_from_line(0, "b", Some(0.98), Some(0.40)),
+            sample_from_line(300, "b", Some(0.98), Some(0.40)),
+        ];
+        let report =
+            aggregate_with_roster(&samples, &[], period, &params, Some(&roster(&["a", "b"])));
+        let share = |handle: &str| report.per_account.get(handle).map(|a| a.contribution_share);
+        assert_eq!(
+            share("a"),
+            Some(0.5),
+            "T3: a weekly-only reading is an observation of the account, so `a` holds its share"
+        );
+        assert_eq!(share("b"), Some(0.5), "T3: and `b` holds the other half");
+        assert_eq!(
+            (
+                report.roster.all_high_episodes,
+                report.roster.all_high_covered_secs
+            ),
+            (1, 600),
+            "T3: `b` was high across the whole period and `a` has no session window to be high \
+             or low on — (all_high_episodes, all_high_covered_secs), the latter `b`'s covered \
+             seconds"
+        );
+    }
+
+    /// Issue #1600, decision D5: an account whose period mixes absent and present session readings
+    /// is counted only over the instants it had a session window. `a` has none for the first half,
+    /// so that half is uncovered on the session axis — nothing is interpolated across it.
+    #[test]
+    fn a_mixed_period_account_is_counted_only_over_the_instants_it_had_a_session_window() {
+        let period = Period::new(0, 1_200);
+        let params = AggregateParams::new(300, 0.80, 0.95);
+        let samples = [
+            sample_from_line(0, "a", None, Some(0.40)),
+            sample_from_line(300, "a", None, Some(0.40)),
+            sample_from_line(600, "a", Some(0.98), Some(0.40)),
+            sample_from_line(900, "a", Some(0.98), Some(0.40)),
+            sample_from_line(0, "b", Some(0.98), Some(0.40)),
+            sample_from_line(300, "b", Some(0.98), Some(0.40)),
+            sample_from_line(600, "b", Some(0.98), Some(0.40)),
+            sample_from_line(900, "b", Some(0.98), Some(0.40)),
+        ];
+        let report =
+            aggregate_with_roster(&samples, &[], period, &params, Some(&roster(&["a", "b"])));
+        assert_eq!(
+            report.roster.all_high_covered_secs, 600,
+            "T4: the census was measurable over the second half only, [600, 1200)"
+        );
+        assert_eq!(
+            report.roster.all_high_episodes, 1,
+            "T4: one episode, over that half"
+        );
+        assert_eq!(report.roster.all_high_secs, 600, "T4: and it spans it");
+    }
+
+    /// Issue #1600, decision D5, in the order real data takes: a session window that was present
+    /// and then disappears. The high reading at 0 is anchored to its reset at 10 000 s, far past
+    /// the cadence horizon, but the absent reading at 300 ends its window there: that reading
+    /// anchors nothing and covers nothing, and nothing is interpolated across the instants after
+    /// it. A reader that looked past the absent reading for the next present one would stretch the
+    /// anchored window to the period end and overstate both the covered and the high seconds.
+    #[test]
+    fn an_absent_session_reading_ends_the_anchored_high_window_of_the_reading_before_it() {
+        let period = Period::new(0, 1_200);
+        let params = AggregateParams::new(300, 0.80, 0.95);
+        let samples = [
+            dated_sample_from_line(0, "a", Some(0.98), Some(0.40), Some(10_000), None),
+            sample_from_line(300, "a", None, Some(0.40)),
+            sample_from_line(600, "a", None, Some(0.40)),
+        ];
+        let report = aggregate_with_roster(&samples, &[], period, &params, Some(&roster(&["a"])));
+        assert_eq!(
+            report.roster.all_high_covered_secs, 300,
+            "the census is measurable over [0, 300) only: the absent reading at 300 ends the \
+             anchored window"
+        );
+        assert_eq!(
+            report.roster.all_high_secs, 300,
+            "and the high time ends there too, not at the reset"
+        );
+        assert_eq!(
+            report.roster.all_high_episodes, 1,
+            "one episode, over that window"
+        );
+    }
+
+    /// Issue #1600, decision D5, the third route to an empty census set: every account on the
+    /// roster is weekly-only for the whole period, so no account is left to intersect over and the
+    /// census is UNMEASURABLE — `(0, 0, 0)`, the zero covered seconds a surface prints as `—` —
+    /// under a known roster and under the sampled-accounts fallback alike.
+    #[test]
+    fn a_roster_with_no_session_windowed_account_leaves_the_all_high_census_unmeasurable() {
+        let period = Period::new(0, 600);
+        let params = AggregateParams::new(300, 0.80, 0.95);
+        let samples = [
+            sample_from_line(0, "a", None, Some(0.40)),
+            sample_from_line(300, "a", None, Some(0.40)),
+            sample_from_line(0, "b", None, Some(0.99)),
+            sample_from_line(300, "b", None, Some(0.99)),
+        ];
+        let census = |report: &UsageReport| {
+            (
+                report.roster.all_high_episodes,
+                report.roster.all_high_secs,
+                report.roster.all_high_covered_secs,
+            )
+        };
+        let configured =
+            aggregate_with_roster(&samples, &[], period, &params, Some(&roster(&["a", "b"])));
+        assert_eq!(
+            census(&configured),
+            (0, 0, 0),
+            "no rostered account has a session window, so the census has nothing to intersect \
+             over — (all_high_episodes, all_high_secs, all_high_covered_secs)"
+        );
+        let fallback = aggregate(&samples, &[], period, &params);
+        assert_eq!(
+            census(&fallback),
+            (0, 0, 0),
+            "and the sampled-accounts fallback reads the same: no sampled account has one either"
         );
     }
 
@@ -2780,6 +3124,33 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         );
     }
 
+    /// Issue #1600: decision D5 narrows the SESSION census only. A viable weekly-only account is
+    /// somewhere to land, so the capacity census keeps it: `b` is blocked until its session reset
+    /// and still there is no hold.
+    #[test]
+    fn a_viable_weekly_only_account_is_somewhere_to_land_so_the_capacity_census_keeps_it() {
+        let period = Period::new(0, 10_000);
+        let samples = [
+            dated_sample_from_line(0, "a", None, Some(0.10), None, Some(999_999)),
+            dated_sample_from_line(0, "b", Some(0.99), Some(0.10), Some(8_000), Some(999_999)),
+        ];
+        let report = aggregate_with_roster(
+            &samples,
+            &[],
+            period,
+            &hold_params(),
+            Some(&roster(&["a", "b"])),
+        );
+        assert_eq!(
+            report.roster.capacity_holds, 0,
+            "T10: `a` was somewhere to land"
+        );
+        assert_eq!(
+            report.roster.capacity_hold_covered_secs, 300,
+            "T10: `a`'s viable reading covers [0, 300) and `b`'s blocked one [0, 8000)"
+        );
+    }
+
     #[test]
     fn a_rostered_account_with_no_samples_makes_the_census_unmeasurable() {
         // A rostered account that contributed nothing cannot silently leave the intersection and
@@ -2943,6 +3314,73 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         assert_eq!(r.capacity_hold_secs_lower_bound, 30_000, "the LATER reset");
         assert_eq!(r.capacity_holds_weekly, 1, "named by the gating window");
         assert_eq!(r.capacity_holds_session, 0);
+    }
+
+    /// Issue #1600: a weekly-only reading at or over the weekly viability line is a WEEKLY hold,
+    /// relieved at its own weekly reset. A reading with no session window is never
+    /// session-blocked, so no session reset is needed to anchor it.
+    #[test]
+    fn a_weekly_only_sample_over_the_weekly_line_is_a_weekly_hold_relieved_at_its_weekly_reset() {
+        let period = Period::new(0, 10_000);
+        let samples = [
+            dated_sample_from_line(0, "a", None, Some(0.98), None, Some(5_000)),
+            // Under the line, at the weekly reset: covering, and not blocked.
+            dated_sample_from_line(5_000, "a", None, Some(0.10), None, None),
+        ];
+        let report =
+            aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+        let r = &report.roster;
+        assert_eq!(r.capacity_holds, 1, "T5: one hold");
+        assert_eq!(
+            r.capacity_holds_weekly, 1,
+            "T5: its cause is the weekly window"
+        );
+        assert_eq!(
+            r.capacity_holds_session, 0,
+            "T5: a weekly-only reading is never session-blocked"
+        );
+        assert_eq!(
+            r.capacity_hold_secs_lower_bound, 5_000,
+            "T5: the hold ends at the weekly reset"
+        );
+        assert_eq!(
+            r.capacity_hold_covered_secs, 5_300,
+            "T5: the under-line reading is covering for one cadence, and not blocked"
+        );
+    }
+
+    /// Issue #1600, the weekly twin of the test above: a session-only reading over the session
+    /// line is a SESSION hold, relieved at its own session reset. A reading with no weekly window
+    /// is never weekly-blocked.
+    #[test]
+    fn a_session_only_sample_over_the_session_line_is_a_session_hold_relieved_at_its_session_reset()
+    {
+        let period = Period::new(0, 10_000);
+        let samples = [
+            dated_sample_from_line(0, "a", Some(0.85), None, Some(5_000), None),
+            // Under the line, at the session reset: covering, and not blocked.
+            dated_sample_from_line(5_000, "a", Some(0.10), None, None, None),
+        ];
+        let report =
+            aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+        let r = &report.roster;
+        assert_eq!(r.capacity_holds, 1, "T14: one hold");
+        assert_eq!(
+            r.capacity_holds_session, 1,
+            "T14: its cause is the session window"
+        );
+        assert_eq!(
+            r.capacity_holds_weekly, 0,
+            "T14: a session-only reading is never weekly-blocked"
+        );
+        assert_eq!(
+            r.capacity_hold_secs_lower_bound, 5_000,
+            "T14: the hold ends at the session reset"
+        );
+        assert_eq!(
+            r.capacity_hold_covered_secs, 5_300,
+            "T14: the under-line reading is covering for one cadence, and not blocked"
+        );
     }
 
     #[test]

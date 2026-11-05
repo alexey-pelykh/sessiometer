@@ -2142,17 +2142,19 @@ fn fold_landings(
                 window_end.min(before_reactivation)
             });
         // Peak absolute session over the parked window (readings strictly after the swap, through the
-        // effective end). The `is_finite` guard drops a NaN/inf reading, which would otherwise reach
-        // the clamp below and FABRICATE a landing — 255 for `+∞`, but 0 for `NaN` and `−∞`, since the
-        // saturating float→int cast floors both — poisoning the issue #597 tail calibration either
-        // way: once as a max-value breach, once as a spotless one.
-        // `None` ⇒ no reading of the parked account in view — an unmeasured anchor.
+        // effective end), over the readings that carry a session value: one with no session window
+        // is not a reading of this axis. The `is_finite` guard drops a NaN/inf reading, which would
+        // otherwise reach the clamp below and FABRICATE a landing — 255 for `+∞`, but 0 for `NaN`
+        // and `−∞`, since the saturating float→int cast floors both — poisoning the issue #597 tail
+        // calibration either way: once as a max-value breach, once as a spotless one.
+        // `None` ⇒ no session reading of the parked account in view — an unmeasured anchor.
         let peak = by_acct
             .get(swap.acct.as_str())
             .into_iter()
             .flatten()
-            .filter(|s| s.ts > swap.ts && s.ts <= effective_end && s.session.is_finite())
-            .map(|s| s.session)
+            .filter(|s| s.ts > swap.ts && s.ts <= effective_end)
+            .filter_map(|s| s.session)
+            .filter(|v| v.is_finite())
             .reduce(f64::max);
         match peak {
             Some(peak) => {
@@ -3937,6 +3939,22 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
         window.into()
     }
 
+    /// A usage [`Sample`] decoded from the JSON line the store holds for it, so a reading can carry
+    /// `null` for a window the account lacks (issue #1600). A test about an absent window builds
+    /// EVERY sample it reads here, the present readings too: the line decodes on a tree whose
+    /// `Sample` can say `null`, and fails to decode, failing the test at its setup, on one that
+    /// cannot.
+    fn sample_from_line(ts: i64, acct: &str, session: Option<f64>, weekly: Option<f64>) -> Sample {
+        serde_json::from_value(serde_json::json!({
+            "ts": ts,
+            "provider": "claude",
+            "acct": acct,
+            "session": session,
+            "weekly": weekly,
+        }))
+        .expect("a store line carrying `null` for an absent window must decode")
+    }
+
     #[test]
     fn parse_folds_only_the_four_relevant_families() {
         let inputs = parse_events(FIXTURE_LOG, None);
@@ -4673,8 +4691,9 @@ ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=-0.15 
     //     `blind_projection_error_classifies_corruption_apart_from_coverage` — deleting it reds
     //     both. #1179 read the comment on the first as awareness rather than coverage; it is
     //     coverage, and it is what makes the bullet above true.
-    //   - `compute_landing`'s post-swap sample window (`s.session.is_finite()`): CANARIED since
-    //     issue #1210, in the landing cluster rather than here — by
+    //   - `compute_landing`'s post-swap sample window (the `.filter(|v| v.is_finite())` behind the
+    //     peak's `filter_map`): CANARIED since issue #1210, in the landing cluster rather than
+    //     here — by
     //     `landing_refuses_a_non_finite_parked_reading_rather_than_fabricating_one` and
     //     `landing_keeps_the_finite_peak_when_a_non_finite_reading_shares_the_window`, which sit
     //     beside the other `compute_landing` tests they share fixtures and idiom with. #1179 left it
@@ -7703,7 +7722,7 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
     /// [`landing_swap_without_a_post_swap_sample_is_unmeasured_not_zero`] pins for an empty window —
     /// rather than being fabricated into a landing.
     ///
-    /// Deleting `&& s.session.is_finite()` from the peak filter REDs this, and reds it naming the
+    /// Deleting `.filter(|v| v.is_finite())` from the peak chain REDs this, and reds it naming the
     /// shape: the message prints every admitted shape beside the reading it fabricated, so the
     /// positive infinity's `Some(255)` with `post_swap_tail: 1` — the max-value breach — is
     /// distinguishable at a glance from the quieter `Some(0)` the other two produce.
@@ -7780,6 +7799,56 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
             "42 is nowhere near the ceiling, so any breach here is fabricated"
         );
         assert_eq!(r.landing.p100_met(), Some(true));
+    }
+
+    /// Issue #1600: a parked window whose readings carry no session value is an UNMEASURED landing,
+    /// the same coverage gap an empty window is, and never a `0 %` one; a window that mixes absent
+    /// and present readings lands at the peak of the present ones.
+    #[test]
+    fn a_parked_window_with_no_session_reading_is_an_unmeasured_landing() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=96
+";
+        // Every post-swap reading of the parked account lacks a session value.
+        let absent = [
+            sample_from_line(epoch("2026-07-11T00:02:00Z"), "work", None, Some(0.50)),
+            sample_from_line(epoch("2026-07-11T00:04:00Z"), "work", None, Some(0.51)),
+        ];
+        let r = aggregate(&parse_events(log, None), &absent, None);
+        assert_eq!(
+            (
+                r.landing.n_measured,
+                r.landing.n_unmeasured,
+                r.landing.p100,
+                r.landing.post_swap_tail
+            ),
+            (0, 1, None, 0),
+            "T7: a parked window with no session reading must leave its anchor unmeasured — \
+             (n_measured, n_unmeasured, p100, post_swap_tail)"
+        );
+
+        // A second anchor, whose window mixes absent readings with one present reading.
+        let mixed = [
+            sample_from_line(epoch("2026-07-11T00:02:00Z"), "work", None, Some(0.50)),
+            sample_from_line(
+                epoch("2026-07-11T00:03:00Z"),
+                "work",
+                Some(0.42),
+                Some(0.51),
+            ),
+            sample_from_line(epoch("2026-07-11T00:04:00Z"), "work", None, Some(0.52)),
+        ];
+        let r = aggregate(&parse_events(log, None), &mixed, None);
+        assert_eq!(
+            (r.landing.n_measured, r.landing.n_unmeasured),
+            (1, 0),
+            "T7: one present reading measures the anchor"
+        );
+        assert_eq!(
+            r.landing.p100,
+            Some(42),
+            "T7: the landing is the peak of the present readings only"
+        );
     }
 
     #[test]
