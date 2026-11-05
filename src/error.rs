@@ -1140,6 +1140,14 @@ pub(crate) enum Error {
     #[error("malformed usage rollup: JSON error at line {line} column {column}")]
     UsageRollupMalformed { line: usize, column: usize },
 
+    /// The usage-rollup file names a store `format` newer than this build reads: a newer
+    /// sessiometer wrote it. Never a reason to delete or move the file, whose daily tier is
+    /// lifetime state. Carries the two generations, plain integers, never the file's bytes.
+    #[error(
+        "usage rollup format {found} was written by a newer sessiometer (this build reads format {supported}); it must not be deleted or moved: run a newer sessiometer"
+    )]
+    UsageRollupNewerFormat { found: u32, supported: u32 },
+
     /// The single-writer store lock (issue #188) could not be acquired within the
     /// bounded wait — a concurrent [`append_sample`](crate::usage_store::append_sample)
     /// / [`compact_and_roll`](crate::usage_store::compact_and_roll) held it the whole
@@ -1778,6 +1786,24 @@ pub(crate) mod tests {
                   obtaining more capacity, which is the reading `BANNED_TOKENS`' own issue #160 \
                   note quotes (`add / buy / upgrade / cancel / bypass / need more`).",
         },
+        LedgerEntry {
+            variant: "UsageRollupNewerFormat",
+            token: "must",
+            verdict: Verdict::Permitted,
+            why: "CONSTRAINT STATEMENT, same test as the two `must` entries above: whose \
+                  behaviour the modal governs. `it must not be deleted or moved` has the STORE \
+                  FILE as its subject and states the RETENTION INVARIANT this tool keeps for its \
+                  own state — the rollup's daily tier is lifetime data no build can rebuild — \
+                  and is keeping in the act of reporting: this build refuses a file a newer \
+                  sessiometer wrote rather than rewrite or reset it. So the modal governs the \
+                  tool's own invariant, in the third person, as `the live session's credential \
+                  must stay untouched` does, and is not the operator-directed modal the group \
+                  bans (`you should`). The weaker reading is recorded rather than hidden: only a \
+                  person can delete a file, so the sentence also warns one off. That warning \
+                  protects data and directs nobody toward an account, a plan or more capacity, \
+                  and issue #1598's fence pins the wording (decision D6, condition C4: the text \
+                  says the file is not to be deleted, and the fence's test reads the phrase).",
+        },
     ];
 
     /// One variant's authored `#[error(...)]` attribute, parsed out of this file's own source.
@@ -2338,7 +2364,7 @@ pub(crate) mod tests {
         // message below can say which one this is rather than leaving the reader to guess.
         assert_eq!(
             prose.len(),
-            91,
+            92,
             "the `#[error(...)]` count moved, and a variant having been ADDED OR REMOVED is the \
              EXPECTED cause: `error_prose_of`'s self-consistency check ran first and found that \
              every `#[error(` in the source started an attribute it parsed, which rules out the \
@@ -2690,7 +2716,7 @@ pub(crate) mod tests {
     fn every_ledger_entry_is_earned_reasoned_and_pinned() {
         let prose = error_prose();
 
-        // PINNED to exactly the three measured entries, for the reason issue #918 pinned the help
+        // PINNED to exactly the four measured entries, for the reason issue #918 pinned the help
         // exemption set: growing this is a design decision that must redden a test, never
         // something that accretes an entry at a time to silence an inconvenient message.
         let pairs: Vec<(&str, &str)> = ERROR_PROSE_LEDGER
@@ -2703,6 +2729,7 @@ pub(crate) mod tests {
                 ("ConfigTargetMaxSessionAboveTrigger", "must"),
                 ("SharedCredentialMutated", "must"),
                 ("ActiveAccountUnresolved", "add"),
+                ("UsageRollupNewerFormat", "must"),
             ],
             "the ledger moved — see issue #1139: these are the (variant, token) pairs the \
              shipped error prose measurably spends, and each was judged one at a time"

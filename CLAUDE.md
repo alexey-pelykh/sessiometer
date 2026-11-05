@@ -306,6 +306,21 @@ Not a JSON wire, but versioned and more dangerous to touch: `FORMAT_VERSION` in 
 gates the on-disk migration-artifact container, and its fixtures are **frozen** — its own emitter's
 doc comment says freeze once, thereafter only read.
 
+Also not a wire, and versioned since issue #1598: `ROLLUP_FORMAT` in `src/usage_store.rs` is the
+usage store's own on-disk generation, the top-level `format` key of `usage-rollup.json` (no key is
+generation 1). Bump it with any change to the written shape of `usage-rollup.json` or of
+`usage-samples.jsonl`, which compaction rewrites only after reading the generation, and add the
+new generation's pins beside the old ones, never editing those, in
+`the_written_store_shape_is_pinned_to_its_generation`. That test fails only when a value it pins
+changes, so a new optional field passes it unseen unless one of its canonical values sets it. A
+build older than #1598 refuses a generation-2 rollup as `malformed usage rollup` before it rewrites
+either file: that is the fence working, not damage. Never delete or move either store file —
+without the rollup an older build reads the store as new, and its compaction erases every sample
+line carrying a `null` window.
+
+↳ Convention only — nothing enforces that last rule: no check watches the two store files, and the
+fence above holds only while `usage-rollup.json` is where the daemon wrote it.
+
 **Telling the two Swift fixture classes apart.** Both live in `apps/menubar/Tests/Fixtures.swift`,
 and nothing in their names or section comments reliably distinguishes them — those doc comments have
 already gone stale at least once, so do not trust the prose. Select on the JSON literal instead: at

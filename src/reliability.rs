@@ -2142,17 +2142,19 @@ fn fold_landings(
                 window_end.min(before_reactivation)
             });
         // Peak absolute session over the parked window (readings strictly after the swap, through the
-        // effective end). The `is_finite` guard drops a NaN/inf reading, which would otherwise reach
-        // the clamp below and FABRICATE a landing — 255 for `+∞`, but 0 for `NaN` and `−∞`, since the
-        // saturating float→int cast floors both — poisoning the issue #597 tail calibration either
-        // way: once as a max-value breach, once as a spotless one.
-        // `None` ⇒ no reading of the parked account in view — an unmeasured anchor.
+        // effective end), over the readings that carry a session value: one with no session window
+        // is not a reading of this axis. The `is_finite` guard drops a NaN/inf reading, which would
+        // otherwise reach the clamp below and FABRICATE a landing — 255 for `+∞`, but 0 for `NaN`
+        // and `−∞`, since the saturating float→int cast floors both — poisoning the issue #597 tail
+        // calibration either way: once as a max-value breach, once as a spotless one.
+        // `None` ⇒ no session reading of the parked account in view — an unmeasured anchor.
         let peak = by_acct
             .get(swap.acct.as_str())
             .into_iter()
             .flatten()
-            .filter(|s| s.ts > swap.ts && s.ts <= effective_end && s.session.is_finite())
-            .map(|s| s.session)
+            .filter(|s| s.ts > swap.ts && s.ts <= effective_end)
+            .filter_map(|s| s.session)
+            .filter(|v| v.is_finite())
             .reduce(f64::max);
         match peak {
             Some(peak) => {
@@ -3928,7 +3930,29 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
     /// (`weekly` is fixed at 0.10 — the landing join reads only `session`) — the landing-SLI join
     /// input, a trimmed form of `stats`' own `sample` test helper.
     fn sample(ts: i64, acct: &str, session: f64) -> Sample {
-        Sample::new(ts, "claude", acct, session, 0.10)
+        Sample::new(ts, "claude", acct, Some(session), Some(0.10))
+    }
+
+    /// Reads a window's fraction the same way before and after the `f64` → `Option<f64>` lift
+    /// (issue #1590), so one assertion text compiles, and passes `clippy -D warnings`, on both sides.
+    fn optional_fraction(window: impl Into<Option<f64>>) -> Option<f64> {
+        window.into()
+    }
+
+    /// A usage [`Sample`] decoded from the JSON line the store holds for it, so a reading can carry
+    /// `null` for a window the account lacks (issue #1600). A test about an absent window builds
+    /// EVERY sample it reads here, the present readings too: the line decodes on a tree whose
+    /// `Sample` can say `null`, and fails to decode, failing the test at its setup, on one that
+    /// cannot.
+    fn sample_from_line(ts: i64, acct: &str, session: Option<f64>, weekly: Option<f64>) -> Sample {
+        serde_json::from_value(serde_json::json!({
+            "ts": ts,
+            "provider": "claude",
+            "acct": acct,
+            "session": session,
+            "weekly": weekly,
+        }))
+        .expect("a store line carrying `null` for an absent window must decode")
     }
 
     #[test]
@@ -4667,8 +4691,9 @@ ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=-0.15 
     //     `blind_projection_error_classifies_corruption_apart_from_coverage` — deleting it reds
     //     both. #1179 read the comment on the first as awareness rather than coverage; it is
     //     coverage, and it is what makes the bullet above true.
-    //   - `compute_landing`'s post-swap sample window (`s.session.is_finite()`): CANARIED since
-    //     issue #1210, in the landing cluster rather than here — by
+    //   - `compute_landing`'s post-swap sample window (the `.filter(|v| v.is_finite())` behind the
+    //     peak's `filter_map`): CANARIED since issue #1210, in the landing cluster rather than
+    //     here — by
     //     `landing_refuses_a_non_finite_parked_reading_rather_than_fabricating_one` and
     //     `landing_keeps_the_finite_peak_when_a_non_finite_reading_shares_the_window`, which sit
     //     beside the other `compute_landing` tests they share fixtures and idiom with. #1179 left it
@@ -7596,21 +7621,35 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
     /// prose a reader must take on trust, so the canary can state its own status instead of implying
     /// a stronger one.
     ///
-    /// What it pins is exactly `serde_json`'s non-finite policy against `Sample`'s derived impls, and
-    /// nothing wider. A change to either — the policy, `session`'s type, its serde attributes — REDs
-    /// here. A store that adopted a DIFFERENT serialization format would leave this green while
-    /// voiding its premise, because no assertion in it reaches the store's own writer; the canary
-    /// below would silently become load-bearing with nothing here saying so.
+    /// Since issue #1598 the premise holds at both ends by the store's own rule, where the near end
+    /// used to hold by accident. On disk `"session":null` now means one thing: the account has no
+    /// session window. So the near end REFUSES a non-finite reading before it can be written:
+    /// `Sample`'s field serializer returns an error where `serde_json` alone writes `null`, which
+    /// would read back as "no window" for a measurement that was not finite. The far end is
+    /// unchanged for the five non-finite spellings, and its `null` arm moved: that line decodes,
+    /// with no session reading.
+    ///
+    /// What it pins is `Sample`'s serde attributes and `serde_json`'s decoding of a non-finite
+    /// spelling, and nothing wider. A change to either — `session`'s type, its serde attributes, the
+    /// decoder's policy — REDs here. A store that adopted a DIFFERENT serialization format would
+    /// leave this green while voiding its premise, because no assertion in it reaches the store's
+    /// own writer; the canary below would silently become load-bearing with nothing here saying so.
     #[test]
     fn the_sample_store_cannot_carry_a_non_finite_session_reading() {
         for (shape, session) in NON_FINITE_PARKED_READINGS {
-            // The near end of the round trip: `f64::INFINITY` has no JSON spelling, so `serde_json`
-            // writes `null` — which is then not an `f64` on the way back in.
-            let encoded = serde_json::to_string(&sample(0, "work", *session))
-                .expect("a Sample always serializes");
+            // The near end: `f64::INFINITY` has no JSON spelling, and `null` is taken — it means
+            // the account has no session window — so the reading is refused at serialization.
+            let encoded = serde_json::to_string(&sample(0, "work", *session));
             assert!(
-                serde_json::from_str::<Sample>(&encoded).is_err(),
-                "{shape} survived a store round trip: {encoded}"
+                encoded.is_err(),
+                "{shape} must be refused at serialization, never written as `null`: {encoded:?}"
+            );
+            let hint = encoded
+                .expect_err("asserted to be an error just above")
+                .to_string();
+            assert!(
+                hint.contains("a usage value was not a finite number"),
+                "the refusal of {shape} must carry the store's own hint: {hint}"
             );
         }
         // The far end, for a file written by something other than that serializer (a torn write, a
@@ -7618,19 +7657,21 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
         // no infinity literal, and a decimal that OVERFLOWS `f64` is rejected rather than saturated
         // into one, so no byte sequence in the store decodes to a non-finite reading.
         // Positive control FIRST, and it is not decoration: every assertion in the loop below is an
-        // `is_err()`, so one typo in a field name would make all six "fail to decode" for a reason
+        // `is_err()`, so one typo in a field name would make all five "fail to decode" for a reason
         // that has nothing to do with `session` and void the whole loop silently. Measured —
         // misspelling `provider` here leaves the entire suite green without this.
         let control = r#"{"ts":0,"provider":"claude","acct":"work","session":0.42,"weekly":0.1}"#;
         assert_eq!(
-            serde_json::from_str::<Sample>(control)
-                .expect("the control spelling must decode, or the loop below proves nothing")
-                .session,
-            0.42,
+            optional_fraction(
+                serde_json::from_str::<Sample>(control)
+                    .expect("the control spelling must decode, or the loop below proves nothing")
+                    .session
+            ),
+            Some(0.42),
             "the control line must decode to its own `session`, or an `is_err()` below could be \
              any field's fault"
         );
-        for spelling in ["Infinity", "-Infinity", "NaN", "1e400", "-1e400", "null"] {
+        for spelling in ["Infinity", "-Infinity", "NaN", "1e400", "-1e400"] {
             let line = format!(
                 r#"{{"ts":0,"provider":"claude","acct":"work","session":{spelling},"weekly":0.1}}"#
             );
@@ -7640,6 +7681,40 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
                  store data, not defence in depth"
             );
         }
+        // The `null` arm, moved: `"session":null` is the store's spelling of "this account has no
+        // session window", so the line decodes, and with NO session reading — never a number.
+        let no_window = r#"{"ts":0,"provider":"claude","acct":"work","session":null,"weekly":0.1}"#;
+        let decoded = serde_json::from_str::<Sample>(no_window)
+            .expect("`session:null` must decode: it means the account has no session window");
+        assert_eq!(
+            optional_fraction(decoded.session),
+            None,
+            "`session:null` must decode with no session reading, never as a number"
+        );
+    }
+
+    /// The weekly twin of the near end above (issue #1598, decision D12 as ruled): on disk
+    /// `"weekly":null` means the account has no weekly window, so a non-finite weekly reading is
+    /// refused at serialization the same way, never written as `null`.
+    #[test]
+    fn the_sample_store_cannot_carry_a_non_finite_weekly_reading() {
+        for (shape, weekly) in NON_FINITE_PARKED_READINGS {
+            let mut reading = sample(0, "work", 0.42);
+            reading.weekly = (*weekly).into();
+            let encoded = serde_json::to_string(&reading);
+            assert!(
+                encoded.is_err(),
+                "{shape} in the weekly reading must be refused at serialization, never written as \
+                 `null`: {encoded:?}"
+            );
+            let hint = encoded
+                .expect_err("asserted to be an error just above")
+                .to_string();
+            assert!(
+                hint.contains("a usage value was not a finite number"),
+                "the refusal of {shape} must carry the store's own hint: {hint}"
+            );
+        }
     }
 
     /// The canary (issue #1210): a non-finite reading of the parked account leaves its anchor
@@ -7647,7 +7722,7 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
     /// [`landing_swap_without_a_post_swap_sample_is_unmeasured_not_zero`] pins for an empty window —
     /// rather than being fabricated into a landing.
     ///
-    /// Deleting `&& s.session.is_finite()` from the peak filter REDs this, and reds it naming the
+    /// Deleting `.filter(|v| v.is_finite())` from the peak chain REDs this, and reds it naming the
     /// shape: the message prints every admitted shape beside the reading it fabricated, so the
     /// positive infinity's `Some(255)` with `post_swap_tail: 1` — the max-value breach — is
     /// distinguishable at a glance from the quieter `Some(0)` the other two produce.
@@ -7724,6 +7799,56 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
             "42 is nowhere near the ceiling, so any breach here is fabricated"
         );
         assert_eq!(r.landing.p100_met(), Some(true));
+    }
+
+    /// Issue #1600: a parked window whose readings carry no session value is an UNMEASURED landing,
+    /// the same coverage gap an empty window is, and never a `0 %` one; a window that mixes absent
+    /// and present readings lands at the peak of the present ones.
+    #[test]
+    fn a_parked_window_with_no_session_reading_is_an_unmeasured_landing() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=96
+";
+        // Every post-swap reading of the parked account lacks a session value.
+        let absent = [
+            sample_from_line(epoch("2026-07-11T00:02:00Z"), "work", None, Some(0.50)),
+            sample_from_line(epoch("2026-07-11T00:04:00Z"), "work", None, Some(0.51)),
+        ];
+        let r = aggregate(&parse_events(log, None), &absent, None);
+        assert_eq!(
+            (
+                r.landing.n_measured,
+                r.landing.n_unmeasured,
+                r.landing.p100,
+                r.landing.post_swap_tail
+            ),
+            (0, 1, None, 0),
+            "T7: a parked window with no session reading must leave its anchor unmeasured — \
+             (n_measured, n_unmeasured, p100, post_swap_tail)"
+        );
+
+        // A second anchor, whose window mixes absent readings with one present reading.
+        let mixed = [
+            sample_from_line(epoch("2026-07-11T00:02:00Z"), "work", None, Some(0.50)),
+            sample_from_line(
+                epoch("2026-07-11T00:03:00Z"),
+                "work",
+                Some(0.42),
+                Some(0.51),
+            ),
+            sample_from_line(epoch("2026-07-11T00:04:00Z"), "work", None, Some(0.52)),
+        ];
+        let r = aggregate(&parse_events(log, None), &mixed, None);
+        assert_eq!(
+            (r.landing.n_measured, r.landing.n_unmeasured),
+            (1, 0),
+            "T7: one present reading measures the anchor"
+        );
+        assert_eq!(
+            r.landing.p100,
+            Some(42),
+            "T7: the landing is the peak of the present readings only"
+        );
     }
 
     #[test]
@@ -8306,10 +8431,34 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
         /// capacity-held swap at 100 is excluded from the SLO by #719 and counted separately.
         fn golden_samples() -> Vec<Sample> {
             vec![
-                Sample::new(epoch("2026-07-11T00:01:00Z"), "claude", "work", 0.97, 0.10),
-                Sample::new(epoch("2026-07-11T00:02:00Z"), "claude", "work", 0.99, 0.10),
-                Sample::new(epoch("2026-07-11T00:06:30Z"), "claude", "work", 0.98, 0.10),
-                Sample::new(epoch("2026-07-11T00:09:30Z"), "claude", "work", 1.00, 0.10),
+                Sample::new(
+                    epoch("2026-07-11T00:01:00Z"),
+                    "claude",
+                    "work",
+                    Some(0.97),
+                    Some(0.10),
+                ),
+                Sample::new(
+                    epoch("2026-07-11T00:02:00Z"),
+                    "claude",
+                    "work",
+                    Some(0.99),
+                    Some(0.10),
+                ),
+                Sample::new(
+                    epoch("2026-07-11T00:06:30Z"),
+                    "claude",
+                    "work",
+                    Some(0.98),
+                    Some(0.10),
+                ),
+                Sample::new(
+                    epoch("2026-07-11T00:09:30Z"),
+                    "claude",
+                    "work",
+                    Some(1.00),
+                    Some(0.10),
+                ),
             ]
         }
 

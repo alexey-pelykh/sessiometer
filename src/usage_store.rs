@@ -9,9 +9,9 @@
 //!
 //! ```text
 //! usage-samples.jsonl : the raw rolling window — one JSON [`Sample`] per line,
-//!                       append-only (the daemon writes at most one line per poll:
-//!                       none for a failed poll, nor, until issue #1598 writes it as
-//!                       `null`, for a reading with a quota window absent).
+//!                       append-only (the daemon writes one line per successful
+//!                       poll and none for a failed one; a quota window the
+//!                       account lacks is written as `null`).
 //! usage-rollup.json   : hourly + daily aggregates + a `rolled_through_ts`
 //!                       watermark, a single atomically-rewritten [`Rollup`].
 //! ```
@@ -38,12 +38,46 @@
 //! A **"lifetime" reader reads the daily tier only** — it is the sole tier kept
 //! without a horizon.
 //!
-//! # Both quota dimensions, never one worst-case scalar
+//! # Every dimension the account has, never one worst-case scalar
 //!
 //! Every tier keeps `session` and `weekly` separately, mirroring the swap
 //! decision's own discipline (issue #41 / [`crate::usage::Usage`]): the store
 //! projects neither window to a single blended number, because the two limits are
-//! independent and a reader may care about either.
+//! independent and a reader may care about either. An account may lack a window (a
+//! verified Ultra account has no session window since 2026-10-30): the raw line then
+//! carries that axis as `null` — the key always written, never a fabricated `0` — and
+//! a tier bucket omits that axis's statistic when none of its readings carried it. A
+//! statistic that is present records how many of the bucket's samples it covers
+//! (`samples`); one folded before that field existed reads as not recorded, never as
+//! the bucket's `count` and never as `0`.
+//!
+//! # Store format and version skew
+//!
+//! From this build's first compaction, `usage-rollup.json` is the envelope
+//! `{"format":2,"rollup":{…}}`. A file with no `format` key is the legacy format 1 and
+//! reads as before; a `format` above this build's own is refused as written by a newer
+//! sessiometer. This build prints that refusal, and any other compaction failure, to
+//! its stderr, which reaches `daemon.err.log` only under a CLI-installed agent; the app
+//! bundle's agent plist routes stderr to no file. There a stall on the read side, a
+//! newer or malformed rollup, shows only as `stats unavailable` on the socket verb and
+//! in the rollup's `format` key, and a compaction that fails on the write side shows
+//! nowhere.
+//!
+//! Every older build refuses the envelope before it rewrites either store file. So on a
+//! store this build has compacted, an older daemon keeps appending samples but stops
+//! compacting without a word and erases nothing; an older `stats` fails with "malformed
+//! usage rollup", which is expected after this change: read the file's `format` key
+//! before treating it as damage; and an older `reliability`, which never reads the
+//! rollup, leaves `null` lines out of its report and deletes nothing. Never delete or
+//! move `usage-samples.jsonl` or `usage-rollup.json`: without the rollup an older build
+//! reads the store as new and erases its `null` lines.
+//!
+//! The fence leaves open the lines appended before the first fenced write, a rollup
+//! deleted or moved by hand, and an older `reliability`'s report, which still leaves
+//! `null` lines out; and on every machine that has run this build, every older build's
+//! `stats` and compaction stay stopped, which is the fence's purpose. No older build
+//! runs as the daemon against a store that holds a `null` line (the deployment rule of
+//! issue #1604).
 //!
 //! # Roll-once-per-whole-day, so the aggregates are exact
 //!
@@ -68,17 +102,12 @@
 //! credential-bearing types ([`crate::keychain`] / [`crate::claude_state`]) that
 //! deliberately omit `Debug`.
 //!
-//! # Not-yet-wired seam
+//! # Who writes and who reads
 //!
-//! This module owns the store's data model and file operations only. The daemon's
-//! per-poll collector (issue #156) will call [`append_sample`] + [`compact_and_roll`],
-//! and the read-only reporting tools (issue #157) will call [`read_samples`] /
-//! [`read_rollup`]. Until then every item here is unused by the binary itself
-//! (main.rs only declares the module), exactly as main.rs frames every subsystem —
-//! hence the module-level `dead_code` allowance, mirroring [`crate::migration`].
-
-// See the "Not-yet-wired seam" note above: #156/#157 wire the read/write callers.
-#![allow(dead_code)]
+//! This module owns the store's data model and file operations. The daemon's per-poll
+//! collector (issue #156, in [`crate::daemon`]) calls [`append_sample`] and
+//! [`compact_and_roll`]; the read-only reporting verbs (issue #157, [`crate::stats`] and
+//! [`crate::reliability`]) call [`read_samples`] and [`read_rollup`].
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -105,8 +134,9 @@ const DEFAULT_HOURLY_WINDOW_SECS: i64 = 90 * DAY_SECS;
 /// (observed samples ÷ expected samples). Matches `config`'s `DEFAULT_POLL_SECS`.
 const DEFAULT_POLL_INTERVAL_SECS: i64 = 300;
 /// A reading at or above this utilisation fraction has hit the quota cap — the
-/// `cap_hits` tally counts these per day, per dimension. Usage fractions are
-/// `consumed / limit`, so `1.0` is exactly the cap and readings can exceed it.
+/// `cap_hits` tally counts these per day, over the readings that carried the axis.
+/// Usage fractions are `consumed / limit`, so `1.0` is exactly the cap and readings
+/// can exceed it.
 const CAP_FRACTION: f64 = 1.0;
 /// The percentile the daily tier records (95th).
 const P95: f64 = 0.95;
@@ -130,7 +160,8 @@ const STORE_LOCK_RETRY: Duration = Duration::from_millis(20);
 /// never — see the module's redaction note), and every other field is a non-secret
 /// percentage, timestamp or label — so `Debug` is safe here (contrast the
 /// credential-bearing types that omit it). The four optional fields are omitted from
-/// the JSON entirely when absent, keeping each line minimal.
+/// the JSON entirely when absent, keeping each line minimal; the two fraction keys
+/// are always present, `null` for a window the account lacks.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Sample {
     /// When the reading was taken, as whole UTC epoch seconds.
@@ -143,11 +174,17 @@ pub(crate) struct Sample {
     /// UNAUTHORED email or a token NEVER — the store's redaction invariant (issue #15;
     /// see `redaction::meter::unauthored_emails`).
     pub(crate) acct: String,
-    /// Fraction in `[0.0, …]` of the rolling 5-hour session window consumed
-    /// (`1.0` = exhausted; readings can exceed it).
-    pub(crate) session: f64,
-    /// Fraction in `[0.0, …]` of the weekly window consumed.
-    pub(crate) weekly: f64,
+    /// Fraction in `[0.0, …]` of the rolling 5-hour session window consumed (`1.0` =
+    /// exhausted; readings can exceed it), or `None` when the account has no session
+    /// window. Always written — as JSON `null` when `None` — so a line's key set does not
+    /// depend on which windows the account has; a non-finite `Some` is refused at
+    /// serialization rather than written as `null`, which would read back as "no window".
+    #[serde(default, serialize_with = "serialize_finite_fraction")]
+    pub(crate) session: Option<f64>,
+    /// Fraction in `[0.0, …]` of the weekly window consumed, or `None` when the account
+    /// has no weekly window. Written and refused exactly as `session`.
+    #[serde(default, serialize_with = "serialize_finite_fraction")]
+    pub(crate) weekly: Option<f64>,
     /// Epoch seconds at which the SESSION window resets, when the poll knew it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_resets_at: Option<i64>,
@@ -173,8 +210,8 @@ impl Sample {
         ts: i64,
         provider: impl Into<String>,
         acct: impl Into<String>,
-        session: f64,
-        weekly: f64,
+        session: Option<f64>,
+        weekly: Option<f64>,
     ) -> Self {
         Self {
             ts,
@@ -213,6 +250,23 @@ impl Sample {
     }
 }
 
+/// Serialize a usage fraction: `None` as JSON `null`, a finite `Some` as the number, a
+/// non-finite `Some` as an error (the hint `serialize_err` carries). JSON has no
+/// spelling for `±∞` / `NaN`, and `serde_json` would otherwise write `null` — which now
+/// means "no window", so the ambiguity is refused at the only writer.
+fn serialize_finite_fraction<S: serde::Serializer>(
+    value: &Option<f64>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match value {
+        None => serializer.serialize_none(),
+        Some(fraction) if fraction.is_finite() => serializer.serialize_some(fraction),
+        Some(_) => Err(serde::ser::Error::custom(
+            "a usage value was not a finite number",
+        )),
+    }
+}
+
 /// The rolled-aggregate object — one atomically-rewritten JSON document holding the
 /// hourly and daily tiers plus the roll watermark.
 ///
@@ -231,59 +285,87 @@ pub(crate) struct Rollup {
     pub(crate) daily: Vec<DayBucket>,
 }
 
-/// One hour's aggregate: max / mean / count per dimension. The mid-resolution tier —
+/// One hour's aggregate: the hour's sample count, and max / mean per dimension the
+/// bucket's readings carried; omitted when none did. The mid-resolution tier —
 /// enough to chart a day's shape, cheap enough to keep ~90 d of them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct HourBucket {
     /// Epoch seconds at the top of the hour (UTC), the bucket key.
     pub(crate) hour_start: i64,
-    /// How many samples fell in this hour.
+    /// How many samples fell in this hour — every sample, whichever windows it carried.
     pub(crate) count: u32,
-    /// Session-dimension max + mean over the hour.
-    pub(crate) session: HourStat,
-    /// Weekly-dimension max + mean over the hour.
-    pub(crate) weekly: HourStat,
+    /// Session-dimension max + mean over the hour's samples that carried a session
+    /// reading; omitted when none did. An observation over the readings present, never a
+    /// statistic fabricated for an account that has no such window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session: Option<HourStat>,
+    /// Weekly-dimension max + mean over the hour's samples that carried a weekly
+    /// reading; omitted when none did, on the same terms as `session`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly: Option<HourStat>,
 }
 
-/// The hourly tier's per-dimension summary: peak and mean utilisation.
+/// The hourly tier's summary of one dimension the bucket's readings carried: peak and
+/// mean utilisation over those readings, and how many they were.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct HourStat {
-    /// Peak utilisation fraction over the bucket.
+    /// Peak utilisation fraction over the bucket's readings on this axis.
     pub(crate) max: f64,
-    /// Mean utilisation fraction over the bucket.
+    /// Mean utilisation fraction over the bucket's readings on this axis.
     pub(crate) mean: f64,
+    /// How many of the bucket's samples carried this axis: the samples `max` and `mean` are
+    /// over. Set at fold time, at least 1 and at most the bucket's `count`. `None` means not
+    /// recorded (a bucket folded before this field existed): never the bucket's `count`,
+    /// never `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) samples: Option<u32>,
 }
 
-/// One day's aggregate: max / mean / p95 / cap-hits per dimension, plus a coverage
-/// ratio. The lowest-resolution tier — kept for the store's lifetime, so it is what
-/// a "lifetime" reader consults.
+/// One day's aggregate: the day's sample count and coverage ratio, and max / mean / p95
+/// / cap-hits per dimension the bucket's readings carried; omitted when none did. The
+/// lowest-resolution tier — kept for the store's lifetime, so it is what a "lifetime"
+/// reader consults.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DayBucket {
     /// Epoch seconds at UTC midnight of the day, the bucket key.
     pub(crate) day_start: i64,
-    /// How many samples fell in this day.
+    /// How many samples fell in this day — every sample, whichever windows it carried.
     pub(crate) count: u32,
     /// Observed samples ÷ expected samples for the day (clamped to `1.0`) — how
     /// complete the day's data is, so a sparsely-polled day is not misread as calm.
+    /// Over the day's whole sample count, like `count`.
     pub(crate) coverage: f64,
-    /// Session-dimension summary over the day.
-    pub(crate) session: DayStat,
-    /// Weekly-dimension summary over the day.
-    pub(crate) weekly: DayStat,
+    /// Session-dimension summary over the day's samples that carried a session reading;
+    /// omitted when none did. An observation over the readings present, never a statistic
+    /// fabricated for an account that has no such window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session: Option<DayStat>,
+    /// Weekly-dimension summary over the day's samples that carried a weekly reading;
+    /// omitted when none did, on the same terms as `session`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) weekly: Option<DayStat>,
 }
 
-/// The daily tier's per-dimension summary: peak, mean, 95th percentile and the
-/// count of cap-hit samples.
+/// The daily tier's summary of one dimension the bucket's readings carried: peak, mean,
+/// 95th percentile and the count of cap-hit samples over those readings, and how many
+/// they were.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DayStat {
-    /// Peak utilisation fraction over the day.
+    /// Peak utilisation fraction over the day's readings on this axis.
     pub(crate) max: f64,
-    /// Mean utilisation fraction over the day.
+    /// Mean utilisation fraction over the day's readings on this axis.
     pub(crate) mean: f64,
-    /// 95th-percentile utilisation fraction over the day (nearest-rank).
+    /// 95th-percentile utilisation fraction over the day's readings on this axis
+    /// (nearest-rank).
     pub(crate) p95: f64,
-    /// Samples at or above the quota cap ([`CAP_FRACTION`]) over the day.
+    /// Readings on this axis at or above the quota cap ([`CAP_FRACTION`]) over the day.
     pub(crate) cap_hits: u32,
+    /// How many of the day's samples carried this axis: the samples `max`, `mean`, `p95` and
+    /// `cap_hits` are over. Set at fold time, at least 1 and at most the bucket's `count`.
+    /// `None` means not recorded (a bucket folded before this field existed): never the
+    /// bucket's `count`, never `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) samples: Option<u32>,
 }
 
 /// The bounds that govern [`compact_and_roll`]. Defaults are self-contained; the
@@ -466,7 +548,46 @@ pub(crate) fn read_samples(samples_path: &Path) -> Result<Vec<Sample>> {
     Ok(samples)
 }
 
+/// The usage store's on-disk generation. Generation 1 is the bare `Rollup` every build
+/// before issue #1598 wrote, with no `format` key; generation 2 wraps it as
+/// `{"format":2,"rollup":{…}}`, which every build before #1598 refuses before it rewrites
+/// either file. Bump it with any change to the written shape of either store file, and add
+/// the new generation's pins to `the_written_store_shape_is_pinned_to_its_generation`.
+/// The retired generation's pins stay: that test reads every generation's pinned text back
+/// through [`read_rollup`] and the [`Sample`] decoder, so they keep guarding what this build
+/// still reads once the writer assertions move on. That test detects a change to a value it
+/// pins, so a new optional field is set in one of its canonical values, or its arrival passes
+/// the test unseen.
+const ROLLUP_FORMAT: u32 = 2;
+
+/// The top-level `format` key alone, read before the body so the dispatch never guesses.
+#[derive(Deserialize)]
+struct FormatProbe {
+    #[serde(default)]
+    format: Option<u32>,
+}
+
+/// The rollup file as this build writes it: the generation, then the rollup itself.
+#[derive(Serialize)]
+struct RollupFileOut<'a> {
+    format: u32,
+    rollup: &'a Rollup,
+}
+
+/// The body of a rollup file whose `format` this build reads.
+#[derive(Deserialize)]
+struct RollupFileIn {
+    rollup: Rollup,
+}
+
 /// Read the rolled-aggregate object; an absent file reads as an empty [`Rollup`].
+///
+/// The file's `format` key decides how it is read, explicitly: this build's own
+/// generation ([`ROLLUP_FORMAT`]) is the envelope [`write_rollup`] writes; no `format` key
+/// is the legacy generation 1, the bare [`Rollup`] every earlier build wrote, whose
+/// statistics read back with no recorded `samples`; a `format` above this build's own was
+/// written by a newer sessiometer and is refused ([`Error::UsageRollupNewerFormat`]) —
+/// never a reason to delete or move the file.
 ///
 /// A present-but-unparseable rollup is a hard error ([`Error::UsageRollupMalformed`],
 /// redacted to a line/column) rather than a silent reset — the daily tier is
@@ -478,10 +599,26 @@ pub(crate) fn read_rollup(rollup_path: &Path) -> Result<Rollup> {
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Rollup::default()),
         Err(err) => return Err(Error::Io(err)),
     };
-    serde_json::from_slice(&bytes).map_err(|err| Error::UsageRollupMalformed {
+    let malformed = |err: serde_json::Error| Error::UsageRollupMalformed {
         line: err.line(),
         column: err.column(),
-    })
+    };
+    match serde_json::from_slice::<FormatProbe>(&bytes)
+        .map_err(malformed)?
+        .format
+    {
+        Some(ROLLUP_FORMAT) => serde_json::from_slice::<RollupFileIn>(&bytes)
+            .map(|file| file.rollup)
+            .map_err(malformed),
+        Some(found) if found > ROLLUP_FORMAT => Err(Error::UsageRollupNewerFormat {
+            found,
+            supported: ROLLUP_FORMAT,
+        }),
+        // No `format` key: generation 1, as every build before #1598 wrote it. No build
+        // writes a `format` below 2; such a file takes the same decode, and an envelope that
+        // carries one fails it at its own position.
+        _ => serde_json::from_slice::<Rollup>(&bytes).map_err(malformed),
+    }
 }
 
 /// Bound the raw window and fold aged samples into the hourly + daily tiers.
@@ -490,7 +627,9 @@ pub(crate) fn read_rollup(rollup_path: &Path) -> Result<Rollup> {
 /// against [`append_sample`] by the store lock ([`StoreLock`], issue #188) so the two
 /// writers can never interleave a torn rewrite. Under that lock it:
 ///
-/// 1. reads the raw samples and the current rollup;
+/// 1. reads the raw samples and the current rollup, and with it the store's generation:
+///    a rollup a newer sessiometer wrote ends the pass here, before either file is
+///    rewritten ([`Error::UsageRollupNewerFormat`]);
 /// 2. rolls every sample whose **whole day** has aged past `now - raw_window` and
 ///    is newer than the watermark — grouped by day (and, within a day, by hour) so
 ///    each bucket is built from that day's complete set in one exact batch;
@@ -619,6 +758,10 @@ fn plan_roll(
 /// [`compact_and_roll`] — never the append path). Empty `samples` writes an empty
 /// file. Uses [`crate::paths::write_private_file`] (tmp + `fsync` + `rename`, `0600`)
 /// so a concurrent reader never observes a half-written file.
+///
+/// Its one caller is [`compact_and_roll`], after [`read_rollup`] has checked the store's
+/// generation. Any new caller checks the generation first, or it rewrites a store that
+/// a newer generation wrote.
 fn write_samples(samples_path: &Path, samples: &[Sample]) -> Result<()> {
     let mut buf = Vec::new();
     for sample in samples {
@@ -628,7 +771,9 @@ fn write_samples(samples_path: &Path, samples: &[Sample]) -> Result<()> {
     paths::write_private_file(samples_path, &buf)
 }
 
-/// Atomically (over)write the rollup file.
+/// Atomically (over)write the rollup file, as the envelope
+/// `{"format":<ROLLUP_FORMAT>,"rollup":{…}}` — the only shape this build writes, and the
+/// only rollup writer.
 ///
 /// The rollup is our own `0600` file; the rewrite goes through the crate's atomic
 /// path so a concurrent reader sees the old-or-new object, never a half-written one.
@@ -638,7 +783,11 @@ fn write_samples(samples_path: &Path, samples: &[Sample]) -> Result<()> {
 /// back. Single-writer (now enforced by the store lock — [`StoreLock`], issue #188),
 /// so the `exists()` probe is race-free.
 fn write_rollup(rollup_path: &Path, rollup: &Rollup) -> Result<()> {
-    let bytes = serde_json::to_vec(rollup).map_err(|_| serialize_err())?;
+    let file = RollupFileOut {
+        format: ROLLUP_FORMAT,
+        rollup,
+    };
+    let bytes = serde_json::to_vec(&file).map_err(|_| serialize_err())?;
     if rollup_path.exists() {
         paths::write_preserving_mode(rollup_path, &bytes)
     } else {
@@ -650,6 +799,10 @@ fn write_rollup(rollup_path: &Path, rollup: &Rollup) -> Result<()> {
 /// (within a day) by hour. Each group is summarised exactly from its complete set;
 /// a same-key bucket is merged defensively (unreachable under the roll-once-per-day
 /// guarantee, but keeps the tiers duplicate-free if a late sample ever appears).
+///
+/// Each dimension is summarised over the group's samples that carried it, and the
+/// statistic records how many those were. A dimension none of them carried gets no
+/// statistic, so an account with no such window is never summarised as zero.
 fn fold_into_tiers(rollup: &mut Rollup, batch: &[Sample], policy: &RetentionPolicy) {
     let expected = expected_per_day(policy);
 
@@ -667,27 +820,28 @@ fn fold_into_tiers(rollup: &mut Rollup, batch: &[Sample], policy: &RetentionPoli
                 .push(sample);
         }
         for (hour, hour_samples) in by_hour {
-            let session: Vec<f64> = hour_samples.iter().map(|s| s.session).collect();
-            let weekly: Vec<f64> = hour_samples.iter().map(|s| s.weekly).collect();
+            let session: Vec<f64> = hour_samples.iter().filter_map(|s| s.session).collect();
+            let weekly: Vec<f64> = hour_samples.iter().filter_map(|s| s.weekly).collect();
+            let hour_stat = |xs: &[f64]| {
+                (!xs.is_empty()).then(|| HourStat {
+                    max: max_of(xs),
+                    mean: mean_of(xs),
+                    samples: Some(xs.len() as u32),
+                })
+            };
             upsert_hour(
                 rollup,
                 HourBucket {
                     hour_start: hour,
                     count: hour_samples.len() as u32,
-                    session: HourStat {
-                        max: max_of(&session),
-                        mean: mean_of(&session),
-                    },
-                    weekly: HourStat {
-                        max: max_of(&weekly),
-                        mean: mean_of(&weekly),
-                    },
+                    session: hour_stat(&session),
+                    weekly: hour_stat(&weekly),
                 },
             );
         }
 
-        let session: Vec<f64> = day_samples.iter().map(|s| s.session).collect();
-        let weekly: Vec<f64> = day_samples.iter().map(|s| s.weekly).collect();
+        let session: Vec<f64> = day_samples.iter().filter_map(|s| s.session).collect();
+        let weekly: Vec<f64> = day_samples.iter().filter_map(|s| s.weekly).collect();
         let count = day_samples.len() as u32;
         upsert_day(
             rollup,
@@ -695,16 +849,19 @@ fn fold_into_tiers(rollup: &mut Rollup, batch: &[Sample], policy: &RetentionPoli
                 day_start: day,
                 count,
                 coverage: (f64::from(count) / expected).min(1.0),
-                session: day_stat(&session),
-                weekly: day_stat(&weekly),
+                session: (!session.is_empty()).then(|| day_stat(&session)),
+                weekly: (!weekly.is_empty()).then(|| day_stat(&weekly)),
             },
             expected,
         );
     }
 }
 
-/// Insert `bucket`, or merge it into an existing same-hour bucket (max / mean /
-/// count all exactly mergeable).
+/// Insert `bucket`, or merge it into an existing same-hour bucket, each dimension on
+/// its own: see [`merge_hour_stat`]. `max` and `count` merge exactly; the pooled `mean`
+/// is exact when both operands recorded `samples`, and otherwise weighted by the two
+/// bucket counts, the pre-count rule, which is exact only when every sample of both
+/// buckets carried the axis.
 fn upsert_hour(rollup: &mut Rollup, bucket: HourBucket) {
     if let Some(existing) = rollup
         .hourly
@@ -712,15 +869,15 @@ fn upsert_hour(rollup: &mut Rollup, bucket: HourBucket) {
         .find(|b| b.hour_start == bucket.hour_start)
     {
         existing.session = merge_hour_stat(
-            &existing.session,
+            existing.session.as_ref(),
             existing.count,
-            &bucket.session,
+            bucket.session.as_ref(),
             bucket.count,
         );
         existing.weekly = merge_hour_stat(
-            &existing.weekly,
+            existing.weekly.as_ref(),
             existing.count,
-            &bucket.weekly,
+            bucket.weekly.as_ref(),
             bucket.count,
         );
         existing.count += bucket.count;
@@ -740,15 +897,15 @@ fn upsert_day(rollup: &mut Rollup, bucket: DayBucket, expected: f64) {
         .find(|b| b.day_start == bucket.day_start)
     {
         existing.session = merge_day_stat(
-            &existing.session,
+            existing.session.as_ref(),
             existing.count,
-            &bucket.session,
+            bucket.session.as_ref(),
             bucket.count,
         );
         existing.weekly = merge_day_stat(
-            &existing.weekly,
+            existing.weekly.as_ref(),
             existing.count,
-            &bucket.weekly,
+            bucket.weekly.as_ref(),
             bucket.count,
         );
         existing.count += bucket.count;
@@ -758,26 +915,76 @@ fn upsert_day(rollup: &mut Rollup, bucket: DayBucket, expected: f64) {
     }
 }
 
-/// Count-weighted merge of two hourly summaries.
-fn merge_hour_stat(a: &HourStat, a_count: u32, b: &HourStat, b_count: u32) -> HourStat {
-    HourStat {
-        max: a.max.max(b.max),
-        mean: weighted_mean(a.mean, a_count, b.mean, b_count),
+/// Merge two hourly summaries of ONE dimension, either of which may be absent
+/// (`a_count` / `b_count` are the two buckets' whole sample counts). Both absent: the
+/// result is absent. One absent: the present side unchanged, its recorded count
+/// included. Both present: `max` is the larger, and the mean and the merged count are
+/// [`merged_mean`]'s.
+fn merge_hour_stat(
+    a: Option<&HourStat>,
+    a_count: u32,
+    b: Option<&HourStat>,
+    b_count: u32,
+) -> Option<HourStat> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(only), None) | (None, Some(only)) => Some(only.clone()),
+        (Some(a), Some(b)) => {
+            let (mean, samples) =
+                merged_mean((a.mean, a.samples, a_count), (b.mean, b.samples, b_count));
+            Some(HourStat {
+                max: a.max.max(b.max),
+                mean,
+                samples,
+            })
+        }
     }
 }
 
-/// Count-weighted merge of two daily summaries (p95 conservative, cap-hits additive).
-fn merge_day_stat(a: &DayStat, a_count: u32, b: &DayStat, b_count: u32) -> DayStat {
-    DayStat {
-        max: a.max.max(b.max),
-        mean: weighted_mean(a.mean, a_count, b.mean, b_count),
-        p95: a.p95.max(b.p95),
-        cap_hits: a.cap_hits + b.cap_hits,
+/// Merge two daily summaries of ONE dimension, on [`merge_hour_stat`]'s terms; p95 is
+/// conservative (the larger of the two), cap-hits additive.
+fn merge_day_stat(
+    a: Option<&DayStat>,
+    a_count: u32,
+    b: Option<&DayStat>,
+    b_count: u32,
+) -> Option<DayStat> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(only), None) | (None, Some(only)) => Some(only.clone()),
+        (Some(a), Some(b)) => {
+            let (mean, samples) =
+                merged_mean((a.mean, a.samples, a_count), (b.mean, b.samples, b_count));
+            Some(DayStat {
+                max: a.max.max(b.max),
+                mean,
+                p95: a.p95.max(b.p95),
+                cap_hits: a.cap_hits + b.cap_hits,
+                samples,
+            })
+        }
     }
 }
 
-/// The count-weighted mean of two means. `a_count + b_count` is always `> 0` here
-/// (both operands come from non-empty buckets).
+/// The pooled mean of two present same-dimension statistics, and the count the merged
+/// statistic records. Each operand is `(mean, recorded samples, the bucket's count)`.
+///
+/// When both operands recorded how many samples they are over, those two counts weight
+/// the mean — `(m_a·n_a + m_b·n_b) / (n_a + n_b)` — and the merged statistic records
+/// their sum. When either did not, the two bucket counts weight it, the rule every build
+/// before the count existed applied, and the merged count is not recorded.
+fn merged_mean(a: (f64, Option<u32>, u32), b: (f64, Option<u32>, u32)) -> (f64, Option<u32>) {
+    let ((a_mean, a_samples, a_count), (b_mean, b_samples, b_count)) = (a, b);
+    match (a_samples, b_samples) {
+        (Some(n_a), Some(n_b)) => (weighted_mean(a_mean, n_a, b_mean, n_b), Some(n_a + n_b)),
+        _ => (weighted_mean(a_mean, a_count, b_mean, b_count), None),
+    }
+}
+
+/// The weighted mean of two means, by the weights it was given: the two recorded
+/// `samples` when both operands carry one, the two bucket counts otherwise. Both weights
+/// are at least 1 here, because a recorded `samples` is at least 1 and a bucket that
+/// holds a statistic holds at least one sample; the zero arm is dead defence.
 fn weighted_mean(a_mean: f64, a_count: u32, b_mean: f64, b_count: u32) -> f64 {
     let total = f64::from(a_count) + f64::from(b_count);
     if total == 0.0 {
@@ -803,13 +1010,15 @@ fn hour_start(ts: i64) -> i64 {
     ts - ts.rem_euclid(HOUR_SECS)
 }
 
-/// The peak of a non-empty slice of finite fractions.
+/// The peak of a non-empty slice of finite fractions — non-empty by construction: the
+/// fold builds a statistic only for a dimension at least one reading carried.
 fn max_of(xs: &[f64]) -> f64 {
     xs.iter().copied().fold(f64::NEG_INFINITY, f64::max)
 }
 
-/// The arithmetic mean of a slice (`0.0` for an empty slice, which the tiers never
-/// produce).
+/// The arithmetic mean of a slice. The `0.0` for an empty slice is dead defence: the
+/// fold guarantees a non-empty one, building a statistic only for a dimension at least
+/// one reading carried.
 fn mean_of(xs: &[f64]) -> f64 {
     if xs.is_empty() {
         0.0
@@ -818,26 +1027,30 @@ fn mean_of(xs: &[f64]) -> f64 {
     }
 }
 
-/// The 95th-percentile value of `xs` by the nearest-rank method (`0.0` for empty). Delegates
-/// to the shared [`crate::percentile::percentile`] (issue #455) — the single copy of the
-/// nearest-rank math.
+/// The 95th-percentile value of `xs` by the nearest-rank method (`0.0` for empty — dead
+/// defence here, as in [`mean_of`]). Delegates to the shared
+/// [`crate::percentile::percentile`] (issue #455) — the single copy of the nearest-rank math.
 fn p95_of(xs: &[f64]) -> f64 {
     crate::percentile::percentile(xs, P95)
 }
 
-/// The daily per-dimension summary over a day's `xs`.
+/// The daily summary of one dimension over `xs`, the day's readings that carried it —
+/// built per dimension the bucket's readings carried; omitted when none did, so `xs` is
+/// never empty here.
 fn day_stat(xs: &[f64]) -> DayStat {
     DayStat {
         max: max_of(xs),
         mean: mean_of(xs),
         p95: p95_of(xs),
         cap_hits: xs.iter().filter(|&&x| x >= CAP_FRACTION).count() as u32,
+        samples: Some(xs.len() as u32),
     }
 }
 
-/// The secret-free serialize error — reachable only for a non-finite float in a
-/// usage fraction/spend, which JSON cannot represent. The store holds no secret, so
-/// the static hint leaks nothing.
+/// The secret-free serialize error — reachable for a non-finite usage fraction, which
+/// JSON cannot represent: the error comes from the field serializer
+/// ([`serialize_finite_fraction`]), which refuses it rather than write the `null` that
+/// means "no window". The store holds no secret, so the static hint leaks nothing.
 fn serialize_err() -> Error {
     Error::UsageStoreSerialize("a usage value was not a finite number")
 }
@@ -853,7 +1066,7 @@ mod tests {
 
     /// A minimal reading: `provider="claude"`, `acct="work"`, no optionals.
     fn sample(ts: i64, session: f64, weekly: f64) -> Sample {
-        Sample::new(ts, "claude", "work", session, weekly)
+        Sample::new(ts, "claude", "work", Some(session), Some(weekly))
     }
 
     /// The two store paths under a fresh temp dir.
@@ -862,6 +1075,36 @@ mod tests {
             dir.join("usage-samples.jsonl"),
             dir.join("usage-rollup.json"),
         )
+    }
+
+    /// Reads a window's fraction the same way before and after the `f64` → `Option<f64>` lift
+    /// (issue #1590), so one assertion text compiles, and passes `clippy -D warnings`, on both sides.
+    fn optional_fraction(window: impl Into<Option<f64>>) -> Option<f64> {
+        window.into()
+    }
+
+    /// Write `lines` to `path` by hand, one JSON object per line, each ending in `\n`: the raw
+    /// file exactly as a build may have left it (issue #1598).
+    fn write_raw_lines(path: &Path, lines: &[&str]) {
+        let mut text = String::new();
+        for line in lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        fs::write(path, text).unwrap();
+    }
+
+    /// The sorted top-level keys of a JSON object, which the store's key-set assertions read
+    /// (issue #1598).
+    fn sorted_keys(value: &serde_json::Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("a store record is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
     }
 
     // --- AC 1: sample serialize/deserialize round-trip ------------------------
@@ -883,6 +1126,107 @@ mod tests {
         for absent in ["session_resets_at", "weekly_resets_at", "severity", "spend"] {
             assert!(!json.contains(absent), "absent optional leaked: {json}");
         }
+
+        // An account without a window carries that axis as `null`: the key is written, never
+        // omitted and never a fabricated `0`, and the sample round-trips equal (issue #1598).
+        let weekly_only = Sample::new(1_700_000_000, "claude", "work", None, Some(0.2));
+        let json = serde_json::to_string(&weekly_only).unwrap();
+        assert!(
+            json.contains("\"session\":null"),
+            "T5: an absent session must be written as null: {json}"
+        );
+        for absent in ["session_resets_at", "weekly_resets_at", "severity", "spend"] {
+            assert!(!json.contains(absent), "T5: absent optional leaked: {json}");
+        }
+        assert_eq!(serde_json::from_str::<Sample>(&json).unwrap(), weekly_only);
+        let session_only = Sample::new(1_700_000_000, "claude", "work", Some(0.1), None);
+        let json = serde_json::to_string(&session_only).unwrap();
+        assert!(
+            json.contains("\"weekly\":null"),
+            "T5: an absent weekly must be written as null: {json}"
+        );
+        for absent in ["session_resets_at", "weekly_resets_at", "severity", "spend"] {
+            assert!(!json.contains(absent), "T5: absent optional leaked: {json}");
+        }
+        assert_eq!(serde_json::from_str::<Sample>(&json).unwrap(), session_only);
+    }
+
+    // --- issue #1598: an absent quota window is written and read as `null` ------------
+
+    #[test]
+    fn a_weekly_only_line_decodes_with_its_session_reading_absent() {
+        let line = r#"{"ts":0,"provider":"claude","acct":"work","session":null,"weekly":0.1}"#;
+        let s: Sample = serde_json::from_str(line).expect("T1: a weekly-only line must decode");
+        assert_eq!(
+            optional_fraction(s.session),
+            None,
+            "T1: the session reading must be absent"
+        );
+        let weekly = optional_fraction(s.weekly).expect("T1: the weekly reading must be present");
+        assert!(
+            (weekly - 0.1).abs() < 1e-9,
+            "T1: the weekly reading must read as written"
+        );
+    }
+
+    #[test]
+    fn a_session_only_line_decodes_with_its_weekly_reading_absent() {
+        let line = r#"{"ts":0,"provider":"claude","acct":"work","session":0.42,"weekly":null}"#;
+        let s: Sample = serde_json::from_str(line).expect("T2: a session-only line must decode");
+        let session =
+            optional_fraction(s.session).expect("T2: the session reading must be present");
+        assert!(
+            (session - 0.42).abs() < 1e-9,
+            "T2: the session reading must read as written"
+        );
+        assert_eq!(
+            optional_fraction(s.weekly),
+            None,
+            "T2: the weekly reading must be absent"
+        );
+    }
+
+    #[test]
+    fn a_weekly_only_line_round_trips_with_the_session_key_written_as_null() {
+        let line = r#"{"ts":0,"provider":"claude","acct":"work","session":null,"weekly":0.1}"#;
+        let decoded: Sample =
+            serde_json::from_str(line).expect("T3: a weekly-only line must decode");
+        let encoded =
+            serde_json::to_string(&decoded).expect("T3: a weekly-only sample must serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&encoded).expect("T3: the re-encoded line must parse");
+        assert_eq!(
+            sorted_keys(&value),
+            ["acct", "provider", "session", "ts", "weekly"],
+            "T3: the session key must be written, never omitted: {encoded}"
+        );
+        assert!(
+            encoded.contains("\"session\":null"),
+            "T3: the absent session must be written as null: {encoded}"
+        );
+        let again: Sample =
+            serde_json::from_str(&encoded).expect("T3: the re-encoded line must decode");
+        assert_eq!(
+            again, decoded,
+            "T3: the re-encoded line must decode to the first decode"
+        );
+    }
+
+    #[test]
+    fn a_line_omitting_the_session_key_reads_as_no_session_reading() {
+        let line = r#"{"ts":0,"provider":"claude","acct":"work","weekly":0.1}"#;
+        let s: Sample =
+            serde_json::from_str(line).expect("T4: a line omitting the session key must decode");
+        assert_eq!(
+            optional_fraction(s.session),
+            None,
+            "T4: an omitted session key must read as no session reading"
+        );
+        assert_eq!(
+            optional_fraction(s.weekly),
+            Some(0.1),
+            "T4: and the weekly reading the line carries is read"
+        );
     }
 
     #[test]
@@ -928,18 +1272,20 @@ mod tests {
             day_start: 0,
             count: 3,
             coverage: 0.5,
-            session: DayStat {
+            session: Some(DayStat {
                 max: 0.9,
                 mean: 0.5,
                 p95: 0.85,
                 cap_hits: 0,
-            },
-            weekly: DayStat {
+                samples: None,
+            }),
+            weekly: Some(DayStat {
                 max: 0.4,
                 mean: 0.3,
                 p95: 0.38,
                 cap_hits: 0,
-            },
+                samples: None,
+            }),
         });
         write_rollup(&rollup_path, &rollup).unwrap();
         assert_eq!(
@@ -952,6 +1298,164 @@ mod tests {
         let mut tmp = rollup_path.clone().into_os_string();
         tmp.push(".tmp");
         assert!(!Path::new(&tmp).exists(), "no <path>.tmp left behind");
+    }
+
+    /// The rollup `fd8640b`'s `write_rollup` emitted, both axes in every bucket and no count:
+    /// the D6 ruling's committed fixture for the first read after the upgrade (issue #1598,
+    /// condition C1). Inline on purpose, never a file under `build/fixtures/`.
+    const FD8640B_ROLLUP: &str = r#"{"rolled_through_ts":9,"hourly":[{"hour_start":0,"count":2,"session":{"max":0.5,"mean":0.4},"weekly":{"max":0.8,"mean":0.7}}],"daily":[{"day_start":0,"count":2,"coverage":0.5,"session":{"max":0.5,"mean":0.4,"p95":0.5,"cap_hits":0},"weekly":{"max":0.8,"mean":0.7,"p95":0.8,"cap_hits":0}}]}"#;
+
+    #[test]
+    fn a_rollup_written_before_the_lift_reads_back_with_both_axes_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, rollup_path) = store_paths(dir.path());
+        fs::write(&rollup_path, FD8640B_ROLLUP).unwrap();
+
+        let rollup = read_rollup(&rollup_path)
+            .expect("T10: a rollup written before the lift must read back");
+        assert_eq!(
+            rollup.rolled_through_ts, 9,
+            "T10: the watermark must read as written"
+        );
+        assert_eq!(
+            rollup.hourly.len(),
+            1,
+            "T10: the hourly bucket must read back"
+        );
+        let hour = &rollup.hourly[0];
+        assert_eq!(
+            (hour.hour_start, hour.count),
+            (0, 2),
+            "T10: the hour's key and count must read as written"
+        );
+        for (axis, stat, max, mean) in [
+            ("session", hour.session.as_ref(), 0.5, 0.4),
+            ("weekly", hour.weekly.as_ref(), 0.8, 0.7),
+        ] {
+            let stat =
+                stat.unwrap_or_else(|| panic!("T10: the hour's {axis} statistic must be present"));
+            assert!(
+                (stat.max - max).abs() < 1e-9 && (stat.mean - mean).abs() < 1e-9,
+                "T10: the hour's {axis} statistic must read as written: {stat:?}"
+            );
+            assert_eq!(
+                stat.samples, None,
+                "T10: the hour's {axis} statistic must read as not recorded"
+            );
+        }
+        assert_eq!(
+            rollup.daily.len(),
+            1,
+            "T10: the daily bucket must read back"
+        );
+        let day = &rollup.daily[0];
+        assert_eq!(
+            (day.day_start, day.count),
+            (0, 2),
+            "T10: the day's key and count must read as written"
+        );
+        assert!(
+            (day.coverage - 0.5).abs() < 1e-9,
+            "T10: the day's coverage must read as written"
+        );
+        for (axis, stat, max, mean, p95) in [
+            ("session", day.session.as_ref(), 0.5, 0.4, 0.5),
+            ("weekly", day.weekly.as_ref(), 0.8, 0.7, 0.8),
+        ] {
+            let stat =
+                stat.unwrap_or_else(|| panic!("T10: the day's {axis} statistic must be present"));
+            assert!(
+                (stat.max - max).abs() < 1e-9
+                    && (stat.mean - mean).abs() < 1e-9
+                    && (stat.p95 - p95).abs() < 1e-9,
+                "T10: the day's {axis} statistic must read as written: {stat:?}"
+            );
+            assert_eq!(
+                stat.cap_hits, 0,
+                "T10: the day's {axis} cap_hits must read as written"
+            );
+            assert_eq!(
+                stat.samples, None,
+                "T10: the day's {axis} statistic must read as not recorded"
+            );
+        }
+
+        // Re-encoded, every bucket keeps both axes and no statistic gains a count: the text
+        // parses to the same JSON value as the input (RV-04).
+        let reencoded = serde_json::to_string(&rollup).expect("T10: the rollup must re-encode");
+        let value: serde_json::Value = serde_json::from_str(&reencoded).unwrap();
+        let buckets = value["hourly"]
+            .as_array()
+            .expect("T10: the re-encoded hourly tier")
+            .iter()
+            .chain(
+                value["daily"]
+                    .as_array()
+                    .expect("T10: the re-encoded daily tier"),
+            );
+        for bucket in buckets {
+            for axis in ["session", "weekly"] {
+                let stat = bucket.get(axis).unwrap_or_else(|| {
+                    panic!("T10: a re-encoded bucket must keep its {axis} statistic: {reencoded}")
+                });
+                assert!(
+                    stat.get("samples").is_none(),
+                    "T10: re-encoding must add no {axis} count: {reencoded}"
+                );
+            }
+        }
+        assert_eq!(
+            value,
+            serde_json::from_str::<serde_json::Value>(FD8640B_ROLLUP).unwrap(),
+            "T10: re-encoding must neither add nor lose a field"
+        );
+    }
+
+    #[test]
+    fn a_rollup_without_the_count_reads_every_statistic_as_not_recorded() {
+        // #1610's shape two: one axis omitted in a bucket, and one statistic present in a
+        // bucket of larger `count`, all without a recorded count (issue #1598, absorbing
+        // #1610's `buckets-written-before-the-field-read-as-not-recorded`).
+        let shape_two = r#"{"rolled_through_ts":9,"hourly":[{"hour_start":0,"count":4,"weekly":{"max":0.76,"mean":0.73}},{"hour_start":3600,"count":4,"session":{"max":0.5,"mean":0.4},"weekly":{"max":0.76,"mean":0.73}}],"daily":[]}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let (_, rollup_path) = store_paths(dir.path());
+        fs::write(&rollup_path, shape_two).unwrap();
+
+        let rollup = read_rollup(&rollup_path)
+            .expect("AC-25: a rollup written without the count must read back");
+        assert_eq!(
+            rollup.hourly.len(),
+            2,
+            "AC-25: both hourly buckets must read back"
+        );
+        assert_eq!(
+            rollup.hourly[0].session, None,
+            "AC-25: the first hour's omitted session axis must stay absent"
+        );
+        let statistics = [
+            ("hour 0 weekly", rollup.hourly[0].weekly.as_ref()),
+            ("hour 3600 session", rollup.hourly[1].session.as_ref()),
+            ("hour 3600 weekly", rollup.hourly[1].weekly.as_ref()),
+        ];
+        for (what, stat) in statistics {
+            let stat =
+                stat.unwrap_or_else(|| panic!("AC-25: the {what} statistic must be present"));
+            assert_eq!(
+                stat.samples, None,
+                "AC-25: the {what} statistic must read as not recorded, never as the bucket's count or 0"
+            );
+        }
+        assert!(
+            rollup.daily.is_empty(),
+            "AC-25: the empty daily tier must read back empty"
+        );
+
+        let reencoded = serde_json::to_string(&rollup).expect("AC-25: the rollup must re-encode");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reencoded).unwrap(),
+            serde_json::from_str::<serde_json::Value>(shape_two).unwrap(),
+            "AC-25: re-encoding must gain no count and lose no field: {reencoded}"
+        );
     }
 
     #[test]
@@ -974,18 +1478,20 @@ mod tests {
                     day_start: i64::from(d) * DAY_SECS,
                     count: 288,
                     coverage: 1.0,
-                    session: DayStat {
+                    session: Some(DayStat {
                         max: 0.99,
                         mean: 0.55,
                         p95: 0.92,
                         cap_hits: 2,
-                    },
-                    weekly: DayStat {
+                        samples: None,
+                    }),
+                    weekly: Some(DayStat {
                         max: 0.61,
                         mean: 0.40,
                         p95: 0.58,
                         cap_hits: 0,
-                    },
+                        samples: None,
+                    }),
                 });
             }
             r
@@ -1188,13 +1694,356 @@ mod tests {
         let rollup = read_rollup(&rollup_path).unwrap();
         let bucket = rollup.daily.iter().find(|d| d.day_start == day).unwrap();
         assert_eq!(bucket.count, 6);
-        assert!((bucket.session.max - 1.2).abs() < 1e-9, "max");
-        assert!((bucket.session.mean - 0.7).abs() < 1e-9, "mean");
+        let session = bucket.session.as_ref().expect("session readings present");
+        assert!((session.max - 1.2).abs() < 1e-9, "max");
+        assert!((session.mean - 0.7).abs() < 1e-9, "mean");
         // Nearest-rank p95 of 6 values: ceil(0.95*6)=6 → the 6th (largest) = 1.2.
-        assert!((bucket.session.p95 - 1.2).abs() < 1e-9, "p95");
-        assert_eq!(bucket.session.cap_hits, 2, "1.0 and 1.2 are cap hits");
+        assert!((session.p95 - 1.2).abs() < 1e-9, "p95");
+        assert_eq!(session.cap_hits, 2, "1.0 and 1.2 are cap hits");
         // Coverage = 6 observed ÷ (86400/300 = 288 expected).
         assert!((bucket.coverage - 6.0 / 288.0).abs() < 1e-9, "coverage");
+    }
+
+    // --- issue #1598: weekly-only lines survive compaction and fold honestly ------------
+
+    /// The raw file T8a and T8b compact, in file order (issue #1598 § 6): two aged days, each
+    /// wholly older than the default 14-day raw window at `200 * DAY_SECS` — day 170 holds
+    /// four weekly-only readings, day 171 two weekly-only readings and two with both axes —
+    /// then a weekly-only cohort inside the window. `14695200` is
+    /// `170 * DAY_SECS + 2 * HOUR_SECS`, `14781600` is `171 * DAY_SECS + 2 * HOUR_SECS`, and
+    /// `17107200` is `200 * DAY_SECS - 2 * DAY_SECS`.
+    const WEEKLY_ONLY_STORE_LINES: [&str; 11] = [
+        r#"{"ts":14695200,"provider":"claude","acct":"work","session":null,"weekly":0.6}"#,
+        r#"{"ts":14695800,"provider":"claude","acct":"work","session":null,"weekly":0.62}"#,
+        r#"{"ts":14696400,"provider":"claude","acct":"work","session":null,"weekly":0.64}"#,
+        r#"{"ts":14697000,"provider":"claude","acct":"work","session":null,"weekly":0.66}"#,
+        r#"{"ts":14781600,"provider":"claude","acct":"work","session":null,"weekly":0.7}"#,
+        r#"{"ts":14782200,"provider":"claude","acct":"work","session":null,"weekly":0.72}"#,
+        r#"{"ts":14782800,"provider":"claude","acct":"work","session":0.3,"weekly":0.74}"#,
+        r#"{"ts":14783400,"provider":"claude","acct":"work","session":0.5,"weekly":0.76}"#,
+        r#"{"ts":17107200,"provider":"claude","acct":"work","session":null,"weekly":0.8}"#,
+        r#"{"ts":17107800,"provider":"claude","acct":"work","session":null,"weekly":0.81}"#,
+        r#"{"ts":17108400,"provider":"claude","acct":"work","session":null,"weekly":0.82}"#,
+    ];
+
+    /// A temp store holding `WEEKLY_ONLY_STORE_LINES`, compacted once at `now = 200 * DAY_SECS`
+    /// under the default policy. Returns the temp dir, which must outlive the two paths.
+    fn compacted_weekly_only_store() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (samples_path, rollup_path) = store_paths(dir.path());
+        write_raw_lines(&samples_path, &WEEKLY_ONLY_STORE_LINES);
+        compact_and_roll(
+            &samples_path,
+            &rollup_path,
+            200 * DAY_SECS,
+            &RetentionPolicy::default(),
+        )
+        .expect("the weekly-only store must compact");
+        (dir, samples_path, rollup_path)
+    }
+
+    #[test]
+    fn compaction_retains_weekly_only_lines_and_leaves_the_rollup_readable() {
+        let (_dir, samples_path, rollup_path) = compacted_weekly_only_store();
+
+        let raw = fs::read_to_string(&samples_path).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("T8a: every retained line must parse"))
+            .collect();
+        let retained: Vec<i64> = lines
+            .iter()
+            .map(|line| {
+                line["ts"]
+                    .as_i64()
+                    .expect("T8a: a retained line must carry its ts")
+            })
+            .collect();
+        assert_eq!(
+            retained,
+            [17_107_200, 17_107_800, 17_108_400],
+            "T8a: the weekly-only lines must survive compaction"
+        );
+        for (line, weekly) in lines.iter().zip([0.8, 0.81, 0.82]) {
+            assert_eq!(
+                line.get("session"),
+                Some(&serde_json::Value::Null),
+                "T8a: a retained line must keep its session key, as null: {line}"
+            );
+            let kept = line["weekly"]
+                .as_f64()
+                .expect("T8a: the weekly reading must survive compaction");
+            assert!(
+                (kept - weekly).abs() < 1e-9,
+                "T8a: the weekly reading must survive as written: {line}"
+            );
+            assert_eq!(
+                sorted_keys(line),
+                ["acct", "provider", "session", "ts", "weekly"],
+                "T8a: a retained line must keep the exact key set: {line}"
+            );
+        }
+        assert_eq!(
+            read_samples(&samples_path).unwrap().len(),
+            3,
+            "T8a: every retained line must read back"
+        );
+
+        let rollup = read_rollup(&rollup_path).expect("T8a: the rollup must stay readable");
+        let text = fs::read_to_string(&rollup_path).unwrap();
+        for token in ["null", "inf", "NaN"] {
+            assert!(
+                !text.contains(token),
+                "T8a: the rollup must carry no `{token}`: {text}"
+            );
+        }
+        let days: Vec<i64> = rollup.daily.iter().map(|d| d.day_start).collect();
+        assert_eq!(
+            days,
+            [14_688_000, 14_774_400],
+            "T8a: both aged days must fold into the daily tier"
+        );
+        let hours: Vec<i64> = rollup.hourly.iter().map(|h| h.hour_start).collect();
+        assert_eq!(
+            hours,
+            [14_695_200, 14_781_600],
+            "T8a: both aged hours must fold into the hourly tier"
+        );
+    }
+
+    #[test]
+    fn a_bucket_whose_readings_carry_no_session_window_omits_the_session_statistic() {
+        let (_dir, _, rollup_path) = compacted_weekly_only_store();
+        let rollup = read_rollup(&rollup_path).expect("T8b: the rollup must read back");
+        let close = |actual: f64, expected: f64| (actual - expected).abs() < 1e-9;
+        let day = |start: i64| {
+            rollup
+                .daily
+                .iter()
+                .find(|d| d.day_start == start)
+                .unwrap_or_else(|| panic!("T8b: day {start} must fold"))
+        };
+        let hour = |start: i64| {
+            rollup
+                .hourly
+                .iter()
+                .find(|h| h.hour_start == start)
+                .unwrap_or_else(|| panic!("T8b: hour {start} must fold"))
+        };
+        // Expected (max, mean, p95, cap_hits, samples) of a daily statistic.
+        let assert_day = |stat: &DayStat, expected: (f64, f64, f64, u32, u32), what: &str| {
+            let (max, mean, p95, cap_hits, samples) = expected;
+            assert!(
+                close(stat.max, max) && close(stat.mean, mean) && close(stat.p95, p95),
+                "T8b: {what} is {stat:?}, expected max {max}, mean {mean}, p95 {p95}"
+            );
+            assert_eq!(stat.cap_hits, cap_hits, "T8b: {what} cap_hits");
+            assert_eq!(stat.samples, Some(samples), "T8b: {what} samples");
+        };
+        // Expected (max, mean, samples) of an hourly statistic.
+        let assert_hour = |stat: &HourStat, expected: (f64, f64, u32), what: &str| {
+            let (max, mean, samples) = expected;
+            assert!(
+                close(stat.max, max) && close(stat.mean, mean),
+                "T8b: {what} is {stat:?}, expected max {max}, mean {mean}"
+            );
+            assert_eq!(stat.samples, Some(samples), "T8b: {what} samples");
+        };
+
+        // Day 170 and its hour: four readings, none of them with a session window.
+        let d = day(14_688_000);
+        assert_eq!(
+            d.count, 4,
+            "T8b: day 14688000 count is its whole sample count"
+        );
+        assert!(
+            close(d.coverage, 4.0 / 288.0),
+            "T8b: day 14688000 coverage is over its whole sample count"
+        );
+        assert_eq!(
+            d.session, None,
+            "T8b: day 14688000 carried no session reading, so it has no session statistic"
+        );
+        let weekly = d
+            .weekly
+            .as_ref()
+            .expect("T8b: day 14688000 weekly statistic");
+        assert_day(weekly, (0.66, 0.63, 0.66, 0, 4), "day 14688000 weekly");
+        let h = hour(14_695_200);
+        assert_eq!(
+            h.count, 4,
+            "T8b: hour 14695200 count is its whole sample count"
+        );
+        assert_eq!(
+            h.session, None,
+            "T8b: hour 14695200 carried no session reading, so it has no session statistic"
+        );
+        let weekly = h
+            .weekly
+            .as_ref()
+            .expect("T8b: hour 14695200 weekly statistic");
+        assert_hour(weekly, (0.66, 0.63, 4), "hour 14695200 weekly");
+
+        // Day 171 and its hour: four readings, two of them with a session window.
+        let d = day(14_774_400);
+        assert_eq!(
+            d.count, 4,
+            "T8b: day 14774400 count is its whole sample count"
+        );
+        assert!(
+            close(d.coverage, 4.0 / 288.0),
+            "T8b: day 14774400 coverage is over its whole sample count"
+        );
+        let session = d
+            .session
+            .as_ref()
+            .expect("T8b: day 14774400 session statistic");
+        assert_day(session, (0.5, 0.4, 0.5, 0, 2), "day 14774400 session");
+        let weekly = d
+            .weekly
+            .as_ref()
+            .expect("T8b: day 14774400 weekly statistic");
+        assert_day(weekly, (0.76, 0.73, 0.76, 0, 4), "day 14774400 weekly");
+        let h = hour(14_781_600);
+        assert_eq!(
+            h.count, 4,
+            "T8b: hour 14781600 count is its whole sample count"
+        );
+        let session = h
+            .session
+            .as_ref()
+            .expect("T8b: hour 14781600 session statistic");
+        assert_hour(session, (0.5, 0.4, 2), "hour 14781600 session");
+        let weekly = h
+            .weekly
+            .as_ref()
+            .expect("T8b: hour 14781600 weekly statistic");
+        assert_hour(weekly, (0.76, 0.73, 4), "hour 14781600 weekly");
+
+        assert_eq!(
+            rollup.rolled_through_ts, 14_783_400,
+            "T8b: the watermark is the newest folded reading"
+        );
+    }
+
+    #[test]
+    fn count_invariants_hold_for_every_folded_bucket() {
+        // Five aged days, each one hour of four readings at two hours past midnight. As the
+        // stub's outline gives it, one axis is carried by none, exactly one or all four of a
+        // day's readings while the other axis is carried by all four, so each tier sees the
+        // none / exactly-one / all-four boundary on both axes and readings carrying both axes
+        // sit beside readings carrying one (issue #1598, absorbing #1610's
+        // `count-invariants-hold-for-every-folded-bucket`). Each pair is (session, weekly).
+        let carried_by: [(u32, u32); 5] = [(0, 4), (1, 4), (4, 4), (4, 0), (4, 1)];
+        let dir = tempfile::tempdir().unwrap();
+        let (samples_path, rollup_path) = store_paths(dir.path());
+        let reading = |present: bool, fraction: f64| {
+            if present {
+                fraction.to_string()
+            } else {
+                "null".to_owned()
+            }
+        };
+        let mut lines = Vec::new();
+        for (day, &(session_n, weekly_n)) in (170_i64..).zip(&carried_by) {
+            let hour = day * DAY_SECS + 2 * HOUR_SECS;
+            for k in 0..4_u32 {
+                lines.push(format!(
+                    r#"{{"ts":{},"provider":"claude","acct":"work","session":{},"weekly":{}}}"#,
+                    hour + i64::from(k) * 600,
+                    reading(k < session_n, 0.1 + 0.1 * f64::from(k)),
+                    reading(k < weekly_n, 0.5 + 0.1 * f64::from(k)),
+                ));
+            }
+        }
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        write_raw_lines(&samples_path, &lines);
+        compact_and_roll(
+            &samples_path,
+            &rollup_path,
+            200 * DAY_SECS,
+            &RetentionPolicy::default(),
+        )
+        .expect("AC-24: the five aged days must compact");
+        let rollup = read_rollup(&rollup_path).expect("AC-24: the rollup must read back");
+
+        for (day, &(session_n, weekly_n)) in (170_i64..).zip(&carried_by) {
+            let daily = rollup
+                .daily
+                .iter()
+                .find(|d| d.day_start == day * DAY_SECS)
+                .unwrap_or_else(|| panic!("AC-24: day {day} must fold"));
+            let hourly = rollup
+                .hourly
+                .iter()
+                .find(|h| h.hour_start == day * DAY_SECS + 2 * HOUR_SECS)
+                .unwrap_or_else(|| panic!("AC-24: day {day}'s hour must fold"));
+            assert_eq!(
+                (daily.count, hourly.count),
+                (4, 4),
+                "AC-24: day {day}: a bucket's count is every sample, whichever windows it carried"
+            );
+            // (tier, axis, readings that carried it, the bucket's count, (samples, max, mean)).
+            let statistics = [
+                (
+                    "daily",
+                    "session",
+                    session_n,
+                    daily.count,
+                    daily.session.as_ref().map(|s| (s.samples, s.max, s.mean)),
+                ),
+                (
+                    "daily",
+                    "weekly",
+                    weekly_n,
+                    daily.count,
+                    daily.weekly.as_ref().map(|s| (s.samples, s.max, s.mean)),
+                ),
+                (
+                    "hourly",
+                    "session",
+                    session_n,
+                    hourly.count,
+                    hourly.session.as_ref().map(|s| (s.samples, s.max, s.mean)),
+                ),
+                (
+                    "hourly",
+                    "weekly",
+                    weekly_n,
+                    hourly.count,
+                    hourly.weekly.as_ref().map(|s| (s.samples, s.max, s.mean)),
+                ),
+            ];
+            for (tier, axis, carried, count, statistic) in statistics {
+                match (carried, statistic) {
+                    (0, None) => {}
+                    (0, Some(statistic)) => panic!(
+                        "AC-24: day {day} {tier} {axis}: no reading carried the axis, yet a statistic was folded: {statistic:?}"
+                    ),
+                    (_, None) => panic!(
+                        "AC-24: day {day} {tier} {axis}: {carried} readings carried the axis, yet no statistic was folded"
+                    ),
+                    (_, Some((samples, max, mean))) => {
+                        assert_eq!(
+                            samples,
+                            Some(carried),
+                            "AC-24: day {day} {tier} {axis}: the count must be the readings that carried the axis"
+                        );
+                        assert!(
+                            (1..=count).contains(&carried),
+                            "AC-24: day {day} {tier} {axis}: a recorded count is at least 1 and at most the bucket's count"
+                        );
+                        if carried == 1 {
+                            assert!(
+                                (max - mean).abs() < 1e-12,
+                                "AC-24: day {day} {tier} {axis}: a statistic over one reading has max equal to mean"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // --- AC 5: store carries redacted handles + provenance-scoped labels only -----
@@ -1255,7 +2104,7 @@ mod tests {
         let authored = "alice@example.com";
         append_sample(
             &samples_path,
-            &Sample::new(1_700_000_000, "claude", authored, 0.9, 0.7)
+            &Sample::new(1_700_000_000, "claude", authored, Some(0.9), Some(0.7))
                 .with_severity(Some("critical".to_owned())),
         )
         .unwrap();
@@ -1360,6 +2209,310 @@ mod tests {
     fn weighted_mean_pools_by_count() {
         // (0.2·1 + 0.8·3) / 4 = 0.65.
         assert!((weighted_mean(0.2, 1, 0.8, 3) - 0.65).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_same_key_merge_keeps_an_absent_axis_absent() {
+        // The merge arms over operands with no recorded count (issue #1598): the bucket
+        // counts 2 and 2 weight a pooled mean.
+        let a = HourStat {
+            max: 0.5,
+            mean: 0.4,
+            samples: None,
+        };
+        let b = HourStat {
+            max: 0.7,
+            mean: 0.6,
+            samples: None,
+        };
+        assert_eq!(
+            merge_hour_stat(None, 2, None, 2),
+            None,
+            "T11: two absent hour statistics merge to an absent one"
+        );
+        assert_eq!(
+            merge_hour_stat(Some(&a), 2, None, 2),
+            Some(a.clone()),
+            "T11: an absent side leaves the present hour statistic unchanged"
+        );
+        assert_eq!(
+            merge_hour_stat(None, 2, Some(&a), 2),
+            Some(a.clone()),
+            "T11: an absent side leaves the present hour statistic unchanged, in either order"
+        );
+        let merged = merge_hour_stat(Some(&a), 2, Some(&b), 2)
+            .expect("T11: two present hour statistics merge to one");
+        assert!(
+            (merged.max - 0.7).abs() < 1e-9 && (merged.mean - 0.5).abs() < 1e-9,
+            "T11: the merged hour statistic is {merged:?}, expected max 0.7, mean 0.5"
+        );
+        assert_eq!(
+            merged.samples, None,
+            "T11: neither hour operand recorded a count, so the merge records none"
+        );
+
+        let c = DayStat {
+            max: 0.5,
+            mean: 0.4,
+            p95: 0.5,
+            cap_hits: 0,
+            samples: None,
+        };
+        let d = DayStat {
+            max: 1.2,
+            mean: 0.6,
+            p95: 1.2,
+            cap_hits: 1,
+            samples: None,
+        };
+        assert_eq!(
+            merge_day_stat(None, 2, None, 2),
+            None,
+            "T11: two absent day statistics merge to an absent one"
+        );
+        assert_eq!(
+            merge_day_stat(Some(&c), 2, None, 2),
+            Some(c.clone()),
+            "T11: an absent side leaves the present day statistic unchanged"
+        );
+        assert_eq!(
+            merge_day_stat(None, 2, Some(&c), 2),
+            Some(c.clone()),
+            "T11: an absent side leaves the present day statistic unchanged, in either order"
+        );
+        let merged = merge_day_stat(Some(&c), 2, Some(&d), 2)
+            .expect("T11: two present day statistics merge to one");
+        assert!(
+            (merged.max - 1.2).abs() < 1e-9
+                && (merged.mean - 0.5).abs() < 1e-9
+                && (merged.p95 - 1.2).abs() < 1e-9,
+            "T11: the merged day statistic is {merged:?}, expected max 1.2, mean 0.5, p95 1.2"
+        );
+        assert_eq!(
+            merged.cap_hits, 1,
+            "T11: the merged day statistic sums cap_hits"
+        );
+        assert_eq!(
+            merged.samples, None,
+            "T11: neither day operand recorded a count, so the merge records none"
+        );
+    }
+
+    #[test]
+    fn a_same_key_merge_weights_each_axis_by_its_recorded_count() {
+        // Both counts recorded (issue #1598, absorbing #1610's
+        // `same-key-merge-weights-each-axis-by-its-recorded-count`): each operand's bucket
+        // counts 4, its statistic is over 2 and 4 readings.
+        let a = HourStat {
+            max: 0.5,
+            mean: 0.4,
+            samples: Some(2),
+        };
+        let b = HourStat {
+            max: 0.9,
+            mean: 0.8,
+            samples: Some(4),
+        };
+        let merged = merge_hour_stat(Some(&a), 4, Some(&b), 4)
+            .expect("AC-26: two present hour statistics merge to one");
+        assert!(
+            (merged.max - 0.9).abs() < 1e-9 && (merged.mean - 2.0 / 3.0).abs() < 1e-9,
+            "AC-26: the hour merge must weight each mean by its recorded count, (0.4·2 + 0.8·4) / 6, not by the bucket counts: {merged:?}"
+        );
+        assert_eq!(
+            merged.samples,
+            Some(6),
+            "AC-26: the merged hour statistic records the sum of the two counts"
+        );
+        let c = DayStat {
+            max: 0.5,
+            mean: 0.4,
+            p95: 0.5,
+            cap_hits: 0,
+            samples: Some(2),
+        };
+        let d = DayStat {
+            max: 1.2,
+            mean: 0.8,
+            p95: 1.2,
+            cap_hits: 1,
+            samples: Some(4),
+        };
+        let merged = merge_day_stat(Some(&c), 4, Some(&d), 4)
+            .expect("AC-26: two present day statistics merge to one");
+        assert!(
+            (merged.max - 1.2).abs() < 1e-9
+                && (merged.mean - 2.0 / 3.0).abs() < 1e-9
+                && (merged.p95 - 1.2).abs() < 1e-9,
+            "AC-26: the day merge must weight each mean by its recorded count: {merged:?}"
+        );
+        assert_eq!(
+            merged.cap_hits, 1,
+            "AC-26: the merged day statistic sums cap_hits"
+        );
+        assert_eq!(
+            merged.samples,
+            Some(6),
+            "AC-26: the merged day statistic records the sum of the two counts"
+        );
+
+        // Either count not recorded: the bucket counts weight the mean, and the merged count
+        // is not recorded.
+        let a_unrecorded = HourStat {
+            samples: None,
+            ..a.clone()
+        };
+        let b_unrecorded = HourStat {
+            samples: None,
+            ..b.clone()
+        };
+        for (left, right) in [(&a_unrecorded, &b), (&a, &b_unrecorded)] {
+            let merged = merge_hour_stat(Some(left), 4, Some(right), 4)
+                .expect("AC-26: two present hour statistics merge to one");
+            assert!(
+                (merged.mean - 0.6).abs() < 1e-9,
+                "AC-26: with a count not recorded, the bucket counts weight the hour mean: {merged:?}"
+            );
+            assert_eq!(
+                merged.samples, None,
+                "AC-26: with a count not recorded, the merged hour count is not recorded"
+            );
+        }
+        let c_unrecorded = DayStat {
+            samples: None,
+            ..c.clone()
+        };
+        let d_unrecorded = DayStat {
+            samples: None,
+            ..d.clone()
+        };
+        for (left, right) in [(&c_unrecorded, &d), (&c, &d_unrecorded)] {
+            let merged = merge_day_stat(Some(left), 4, Some(right), 4)
+                .expect("AC-26: two present day statistics merge to one");
+            assert!(
+                (merged.mean - 0.6).abs() < 1e-9,
+                "AC-26: with a count not recorded, the bucket counts weight the day mean: {merged:?}"
+            );
+            assert_eq!(
+                merged.samples, None,
+                "AC-26: with a count not recorded, the merged day count is not recorded"
+            );
+        }
+
+        // One side absent: the present side unchanged, count included, in both orders. Both
+        // absent: absent.
+        assert_eq!(merge_hour_stat(Some(&a), 4, None, 4), Some(a.clone()));
+        assert_eq!(merge_hour_stat(None, 4, Some(&a), 4), Some(a.clone()));
+        assert_eq!(merge_hour_stat(None, 4, None, 4), None);
+        assert_eq!(merge_day_stat(Some(&c), 4, None, 4), Some(c.clone()));
+        assert_eq!(merge_day_stat(None, 4, Some(&c), 4), Some(c.clone()));
+        assert_eq!(merge_day_stat(None, 4, None, 4), None);
+
+        // The merged bucket's own count is the sum of the two, and its coverage is recomputed
+        // from that sum.
+        let mut rollup = Rollup::default();
+        for stat in [&c, &d] {
+            upsert_day(
+                &mut rollup,
+                DayBucket {
+                    day_start: 0,
+                    count: 4,
+                    coverage: 4.0 / 288.0,
+                    session: Some(stat.clone()),
+                    weekly: None,
+                },
+                288.0,
+            );
+        }
+        assert_eq!(
+            rollup.daily.len(),
+            1,
+            "AC-26: a same-key day merges into one bucket"
+        );
+        let merged = &rollup.daily[0];
+        assert_eq!(
+            merged.count, 8,
+            "AC-26: the merged bucket's count is the sum of the two"
+        );
+        assert!(
+            (merged.coverage - 8.0 / 288.0).abs() < 1e-9,
+            "AC-26: the merged bucket's coverage is recomputed from its count"
+        );
+        let session = merged
+            .session
+            .as_ref()
+            .expect("AC-26: the merged bucket keeps its session statistic");
+        assert!(
+            (session.mean - 2.0 / 3.0).abs() < 1e-9,
+            "AC-26: the merged bucket's session mean is weighted by the recorded counts: {session:?}"
+        );
+        assert_eq!(
+            session.samples,
+            Some(6),
+            "AC-26: the merged bucket's session count"
+        );
+        assert_eq!(
+            merged.weekly, None,
+            "AC-26: an axis absent on both sides of the merge stays absent"
+        );
+    }
+
+    /// The not-recorded arm over UNEQUAL bucket counts (issue #1598): with a count not recorded,
+    /// each operand's own bucket count weights the pooled mean, so buckets of 1 and 3 samples
+    /// pool `(0.4·1 + 0.8·3) / 4 = 0.7`, and the same operands with the counts the other way
+    /// round pool `(0.4·3 + 0.8·1) / 4 = 0.5`. Every other merge test passes equal bucket
+    /// counts, under which the plain mean 0.6, a dropped weight and a swapped weight all read
+    /// the same; a legacy bucket read from a generation-1 rollup always takes this arm.
+    #[test]
+    fn a_not_recorded_merge_weights_the_mean_by_each_operand_s_own_bucket_count() {
+        let a = HourStat {
+            max: 0.5,
+            mean: 0.4,
+            samples: None,
+        };
+        let b = HourStat {
+            max: 0.9,
+            mean: 0.8,
+            samples: Some(4),
+        };
+        for (a_count, b_count, expected) in [(1, 3, 0.7), (3, 1, 0.5)] {
+            let merged = merge_hour_stat(Some(&a), a_count, Some(&b), b_count)
+                .expect("two present hour statistics merge to one");
+            assert!(
+                (merged.mean - expected).abs() < 1e-9,
+                "the hour mean is weighted by the bucket counts {a_count} and {b_count}: {merged:?}, expected {expected}"
+            );
+            assert_eq!(
+                merged.samples, None,
+                "with a count not recorded, the merged hour count is not recorded"
+            );
+        }
+        let c = DayStat {
+            max: 0.5,
+            mean: 0.4,
+            p95: 0.5,
+            cap_hits: 0,
+            samples: None,
+        };
+        let d = DayStat {
+            max: 1.2,
+            mean: 0.8,
+            p95: 1.2,
+            cap_hits: 1,
+            samples: Some(4),
+        };
+        for (c_count, d_count, expected) in [(1, 3, 0.7), (3, 1, 0.5)] {
+            let merged = merge_day_stat(Some(&c), c_count, Some(&d), d_count)
+                .expect("two present day statistics merge to one");
+            assert!(
+                (merged.mean - expected).abs() < 1e-9,
+                "the day mean is weighted by the bucket counts {c_count} and {d_count}: {merged:?}, expected {expected}"
+            );
+            assert_eq!(
+                merged.samples, None,
+                "with a count not recorded, the merged day count is not recorded"
+            );
+        }
     }
 
     // --- issue #161: RollSummary + configurable daily retention ---------------
@@ -1681,6 +2834,417 @@ mod tests {
             remaining.len(),
             N as usize,
             "every concurrently-appended sample survived the compaction rewrites"
+        );
+    }
+
+    // --- issue #1598: the rollup fence (decision D6, amendment 1) -----------------------
+
+    #[test]
+    fn every_rollup_write_is_the_format_2_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let alone = dir.path().join("written-by-write-rollup.json");
+        write_rollup(&alone, &Rollup::default()).expect("T12: write_rollup must write");
+        let (_store, _, compacted) = compacted_weekly_only_store();
+
+        for (writer, path) in [("write_rollup", &alone), ("compact_and_roll", &compacted)] {
+            let text = fs::read_to_string(path).unwrap();
+            let file: serde_json::Value =
+                serde_json::from_str(&text).expect("T12: a rollup file must parse");
+            assert_eq!(
+                sorted_keys(&file),
+                ["format", "rollup"],
+                "T12: {writer} must write the format-2 envelope: {text}"
+            );
+            assert_eq!(
+                file["format"], 2,
+                "T12: {writer} must write format 2: {text}"
+            );
+            assert_eq!(
+                sorted_keys(&file["rollup"]),
+                ["daily", "hourly", "rolled_through_ts"],
+                "T12: {writer}'s envelope must hold the rollup itself: {text}"
+            );
+            let body: Rollup = serde_json::from_value(file["rollup"].clone())
+                .expect("T12: the envelope's rollup must decode");
+            assert_eq!(
+                read_rollup(path).expect("T12: read_rollup must read the envelope"),
+                body,
+                "T12: read_rollup must read back what {writer} wrote"
+            );
+        }
+        assert_eq!(
+            read_rollup(&alone).unwrap(),
+            Rollup::default(),
+            "T12: read_rollup must read back the rollup write_rollup was given"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_envelope_is_reported_at_its_own_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, rollup_path) = store_paths(dir.path());
+
+        // A format-2 envelope whose body is corrupt: refused at the bad field's own position.
+        fs::write(
+            &rollup_path,
+            r#"{"format":2,"rollup":{"rolled_through_ts":"x","hourly":[],"daily":[]}}"#,
+        )
+        .unwrap();
+        match read_rollup(&rollup_path) {
+            Err(Error::UsageRollupMalformed { line, column }) => {
+                assert_eq!(
+                    line, 1,
+                    "T13: a corrupt envelope must be reported on its own line"
+                );
+                assert!(
+                    column > 0,
+                    "T13: a corrupt envelope must be reported at its own column, never 0"
+                );
+            }
+            other => panic!("T13: a corrupt envelope must read as UsageRollupMalformed: {other:?}"),
+        }
+
+        // A `format` that is not a number: refused, never read as the legacy shape.
+        fs::write(
+            &rollup_path,
+            r#"{"format":"2","rolled_through_ts":0,"hourly":[],"daily":[]}"#,
+        )
+        .unwrap();
+        let non_numeric = read_rollup(&rollup_path);
+        assert!(
+            matches!(non_numeric, Err(Error::UsageRollupMalformed { .. })),
+            "T13: a format that is not a number must be refused as malformed: {non_numeric:?}"
+        );
+    }
+
+    // Frozen at `fd8640b`: the tier types every pre-#1598 build decodes. Never edit: issue
+    // #1598's fence is graded against them.
+    #[allow(dead_code)]
+    mod fd8640b_tiers {
+        use serde::Deserialize;
+
+        /// The rolled-aggregate object — one atomically-rewritten JSON document holding the
+        /// hourly and daily tiers plus the roll watermark.
+        ///
+        /// `rolled_through_ts` is the newest sample epoch already folded into the tiers: a
+        /// sample with `ts <= rolled_through_ts` has been rolled and must never be folded
+        /// again (the exactly-once guarantee). Non-secret throughout, so `Debug` is safe.
+        #[derive(Deserialize)]
+        pub(crate) struct Rollup {
+            /// The newest sample epoch already folded into the tiers (0 before any roll).
+            pub(crate) rolled_through_ts: i64,
+            /// The hourly tier — one bucket per hour, bounded to ~90 d, sorted by
+            /// `hour_start`.
+            pub(crate) hourly: Vec<HourBucket>,
+            /// The daily tier — one bucket per day, kept for the store's lifetime, sorted
+            /// by `day_start`.
+            pub(crate) daily: Vec<DayBucket>,
+        }
+
+        /// One hour's aggregate: max / mean / count per dimension. The mid-resolution tier —
+        /// enough to chart a day's shape, cheap enough to keep ~90 d of them.
+        #[derive(Deserialize)]
+        pub(crate) struct HourBucket {
+            /// Epoch seconds at the top of the hour (UTC), the bucket key.
+            pub(crate) hour_start: i64,
+            /// How many samples fell in this hour.
+            pub(crate) count: u32,
+            /// Session-dimension max + mean over the hour.
+            pub(crate) session: HourStat,
+            /// Weekly-dimension max + mean over the hour.
+            pub(crate) weekly: HourStat,
+        }
+
+        /// The hourly tier's per-dimension summary: peak and mean utilisation.
+        #[derive(Deserialize)]
+        pub(crate) struct HourStat {
+            /// Peak utilisation fraction over the bucket.
+            pub(crate) max: f64,
+            /// Mean utilisation fraction over the bucket.
+            pub(crate) mean: f64,
+        }
+
+        /// One day's aggregate: max / mean / p95 / cap-hits per dimension, plus a coverage
+        /// ratio. The lowest-resolution tier — kept for the store's lifetime, so it is what
+        /// a "lifetime" reader consults.
+        #[derive(Deserialize)]
+        pub(crate) struct DayBucket {
+            /// Epoch seconds at UTC midnight of the day, the bucket key.
+            pub(crate) day_start: i64,
+            /// How many samples fell in this day.
+            pub(crate) count: u32,
+            /// Observed samples ÷ expected samples for the day (clamped to `1.0`) — how
+            /// complete the day's data is, so a sparsely-polled day is not misread as calm.
+            pub(crate) coverage: f64,
+            /// Session-dimension summary over the day.
+            pub(crate) session: DayStat,
+            /// Weekly-dimension summary over the day.
+            pub(crate) weekly: DayStat,
+        }
+
+        /// The daily tier's per-dimension summary: peak, mean, 95th percentile and the
+        /// count of cap-hit samples.
+        #[derive(Deserialize)]
+        pub(crate) struct DayStat {
+            /// Peak utilisation fraction over the day.
+            pub(crate) max: f64,
+            /// Mean utilisation fraction over the day.
+            pub(crate) mean: f64,
+            /// 95th-percentile utilisation fraction over the day (nearest-rank).
+            pub(crate) p95: f64,
+            /// Samples at or above the quota cap ([`CAP_FRACTION`]) over the day.
+            pub(crate) cap_hits: u32,
+        }
+    }
+
+    #[test]
+    fn a_rollup_this_build_writes_is_refused_by_the_fd8640b_tier_types() {
+        // (a) The rollup a compaction writes over an empty store.
+        let empty = tempfile::tempdir().unwrap();
+        let (empty_samples, empty_rollup) = store_paths(empty.path());
+        compact_and_roll(
+            &empty_samples,
+            &empty_rollup,
+            200 * DAY_SECS,
+            &RetentionPolicy::default(),
+        )
+        .expect("T14: a compaction over an empty store must succeed");
+        // (b) The rollup it writes over an aged cohort that carries both axes on every line,
+        // so no bucket omits an axis.
+        let both = tempfile::tempdir().unwrap();
+        let (both_samples, both_rollup) = store_paths(both.path());
+        write_raw_lines(
+            &both_samples,
+            &[
+                r#"{"ts":14695200,"provider":"claude","acct":"work","session":0.3,"weekly":0.6}"#,
+                r#"{"ts":14695800,"provider":"claude","acct":"work","session":0.5,"weekly":0.62}"#,
+            ],
+        );
+        compact_and_roll(
+            &both_samples,
+            &both_rollup,
+            200 * DAY_SECS,
+            &RetentionPolicy::default(),
+        )
+        .expect("T14: a compaction over a both-axes store must succeed");
+
+        let mut decoded_by_fd8640b = Vec::new();
+        for (store, path) in [
+            ("empty store", &empty_rollup),
+            ("both-axes store", &both_rollup),
+        ] {
+            let bytes = fs::read(path).unwrap();
+            match serde_json::from_slice::<fd8640b_tiers::Rollup>(&bytes) {
+                Err(err) => assert!(
+                    err.to_string().contains("missing field"),
+                    "T14: the fd8640b tier types must refuse the {store}'s rollup for a missing field: {err}"
+                ),
+                Ok(_) => decoded_by_fd8640b.push(store),
+            }
+        }
+        assert!(
+            decoded_by_fd8640b.is_empty(),
+            "T14: the fd8640b tier types decode the rollup this build writes for {decoded_by_fd8640b:?}, so an older build would compact past the fence"
+        );
+    }
+
+    #[test]
+    fn a_legacy_rollup_survives_its_first_fenced_compaction_bucket_for_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let (samples_path, rollup_path) = store_paths(dir.path());
+        fs::write(&rollup_path, FD8640B_ROLLUP).unwrap();
+        fs::write(&samples_path, "").unwrap();
+        compact_and_roll(
+            &samples_path,
+            &rollup_path,
+            DAY_SECS,
+            &RetentionPolicy::default(),
+        )
+        .expect("T15: the first fenced compaction over a legacy rollup must succeed");
+
+        // The legacy literal as `read_rollup` reads it, from a copy the pass never touched.
+        let untouched = dir.path().join("fd8640b-rollup.json");
+        fs::write(&untouched, FD8640B_ROLLUP).unwrap();
+        let before = read_rollup(&untouched).expect("T15: the legacy literal must read back");
+        let after = read_rollup(&rollup_path).expect("T15: the rewritten rollup must read back");
+        assert_eq!(
+            after.rolled_through_ts, before.rolled_through_ts,
+            "T15: the watermark must survive the pass"
+        );
+        assert_eq!(
+            after.hourly, before.hourly,
+            "T15: the hourly tier must survive bucket for bucket"
+        );
+        assert_eq!(
+            after.daily, before.daily,
+            "T15: the daily tier must survive bucket for bucket"
+        );
+        let file: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&rollup_path).unwrap()).unwrap();
+        assert_eq!(
+            file["format"], 2,
+            "T15: the pass must rewrite the rollup as format 2: {file}"
+        );
+    }
+
+    #[test]
+    fn a_newer_store_format_is_refused_and_both_files_are_left_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let (samples_path, rollup_path) = store_paths(dir.path());
+        fs::write(
+            &rollup_path,
+            r#"{"format":3,"rollup":{"rolled_through_ts":9,"hourly":[],"daily":[]}}"#,
+        )
+        .unwrap();
+        // One aged line and one inside the raw window, so a pass would both fold and rewrite.
+        write_raw_lines(
+            &samples_path,
+            &[WEEKLY_ONLY_STORE_LINES[0], WEEKLY_ONLY_STORE_LINES[8]],
+        );
+        let samples_before = fs::read(&samples_path).unwrap();
+        let rollup_before = fs::read(&rollup_path).unwrap();
+
+        let compaction = compact_and_roll(
+            &samples_path,
+            &rollup_path,
+            200 * DAY_SECS,
+            &RetentionPolicy::default(),
+        )
+        .map(|_| ());
+        let read = read_rollup(&rollup_path).map(|_| ());
+        for (call, outcome) in [("compact_and_roll", compaction), ("read_rollup", read)] {
+            let err = match outcome {
+                Err(err) => err,
+                Ok(()) => panic!("T16: {call} must refuse a newer store format"),
+            };
+            assert!(
+                !matches!(err, Error::UsageRollupMalformed { .. }),
+                "T16: {call} must not report a newer store as malformed: {err}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains("newer sessiometer"),
+                "T16: {call}'s error must say a newer sessiometer wrote the file: {text}"
+            );
+            assert!(
+                text.contains("must not be deleted"),
+                "T16: {call}'s error must say the file must not be deleted: {text}"
+            );
+        }
+        assert_eq!(
+            fs::read(&samples_path).unwrap(),
+            samples_before,
+            "T16: the raw file must be left byte-identical"
+        );
+        assert_eq!(
+            fs::read(&rollup_path).unwrap(),
+            rollup_before,
+            "T16: the rollup file must be left byte-identical"
+        );
+    }
+
+    /// One generation's pinned written shapes: see `GENERATION_2_SHAPE`.
+    struct StoreShape {
+        generation: u32,
+        full_sample: &'static str,
+        weekly_only_sample: &'static str,
+        rollup: &'static str,
+    }
+
+    /// The written shape of each store file at generation 2, byte for byte: a sample that sets
+    /// every optional field, a sample whose session window is absent, and a rollup whose
+    /// statistics carry every field, its daily session omitted (issue #1598, condition C5).
+    /// Never edit these pins: a change to a pinned value fails the test below, and the remedy
+    /// is to bump `ROLLUP_FORMAT` and add the new generation's pins beside these. The writer
+    /// assertions then move to the new pins; these stay read back through `read_rollup` and
+    /// the `Sample` decoder, which is what a retired generation's pins guard.
+    const GENERATION_2_SHAPE: StoreShape = StoreShape {
+        generation: 2,
+        full_sample: r#"{"ts":1700000000,"provider":"claude","acct":"work","session":0.25,"weekly":0.5,"session_resets_at":1700018000,"weekly_resets_at":1700600000,"severity":"warning","spend":1.5}"#,
+        weekly_only_sample: r#"{"ts":1700000000,"provider":"claude","acct":"work","session":null,"weekly":0.5,"weekly_resets_at":1700600000}"#,
+        rollup: r#"{"format":2,"rollup":{"rolled_through_ts":7200,"hourly":[{"hour_start":3600,"count":4,"session":{"max":0.5,"mean":0.25,"samples":2},"weekly":{"max":0.75,"mean":0.5,"samples":4}}],"daily":[{"day_start":0,"count":4,"coverage":0.5,"weekly":{"max":1.0,"mean":0.5,"p95":1.0,"cap_hits":1,"samples":4}}]}}"#,
+    };
+
+    #[test]
+    fn the_written_store_shape_is_pinned_to_its_generation() {
+        let full = Sample::new(1_700_000_000, "claude", "work", Some(0.25), Some(0.5))
+            .with_resets(Some(1_700_018_000), Some(1_700_600_000))
+            .with_severity(Some("warning".to_owned()))
+            .with_spend(Some(1.5));
+        let weekly_only = Sample::new(1_700_000_000, "claude", "work", None, Some(0.5))
+            .with_resets(None, Some(1_700_600_000));
+        assert_eq!(
+            serde_json::to_string(&full).unwrap(),
+            GENERATION_2_SHAPE.full_sample,
+            "T17: a sample's written shape moved without a ROLLUP_FORMAT bump"
+        );
+        assert_eq!(
+            serde_json::to_string(&weekly_only).unwrap(),
+            GENERATION_2_SHAPE.weekly_only_sample,
+            "T17: a weekly-only sample's written shape moved without a ROLLUP_FORMAT bump"
+        );
+
+        let rollup = Rollup {
+            rolled_through_ts: 7200,
+            hourly: vec![HourBucket {
+                hour_start: 3600,
+                count: 4,
+                session: Some(HourStat {
+                    max: 0.5,
+                    mean: 0.25,
+                    samples: Some(2),
+                }),
+                weekly: Some(HourStat {
+                    max: 0.75,
+                    mean: 0.5,
+                    samples: Some(4),
+                }),
+            }],
+            daily: vec![DayBucket {
+                day_start: 0,
+                count: 4,
+                coverage: 0.5,
+                session: None,
+                weekly: Some(DayStat {
+                    max: 1.0,
+                    mean: 0.5,
+                    p95: 1.0,
+                    cap_hits: 1,
+                    samples: Some(4),
+                }),
+            }],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (_, rollup_path) = store_paths(dir.path());
+        write_rollup(&rollup_path, &rollup).unwrap();
+        assert_eq!(
+            fs::read_to_string(&rollup_path).unwrap(),
+            GENERATION_2_SHAPE.rollup,
+            "T17: the rollup's written shape moved without a ROLLUP_FORMAT bump"
+        );
+        assert_eq!(
+            ROLLUP_FORMAT, GENERATION_2_SHAPE.generation,
+            "T17: ROLLUP_FORMAT must equal the newest pinned generation"
+        );
+
+        // The read side: this build decodes each generation's pinned text back to the value
+        // that wrote it. Once a later generation retires these pins from the writer
+        // assertions above, this is what they keep guarding.
+        assert_eq!(
+            serde_json::from_str::<Sample>(GENERATION_2_SHAPE.full_sample).unwrap(),
+            full,
+            "T17: the pinned generation-2 sample must decode back to the sample that wrote it"
+        );
+        assert_eq!(
+            serde_json::from_str::<Sample>(GENERATION_2_SHAPE.weekly_only_sample).unwrap(),
+            weekly_only,
+            "T17: the pinned generation-2 weekly-only sample must decode back to the sample that wrote it"
+        );
+        fs::write(&rollup_path, GENERATION_2_SHAPE.rollup).unwrap();
+        assert_eq!(
+            read_rollup(&rollup_path).unwrap(),
+            rollup,
+            "T17: the pinned generation-2 rollup must read back bucket for bucket"
         );
     }
 }
