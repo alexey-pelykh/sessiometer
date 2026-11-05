@@ -674,9 +674,9 @@ const USAGE_PROVIDER: &str = "claude";
 
 /// Record at most ONE usage sample for a poll (issue #156), fail-open, to the INJECTED store path.
 ///
-/// A failed poll records none, and so does a reading with a quota window absent (its
-/// fraction `None`), until issue #1598 writes that window as `null`;
-/// [`append_sample_for_poll`] owns both skips.
+/// A failed poll records none. A reading with a quota window absent (its fraction
+/// `None`) is recorded like any other, that window written as `null`;
+/// [`append_sample_for_poll`] owns the rule.
 ///
 /// The poll-loop entry point. `samples_path` is `Some` when production wired the real
 /// `crate::paths::usage_samples()` path via `Daemon::with_usage_samples` — then delegate to
@@ -707,10 +707,10 @@ fn record_usage_sample(
 /// - **Gap honesty**: a FAILED poll (`Err` — API error, 401, offline) records
 ///   NOTHING. A gap is absent, never a fabricated zero/healthy sample (issue #157
 ///   reads a missing sample as UNKNOWN, never zero). A reading with a quota window
-///   absent (its fraction `None`: the account has no such window) also records
-///   NOTHING until issue #1598 writes that window as `null`: a [`Sample`] cannot hold
-///   `null` for either window yet, and a substituted number would read as a
-///   measurement. It is still a READING, not a gap, to the `usage_gap` tracker — see
+///   absent (its fraction `None`: the account has no such window) is a READING, so
+///   it is recorded, with that window written as `null` on the line — the key
+///   present, never a substituted number, which would read as a measurement. To the
+///   `usage_gap` tracker it is a reading too, not a gap — see
 ///   [`stats_events_for_poll`].
 /// - **Redaction-clean**: `acct` is the account's roster `label` — never a token or a
 ///   credential-read email. Since #444/#447 an operator-*authored* label MAY be an
@@ -734,24 +734,21 @@ fn append_sample_for_poll(
     let Ok(reading) = polled else {
         return; // gap: a poll with no reading records no sample
     };
-    // Gap honesty: a reading with a quota window absent (its fraction `None`: the account
-    // has no such window) carries no number to store for that window, and a `Sample`
-    // cannot hold `null` for either window until issue #1598 writes one. So record
-    // nothing: no stored sample, never a substituted zero, which would read as a measured
-    // idle window where a missing sample reads as UNKNOWN (issue #157). (To the
-    // `usage_gap` tracker this poll is still a reading, not a gap: see
-    // `stats_events_for_poll`.) Issue #1598 replaces this skip with a `null` window on the
-    // sample line.
-    let (Some(session), Some(weekly)) = (reading.usage.session, reading.usage.weekly) else {
-        return;
-    };
-    let sample = Sample::new(now, USAGE_PROVIDER, account_label, session, weekly)
-        .with_resets(
-            reading.usage.session_resets_at,
-            reading.usage.weekly_resets_at,
-        )
-        .with_severity(reading.severity.clone())
-        .with_spend(None);
+    // A window the account lacks (its fraction `None`) goes onto the line as `null`: the
+    // reading is recorded as it was served, never skipped and never given a number.
+    let sample = Sample::new(
+        now,
+        USAGE_PROVIDER,
+        account_label,
+        reading.usage.session,
+        reading.usage.weekly,
+    )
+    .with_resets(
+        reading.usage.session_resets_at,
+        reading.usage.weekly_resets_at,
+    )
+    .with_severity(reading.severity.clone())
+    .with_spend(None);
     if let Err(err) = append_sample(samples_path, &sample) {
         eprintln!("sessiometer: usage-sample write skipped: {err}");
     }
@@ -829,14 +826,16 @@ struct StatsState {
 /// the poll loop):
 ///
 /// - **Gap** (`is_gap`): a no-reading poll recorded no sample (#156's gap-honesty), and MAY
-///   surface a rate-limited `usage_gap`. A reading with a quota window absent records no
-///   sample either (until #1598), yet it is not a gap here: `is_gap` only says the poll had
+///   surface a rate-limited `usage_gap`. A reading with a quota window absent is a reading,
+///   recorded with that window as `null`, and never a gap here: `is_gap` only says the poll had
 ///   no reading, so such a poll clears the streak and emits no `usage_gap`. The first poll of a
 ///   streak emits (`since = now`); later gapping polls re-emit only once
 ///   `cadence.gap_reemit_secs` has elapsed, `since` fixed at the streak start. A reading
 ///   clears the account's streak.
 /// - **Rollup**: at most once per `cadence.roll_cadence_secs`, run `compact_and_roll` under
-///   `policy`; when a pass folds ≥1 raw sample, emit a `usage_rollup`.
+///   `policy`; when a pass folds ≥1 raw sample, emit a `usage_rollup`. A pass that fails emits
+///   nothing and prints `usage-store compaction skipped` with its error to stderr, so a
+///   compaction that has stalled — on a rollup a newer sessiometer wrote, for one — says so.
 ///
 /// Every emitted event is redaction-clean: `usage_gap` carries only the account HANDLE +
 /// timestamps, `usage_rollup` only integers — never a token or email (the #15 guarantee).
@@ -895,13 +894,16 @@ fn stats_events_for_poll(
         // Bound attempts to one per cadence window regardless of outcome (fail-open): a
         // persistent store error then retries at the cadence, never once per poll.
         state.last_roll = Some(now);
-        if let Ok(summary) = compact_and_roll(paths.samples, paths.rollup, now, policy) {
-            if summary.raw_lines > 0 {
-                events.push(Event::UsageRollup {
-                    rolled_through: summary.rolled_through_ts,
-                    raw_lines: summary.raw_lines,
-                });
+        match compact_and_roll(paths.samples, paths.rollup, now, policy) {
+            Ok(summary) => {
+                if summary.raw_lines > 0 {
+                    events.push(Event::UsageRollup {
+                        rolled_through: summary.rolled_through_ts,
+                        raw_lines: summary.raw_lines,
+                    });
+                }
             }
+            Err(err) => eprintln!("sessiometer: usage-store compaction skipped: {err}"),
         }
     }
 
@@ -1973,8 +1975,8 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// ticking a `FakeDaemon` writes NO sample and the developer's real store stays untouched).
     /// Production wires the real `crate::paths::usage_samples()` path via
     /// [`with_usage_samples`](Self::with_usage_samples); when `Some`, each poll appends at most
-    /// one redacted `Sample` to it: none for a failed poll, nor, until issue #1598 writes it as
-    /// `null`, for a reading with a quota window absent. The path is INJECTED, never resolved
+    /// one redacted `Sample` to it: none for a failed poll, and one for a reading, a quota
+    /// window the account lacks written as `null`. The path is INJECTED, never resolved
     /// inline, so a test cannot reach the real support dir (issue #315) — the same reason
     /// `NativeHistoryStore` holds its paths so a test can point one at a temp dir.
     usage_samples_path: Option<PathBuf>,
@@ -2291,8 +2293,8 @@ where
     }
 
     /// Wire the per-poll usage-sample store path (issue #156/#315): the daemon then appends at
-    /// most one redacted `Sample` to `path` per poll (none for a failed poll, nor, until issue
-    /// #1598 writes it as `null`, for a reading with a quota window absent). Production sets
+    /// most one redacted `Sample` to `path` per poll (none for a failed poll; a reading's
+    /// absent quota window is written as `null`). Production sets
     /// the real `crate::paths::usage_samples()` path; left unset, the collector is inert so a
     /// hermetic `FakeDaemon` tick writes nothing to the real support dir. The path is INJECTED
     /// rather than resolved inline precisely so a test cannot reach the real store (issue
@@ -2799,8 +2801,8 @@ where
             let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
             // Record at most ONE usage sample for this poll (issue #156): piggyback the
             // reading just fetched (no extra usage-API call), recording nothing on a
-            // gap or on a reading with a quota window absent (until #1598 writes it as
-            // `null`), and swallowing any store error. The store path is INJECTED (issue #315):
+            // gap, writing a quota window the account lacks as `null`, and swallowing any
+            // store error. The store path is INJECTED (issue #315):
             // `None` in the hermetic-test default, so ticking a `FakeDaemon` writes nothing —
             // off the swap-decision path, so a sampling failure never perturbs the loop below.
             record_usage_sample(
@@ -19116,6 +19118,10 @@ mod tests {
                 line: 5,
                 column: 12,
             },
+            Error::UsageRollupNewerFormat {
+                found: 3,
+                supported: 2,
+            },
             Error::UsageStoreBusy,
             // Issue #1445: a fixed sentence and no fields at all — the busiest possible variant
             // to redact, and the same shape as `SwapLockBusy` / `UsageStoreBusy` above it.
@@ -20035,8 +20041,9 @@ mod tests {
 
     /// A successful poll whose reading carries each window writes EXACTLY ONE sample
     /// carrying the redacted handle and every projected field — including the widened
-    /// `severity` — with no secret. A reading with a window absent writes none
-    /// (`collector_records_nothing_for_a_reading_whose_session_window_was_absent`).
+    /// `severity` — with no secret. A reading with a window absent writes one too, that
+    /// window as `null`
+    /// (`collector_writes_a_null_session_line_for_a_reading_whose_session_window_was_absent`).
     #[test]
     fn collector_writes_one_redacted_sample_per_successful_poll() {
         let dir = tempfile::tempdir().unwrap();
@@ -20059,8 +20066,10 @@ mod tests {
         assert_eq!(s.ts, 1_700_000_000);
         assert_eq!(s.provider, USAGE_PROVIDER);
         assert_eq!(s.acct, "work", "the redacted handle, verbatim");
-        assert!((s.session - 0.42).abs() < 1e-9);
-        assert!((s.weekly - 0.88).abs() < 1e-9);
+        let session = optional_fraction(s.session).expect("the session reading is stored");
+        assert!((session - 0.42).abs() < 1e-9);
+        let weekly = optional_fraction(s.weekly).expect("the weekly reading is stored");
+        assert!((weekly - 0.88).abs() < 1e-9);
         assert_eq!(s.session_resets_at, Some(1_700_003_600));
         assert_eq!(s.weekly_resets_at, Some(1_700_600_000));
         assert_eq!(s.severity.as_deref(), Some("critical"), "severity retained");
@@ -20078,6 +20087,119 @@ mod tests {
         assert!(
             !raw.contains("sk-ant"),
             "no token may reach the store: {raw}"
+        );
+    }
+
+    /// Reads a window's fraction the same way before and after the `f64` → `Option<f64>` lift
+    /// (issue #1590), so one assertion text compiles, and passes `clippy -D warnings`, on both sides.
+    fn optional_fraction(window: impl Into<Option<f64>>) -> Option<f64> {
+        window.into()
+    }
+
+    /// A weekly-only reading (`session: None`: the account has no session window) is sampled
+    /// like any other: one line, every served field in place, and `"session":null` on it — the
+    /// key written, never omitted and never a number (issue #1598).
+    #[test]
+    fn a_weekly_only_reading_is_sampled_with_its_session_written_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let reading = Ok(PolledReading {
+            usage: Usage {
+                session: None,
+                weekly: Some(0.90),
+                weekly_resets_at: Some(1_700_600_000),
+                session_resets_at: None,
+            },
+            severity: Some("critical".to_owned()),
+        });
+
+        append_sample_for_poll(&samples_path, "work", &reading, 1_700_000_000);
+
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        assert_eq!(
+            samples.len(),
+            1,
+            "T9: a weekly-only reading must store exactly one sample"
+        );
+        let s = &samples[0];
+        assert_eq!(s.ts, 1_700_000_000);
+        assert_eq!(s.acct, "work", "the redacted handle, verbatim");
+        assert_eq!(
+            optional_fraction(s.session),
+            None,
+            "T9: the session reading must be absent"
+        );
+        let weekly = optional_fraction(s.weekly).expect("T9: the weekly reading must be stored");
+        assert!(
+            (weekly - 0.90).abs() < 1e-9,
+            "T9: the weekly reading must be stored as served"
+        );
+        assert_eq!(s.session_resets_at, None);
+        assert_eq!(s.weekly_resets_at, Some(1_700_600_000));
+        assert_eq!(s.severity.as_deref(), Some("critical"), "severity retained");
+        assert_eq!(s.spend, None, "no spend producer yet (forward slot)");
+
+        let raw = std::fs::read_to_string(&samples_path).unwrap();
+        let line: serde_json::Value = serde_json::from_str(
+            raw.lines()
+                .next()
+                .expect("T9: the stored sample is one line"),
+        )
+        .expect("T9: the stored line is JSON");
+        assert_eq!(
+            line.get("session"),
+            Some(&serde_json::Value::Null),
+            "T9: the line must carry its session key, written as null: {raw}"
+        );
+    }
+
+    /// The weekly twin (issue #1598): a reading whose WEEKLY window is absent is sampled too,
+    /// with `"weekly":null` on its line. No early return keys on either window.
+    #[test]
+    fn a_session_only_reading_is_sampled_with_its_weekly_written_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let reading = Ok(PolledReading {
+            usage: Usage {
+                session: Some(0.42),
+                weekly: None,
+                weekly_resets_at: None,
+                session_resets_at: Some(1_700_003_600),
+            },
+            severity: None,
+        });
+
+        append_sample_for_poll(&samples_path, "work", &reading, 1_700_000_000);
+
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        assert_eq!(
+            samples.len(),
+            1,
+            "a session-only reading must store exactly one sample"
+        );
+        let s = &samples[0];
+        let session = optional_fraction(s.session).expect("the session reading must be stored");
+        assert!(
+            (session - 0.42).abs() < 1e-9,
+            "the session reading must be stored as served"
+        );
+        assert_eq!(
+            optional_fraction(s.weekly),
+            None,
+            "the weekly reading must be absent"
+        );
+        assert_eq!(s.session_resets_at, Some(1_700_003_600));
+        assert_eq!(s.weekly_resets_at, None);
+
+        let raw = std::fs::read_to_string(&samples_path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 1, "exactly one line: {raw}");
+        let line: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("the stored line is JSON");
+        assert_eq!(
+            line.get("weekly"),
+            Some(&serde_json::Value::Null),
+            "the line must carry its weekly key, written as null: {raw}"
         );
     }
 
@@ -20190,14 +20312,13 @@ mod tests {
         assert_eq!(samples[0].ts, 200);
     }
 
-    /// GAP HONESTY: a reading whose session window is absent from the reply (`session:
-    /// None`) is served to the swap decision, but it must NOT be stored — a `Sample` cannot
-    /// hold `null` for a window until issue #1598, and a substituted zero would read as a
-    /// real idle session. The call with the window absent writes no line; a reading with
-    /// the window present through the same store writes exactly one. Issue #1598 rewrites
-    /// this test when it writes the window as `null`.
+    /// A reading whose session window is absent from the reply (`session: None`: the
+    /// account has no such window) is a READING, so it is stored: one line, its `session`
+    /// written as `null` — the key present, never omitted and never a substituted zero, which
+    /// would read as a real idle session. A reading with the window present through the same
+    /// store writes its own line, the number in place.
     #[test]
-    fn collector_records_nothing_for_a_reading_whose_session_window_was_absent() {
+    fn collector_writes_a_null_session_line_for_a_reading_whose_session_window_was_absent() {
         let dir = tempfile::tempdir().unwrap();
         let samples_path = dir.path().join("usage-samples.jsonl");
         let reading_with_session = |session: Option<f64>| {
@@ -20212,13 +20333,33 @@ mod tests {
             })
         };
 
-        append_sample_for_poll(&samples_path, "work", &reading_with_session(None), 100);
-        assert!(
+        let stored = || {
             crate::usage_store::read_samples(&samples_path)
                 .unwrap()
-                .is_empty(),
-            "a reading with its session window absent writes no sample"
+                .len()
+        };
+        let raw_lines = || -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&samples_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("a stored line is JSON"))
+                .collect()
+        };
+
+        append_sample_for_poll(&samples_path, "work", &reading_with_session(None), 100);
+        assert_eq!(
+            stored(),
+            1,
+            "a reading with its session window absent writes exactly one line"
         );
+        let lines = raw_lines();
+        assert_eq!(
+            lines[0].get("session"),
+            Some(&serde_json::Value::Null),
+            "and that line carries its session key, written as null: {}",
+            lines[0]
+        );
+        assert_eq!(lines[0]["ts"], 100, "it is the absent-window call's");
 
         append_sample_for_poll(
             &samples_path,
@@ -20226,13 +20367,18 @@ mod tests {
             &reading_with_session(Some(0.42)),
             200,
         );
-        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
         assert_eq!(
-            samples.len(),
-            1,
-            "a reading with its session window present writes exactly one"
+            stored(),
+            2,
+            "a reading with its session window present writes its own line"
         );
-        assert_eq!(samples[0].ts, 200, "and it is the present-window call's");
+        let lines = raw_lines();
+        assert_eq!(lines[1]["ts"], 200, "and it is the present-window call's");
+        assert_eq!(
+            lines[1]["session"], 0.42,
+            "with the served number in place: {}",
+            lines[1]
+        );
     }
 
     /// FAIL-OPEN: a store-write error is swallowed — the collector returns normally
@@ -20396,7 +20542,11 @@ mod tests {
         let aged = now - 20 * 86_400;
         let fresh = now - 3_600;
         for ts in [aged, fresh] {
-            append_sample(&samples_path, &Sample::new(ts, "claude", "spare", 0.5, 0.6)).unwrap();
+            append_sample(
+                &samples_path,
+                &Sample::new(ts, "claude", "spare", Some(0.5), Some(0.6)),
+            )
+            .unwrap();
         }
         let mut daemon = three_account_daemon(
             FakeRosterPoller::new()
@@ -20472,12 +20622,14 @@ mod tests {
     /// The two tick-level effects for a reading whose session window is absent (`session:
     /// None`: the account has none), observed through a real tick with BOTH stores wired to a
     /// temp dir — the per-poll sample path and the stats maintenance layer. That account writes
-    /// no sample (until #1598 writes the window as `null`) and emits no `usage_gap` (to the gap
+    /// one sample per poll, its session window `null`, and emits no `usage_gap` (to the gap
     /// tracker, which keys on `polled.is_err()`, it is a READING); a two-window account through
-    /// the same wiring writes exactly one; and a FAILING account proves the gap tracker is live
-    /// through this wiring, so the first account's silence is not the silence of an unwired seam.
+    /// the same wiring writes exactly one as well; and a FAILING account proves the gap tracker
+    /// is live through this wiring, so the first account's silence is not the silence of an
+    /// unwired seam.
     #[tokio::test]
-    async fn tick_stores_no_sample_and_logs_no_gap_for_a_reading_whose_session_window_was_absent() {
+    async fn tick_stores_a_null_session_sample_and_logs_no_gap_for_a_reading_whose_session_window_was_absent(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let samples_path = dir.path().join("usage-samples.jsonl");
         let rollup_path = dir.path().join("usage-rollup.json");
@@ -20516,16 +20668,29 @@ mod tests {
         };
         let stored = || crate::usage_store::read_samples(&samples_path).unwrap();
 
-        // Tick 1 — the account without a session window: no sample stored, no `usage_gap`.
+        // Tick 1 — the account without a session window: exactly one sample stored, its
+        // session written as `null`, and no `usage_gap`.
         let t1 = daemon.tick().await;
         assert_eq!(
             polled(&t1),
             "work",
             "tick 1 polls the active, whose session window is absent"
         );
-        assert!(
-            stored().is_empty(),
-            "a reading with a window absent stores no sample"
+        let samples = stored();
+        assert_eq!(
+            samples.len(),
+            1,
+            "a reading with its session window absent stores exactly one sample"
+        );
+        assert_eq!(samples[0].acct, "work", "and it is that account's");
+        let raw = std::fs::read_to_string(&samples_path).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(raw.lines().next().expect("the stored sample is one line"))
+                .expect("the stored line is JSON");
+        assert_eq!(
+            line.get("session"),
+            Some(&serde_json::Value::Null),
+            "the stored line carries its session key, written as null: {raw}"
         );
         assert!(
             gaps(&t1).is_empty(),
@@ -20536,21 +20701,28 @@ mod tests {
         let t2 = daemon.tick().await;
         assert_eq!(polled(&t2), "spare", "tick 2 polls the two-window peer");
         let samples = stored();
-        assert_eq!(samples.len(), 1, "a two-window reading stores one sample");
+        assert_eq!(samples.len(), 2, "a two-window reading stores one sample");
         assert_eq!(
-            samples[0].acct, "spare",
+            samples.iter().filter(|s| s.acct == "spare").count(),
+            1,
             "and it is the two-window account's"
         );
         assert!(gaps(&t2).is_empty());
 
-        // Tick 3 — the account without a session window again: still nothing of its own
-        // stored, still no gap.
+        // Tick 3 — the account without a session window again: one more sample of its own,
+        // still no gap.
         let t3 = daemon.tick().await;
         assert_eq!(polled(&t3), "work", "tick 3 re-polls the active");
+        let samples = stored();
         assert_eq!(
-            stored().len(),
-            1,
-            "the account without a session window added no sample"
+            samples.len(),
+            3,
+            "the account without a session window added its sample"
+        );
+        assert_eq!(
+            samples.iter().filter(|s| s.acct == "work").count(),
+            2,
+            "one sample per poll of that account"
         );
         assert!(gaps(&t3).is_empty());
 
@@ -20562,7 +20734,7 @@ mod tests {
             vec!["backup".to_owned()],
             "a no-reading poll emits usage_gap, so the silence above was observed"
         );
-        assert_eq!(stored().len(), 1, "a failed poll stores nothing either");
+        assert_eq!(stored().len(), 3, "a failed poll stores nothing");
     }
 
     // --- one account moving between outcomes across ticks --------------------------------
@@ -20676,10 +20848,11 @@ mod tests {
     }
 
     /// Failed → a reading with its session window absent → failed: to the `usage_gap` tracker
-    /// such a reading is a READING, so it ends the account's gap streak although it stores no
-    /// sample; the failure after it opens a NEW streak and emits at once — a continuing streak
-    /// would have been rate-limited for `GAP_REEMIT_MIN_SECS`, which is the difference a poll
-    /// that skipped the stats layer would show.
+    /// such a reading is a READING, so it ends the account's gap streak, and it stores its
+    /// sample, the session window written as `null`; the failure after it opens a NEW streak and
+    /// emits at once — a continuing streak would have been rate-limited for
+    /// `GAP_REEMIT_MIN_SECS`, which is the difference a poll that skipped the stats layer would
+    /// show.
     #[tokio::test]
     async fn a_reading_without_a_session_window_between_two_failed_polls_ends_the_gap_streak_and_the_next_failure_opens_a_new_one(
     ) {
@@ -20703,7 +20876,7 @@ mod tests {
             "a reading with its session window absent is a reading to the gap tracker: no usage_gap"
         );
         assert!(!rig.gap_streak_open(), "and it ends the streak");
-        assert_eq!(rig.stored(), 0, "yet it stores no sample");
+        assert_eq!(rig.stored(), 1, "and it stores its sample");
 
         rig.script(Scripted::Transient);
         let t3 = rig.tick().await;
@@ -20719,7 +20892,7 @@ mod tests {
             "the new streak starts at or after the old one: {first:?} then {second:?}"
         );
         assert!(rig.gap_streak_open(), "the new streak is carried");
-        assert_eq!(rig.stored(), 0);
+        assert_eq!(rig.stored(), 1, "a failed poll stores nothing more");
     }
 
     // --- Usage-stats store maintenance events (issue #161) ------------------
@@ -20894,7 +21067,7 @@ mod tests {
         for k in 0..3 {
             append_sample(
                 &samples_path,
-                &Sample::new(aged + k * 600, "claude", "work", 0.5, 0.6),
+                &Sample::new(aged + k * 600, "claude", "work", Some(0.5), Some(0.6)),
             )
             .unwrap();
         }
@@ -20962,7 +21135,13 @@ mod tests {
         for k in 0..3 {
             append_sample(
                 &samples_path,
-                &Sample::new(10 * 86_400 + k * 600, "claude", "work", 0.5, 0.6),
+                &Sample::new(
+                    10 * 86_400 + k * 600,
+                    "claude",
+                    "work",
+                    Some(0.5),
+                    Some(0.6),
+                ),
             )
             .unwrap();
         }
@@ -20987,7 +21166,13 @@ mod tests {
         for k in 0..3 {
             append_sample(
                 &samples_path,
-                &Sample::new(11 * 86_400 + k * 600, "claude", "work", 0.4, 0.5),
+                &Sample::new(
+                    11 * 86_400 + k * 600,
+                    "claude",
+                    "work",
+                    Some(0.4),
+                    Some(0.5),
+                ),
             )
             .unwrap();
         }
@@ -21025,6 +21210,76 @@ mod tests {
         assert!(
             e3.iter().any(|e| matches!(e, Event::UsageRollup { .. })),
             "rolls again past the cadence"
+        );
+    }
+
+    /// A store written by a newer sessiometer (issue #1598, condition C7): the cadence-gated
+    /// pass refuses the `format` 3 rollup, so it emits no `usage_rollup`, it still advances the
+    /// cadence anchor (one attempt per window, never one per poll), and it rewrites neither
+    /// store file. The refusal goes to stderr, which libtest captures: the `eprintln!` line is
+    /// graded by the diff, not here.
+    #[test]
+    fn stats_rollup_skips_a_newer_format_store_without_an_event_and_leaves_both_files_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let rollup_path = dir.path().join("usage-rollup.json");
+        let policy = RetentionPolicy::default();
+        let cadence = test_cadence();
+        let mut state = StatsState::default(); // first pass is due
+        let now = 200 * 86_400;
+        for k in 0..3 {
+            append_sample(
+                &samples_path,
+                &Sample::new(
+                    10 * 86_400 + k * 600,
+                    "claude",
+                    "work",
+                    Some(0.5),
+                    Some(0.6),
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            &rollup_path,
+            r#"{"format":3,"rollup":{"rolled_through_ts":0,"hourly":[],"daily":[]}}"#,
+        )
+        .unwrap();
+        let samples_before = std::fs::read(&samples_path).unwrap();
+        let rollup_before = std::fs::read(&rollup_path).unwrap();
+
+        let events = stats_events_for_poll(
+            &StorePaths {
+                samples: &samples_path,
+                rollup: &rollup_path,
+            },
+            "work",
+            false,
+            now,
+            &policy,
+            &mut state,
+            &cadence,
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, Event::UsageRollup { .. })),
+            "a refused compaction emits no usage_rollup"
+        );
+        assert_eq!(
+            state.last_roll,
+            Some(now),
+            "the refused attempt still advances the cadence anchor"
+        );
+        assert_eq!(
+            std::fs::read(&samples_path).unwrap(),
+            samples_before,
+            "the raw samples are left untouched"
+        );
+        assert_eq!(
+            std::fs::read(&rollup_path).unwrap(),
+            rollup_before,
+            "the newer rollup is left untouched"
         );
     }
 

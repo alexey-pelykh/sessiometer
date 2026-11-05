@@ -1277,7 +1277,7 @@ mod tests {
 
     /// A minimal reading: `provider="claude"`, given `acct`, no optionals.
     fn sample(ts: i64, acct: &str, session: f64, weekly: f64) -> Sample {
-        Sample::new(ts, "claude", acct, session, weekly)
+        Sample::new(ts, "claude", acct, Some(session), Some(weekly))
     }
 
     /// Default-ish params: 300 s cadence, cap and high-water both at 0.80.
@@ -2659,7 +2659,7 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         session_reset: i64,
         weekly_reset: i64,
     ) -> Sample {
-        Sample::new(ts, "claude", acct, session, weekly)
+        Sample::new(ts, "claude", acct, Some(session), Some(weekly))
             .with_resets(Some(session_reset), Some(weekly_reset))
     }
 
@@ -2921,7 +2921,7 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         // assumption. With no assertion to lean on, the window is the plain cadence horizon and
         // everything past it stays unknown.
         let period = Period::new(0, 10_000);
-        let samples = vec![Sample::new(0, "claude", "a", 0.85, 0.10)]; // no resets carried
+        let samples = vec![Sample::new(0, "claude", "a", Some(0.85), Some(0.10))]; // no resets carried
         let report =
             aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
         assert_eq!(
@@ -3198,7 +3198,7 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
                     (!s.is_empty()).then(|| s.parse::<i64>().expect("reset offset") + CORPUS_START)
                 };
                 let (sr, wr) = (reset(next()), reset(next()));
-                Sample::new(ts, "claude", acct, session, weekly).with_resets(sr, wr)
+                Sample::new(ts, "claude", acct, Some(session), Some(weekly)).with_resets(sr, wr)
             })
             .collect()
     }
@@ -3537,6 +3537,10 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         // sessions past the water would otherwise silently turn the assertion above into a real
         // failure whose message points at the anchoring instead of at the fixture.
         let samples = replay_samples();
+        // Every corpus line carries a session and a weekly fraction (the loader parses the two
+        // from each), so a fraction read off a replay sample is a read of a present value.
+        let session_of = |s: &Sample| s.session.expect("a replay reading has a session window");
+        let weekly_of = |s: &Sample| s.weekly.expect("a replay reading has a weekly window");
         let never_high: BTreeSet<&str> = REPLAY_ROSTER
             .iter()
             .copied()
@@ -3544,7 +3548,7 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
                 samples
                     .iter()
                     .filter(|s| s.acct == *h)
-                    .all(|s| s.session < params().high_threshold)
+                    .all(|s| session_of(s) < params().high_threshold)
             })
             .collect();
         assert_eq!(
@@ -3582,7 +3586,7 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             let group: Vec<&Sample> = samples.iter().filter(|s| s.acct == handle).collect();
             for pair in group.windows(2) {
                 let (a, b) = (pair[0], pair[1]);
-                if a.weekly < rotation_line || b.weekly < rotation_line {
+                if weekly_of(a) < rotation_line || weekly_of(b) < rotation_line {
                     continue;
                 }
                 if a.session_resets_at.is_none() || a.session_resets_at != b.session_resets_at {
@@ -3595,8 +3599,8 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
                         handle,
                         a.ts - CORPUS_START,
                         b.ts - a.ts,
-                        a.session,
-                        b.session,
+                        session_of(a),
+                        session_of(b),
                     ));
                 }
             }

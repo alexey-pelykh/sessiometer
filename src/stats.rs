@@ -5537,7 +5537,7 @@ mod tests {
 
     /// A minimal reading: `provider="claude"`, given `acct`, no optionals.
     fn sample(ts: i64, acct: &str, session: f64, weekly: f64) -> Sample {
-        Sample::new(ts, "claude", acct, session, weekly)
+        Sample::new(ts, "claude", acct, Some(session), Some(weekly))
     }
 
     /// A `StoreData` from samples + event-log text (empty rollup).
@@ -5665,18 +5665,20 @@ mod tests {
             day_start: 5 * DAY_SECS,
             count: 10,
             coverage: 1.0,
-            session: crate::usage_store::DayStat {
+            session: Some(crate::usage_store::DayStat {
                 max: 0.9,
                 mean: 0.5,
                 p95: 0.8,
                 cap_hits: 0,
-            },
-            weekly: crate::usage_store::DayStat {
+                samples: None,
+            }),
+            weekly: Some(crate::usage_store::DayStat {
                 max: 0.4,
                 mean: 0.3,
                 p95: 0.38,
                 cap_hits: 0,
-            },
+                samples: None,
+            }),
         });
         let w = plan_window(Some("lifetime"), None, now, &store).unwrap();
         assert_eq!(

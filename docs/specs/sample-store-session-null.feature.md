@@ -119,24 +119,33 @@ Scenario: the #1613 sample skip is gone — a reading with no session window wri
     # collector_writes_one_redacted_sample_per_successful_poll;
     # this scenario grades that the hot-fix's skip and its text are gone.
 
-Scenario Outline: a non-finite Some fraction is refused at serialization, so null on disk has one meaning (serialization-refusal default)
-  # Tier A — graded by reliability::tests::the_sample_store_cannot_carry_a_non_finite_session_reading
+Scenario Outline: a non-finite Some fraction is refused at serialization, so null on disk has one meaning (serialization-refusal default; the weekly row is D12 as ruled)
+  # Tier A — the session rows are graded by
+  # reliability::tests::the_sample_store_cannot_carry_a_non_finite_session_reading
   # (#1598 T6, the near-end loop; RED at fd8640b: `serde_json::to_string` of such a `Sample` is `Ok` —
   # the canary's own `.expect("a Sample always serializes")` — so the `is_err()` assertion FAILS,
   # recorded per AC-13 in T6's first scratch run; mutant, AC-6's record: `serialize_with` dropped, so
   # `Some(f64::INFINITY)` serializes as `"session":null` and the assertion fails) · covers AC-6 (the
   # serialization arm)
-  Given a `Sample` for `work` whose session reading is `Some(<value>)`, <shape>
+  # Tier A — the weekly row is graded by
+  # reliability::tests::the_sample_store_cannot_carry_a_non_finite_weekly_reading (the D12 ruling of
+  # 2026-11-03, a comment on #1598: the refusal is graded on the weekly axis too; RED at fd8640b for
+  # the session rows' reason: `serde_json::to_string` of a `Sample` whose weekly reading is not
+  # finite is `Ok` and writes `"weekly":null`, so the `is_err()` assertion FAILS; mutant, the
+  # ruling's own: `serialize_with` dropped from `weekly`, so `Some(f64::INFINITY)` serializes as
+  # `"weekly":null` and the assertion fails) · covers AC-6 (the serialization arm, on the weekly axis)
+  Given a `Sample` for `work` whose <axis> reading is `Some(<value>)`, <shape>
    When it is serialized with `serde_json::to_string`
    Then the result is `Err`, carrying the hint `a usage value was not a finite number`
-    But NOT `Ok` with `"session":null` — which would read back as "no window" for a measurement that
+    But NOT `Ok` with `"<axis>":null` — which would read back as "no window" for a measurement that
         was not finite
 
 Examples:
-  | shape               | value             |
-  | a positive infinity | f64::INFINITY     |
-  | a NaN               | f64::NAN          |
-  | a negative infinity | f64::NEG_INFINITY |
+  | axis    | shape               | value             |
+  | session | a positive infinity | f64::INFINITY     |
+  | session | a NaN               | f64::NAN          |
+  | session | a negative infinity | f64::NEG_INFINITY |
+  | weekly  | a positive infinity | f64::INFINITY     |
   # The hint is `serialize_err()`'s (`src/usage_store.rs:841-843`), whose doc "reachable only for a
   # non-finite float" becomes true as written: `serde_json` 1.0.150's `serialize_f64` writes `null`
   # for `Nan | Infinite` rather than erroring, so the refusal has to live in the field serializer
@@ -1012,7 +1021,7 @@ is named as such, with what grades it instead.
 | AC-3 — compaction retains such lines | Rule 3 "compaction keeps every in-window weekly-only line…"; Rule 1's key-set clause | T8a (retention half) |
 | AC-4 — an all-absent axis folds to a finite, readable rollup with no statistic on that axis | Rule 4 "an hour and a day holding only session-less samples fold to a finite, readable rollup"; Rule 4 "a bucket whose readings carried no session reading omits…"; Rule 4 "a mixed bucket folds each axis over exactly the readings that carried it" | T8a (rollup half) with AC-4's first mutant record; T8b with its second, the fabricating fold |
 | AC-5 — the tiers' representation is the per-axis `Option`, and each present statistic records its sample count | Rule 4 "a bucket whose readings carried no session reading omits…" (the omitted member); Rule 4 "a rollup written at fd8640b reads back unchanged"; Rule 4 "a defensive same-key merge…"; Rule 4 "each present statistic records how many of its bucket's readings it is over…"; Rule 4 "the count invariant holds at both tiers for both axes…"; Rule 4 "a rollup written without the count…"; Rule 4 "a same-key merge weights each axis by its recorded counts…" | T8b; T10 for the backward read, every statistic's `samples` `None`; T11 for the merge arms; the tests of AC-23 to AC-26 for the count; the doc comments by `cargo doc` and review |
-| AC-6 — the non-finite guard moves with the shape and is not deleted | Rule 2 "the canary's null arm moves…"; Rule 2 "the five non-finite spellings stay refused at decode" (Tier B); Rule 1 "a non-finite Some fraction is refused at serialization" | T6's moved `null` arm; the committed decode arms under AC-6's presence check; T6's near-end arm with its AC-13 RED run and AC-6's mutant record. T7 (`landing_refuses_a_non_finite_parked_reading_rather_than_fabricating_one`, `src/reliability.rs:7444`) stays green under the reliability rule's own move and has no scenario here |
+| AC-6 — the non-finite guard moves with the shape and is not deleted | Rule 2 "the canary's null arm moves…"; Rule 2 "the five non-finite spellings stay refused at decode" (Tier B); Rule 1 "a non-finite Some fraction is refused at serialization" | T6's moved `null` arm; the committed decode arms under AC-6's presence check; T6's near-end arm with its AC-13 RED run and AC-6's mutant record; the outline's weekly row by `reliability::tests::the_sample_store_cannot_carry_a_non_finite_weekly_reading` with the D12 ruling's mutant, `serialize_with` dropped from `weekly`. T7 (`landing_refuses_a_non_finite_parked_reading_rather_than_fabricating_one` in `src/reliability.rs`) stays green under the reliability rule's own move and has no scenario here |
 | AC-7 — the round-trip test gains the `null` case for both axes | Rule 2 "a Sample round-trips with a null reading on either axis…" | T5, extended, with AC-7's mutant record for the weekly key |
 | AC-8 — a line omitting the `session` key reads as no session reading | Rule 2 "a line omitting the session key reads as no session reading" | T4, written form |
 | AC-9 — never a fabricated window value in the store or its tests | Rule 4 "a mixed bucket folds…" (the `mean` 0.2 BUT NOT); Rule 2's round-trip outline (the helper clause) | the `git grep` over the added lines for `unwrap_or(0.0)`, `unwrap_or_default()` and `Some(0.0)` is a review signal, not the gate; review reads every wrapper |

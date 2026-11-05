@@ -3928,7 +3928,13 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
     /// (`weekly` is fixed at 0.10 — the landing join reads only `session`) — the landing-SLI join
     /// input, a trimmed form of `stats`' own `sample` test helper.
     fn sample(ts: i64, acct: &str, session: f64) -> Sample {
-        Sample::new(ts, "claude", acct, session, 0.10)
+        Sample::new(ts, "claude", acct, Some(session), Some(0.10))
+    }
+
+    /// Reads a window's fraction the same way before and after the `f64` → `Option<f64>` lift
+    /// (issue #1590), so one assertion text compiles, and passes `clippy -D warnings`, on both sides.
+    fn optional_fraction(window: impl Into<Option<f64>>) -> Option<f64> {
+        window.into()
     }
 
     #[test]
@@ -7596,21 +7602,35 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
     /// prose a reader must take on trust, so the canary can state its own status instead of implying
     /// a stronger one.
     ///
-    /// What it pins is exactly `serde_json`'s non-finite policy against `Sample`'s derived impls, and
-    /// nothing wider. A change to either — the policy, `session`'s type, its serde attributes — REDs
-    /// here. A store that adopted a DIFFERENT serialization format would leave this green while
-    /// voiding its premise, because no assertion in it reaches the store's own writer; the canary
-    /// below would silently become load-bearing with nothing here saying so.
+    /// Since issue #1598 the premise holds at both ends by the store's own rule, where the near end
+    /// used to hold by accident. On disk `"session":null` now means one thing: the account has no
+    /// session window. So the near end REFUSES a non-finite reading before it can be written:
+    /// `Sample`'s field serializer returns an error where `serde_json` alone writes `null`, which
+    /// would read back as "no window" for a measurement that was not finite. The far end is
+    /// unchanged for the five non-finite spellings, and its `null` arm moved: that line decodes,
+    /// with no session reading.
+    ///
+    /// What it pins is `Sample`'s serde attributes and `serde_json`'s decoding of a non-finite
+    /// spelling, and nothing wider. A change to either — `session`'s type, its serde attributes, the
+    /// decoder's policy — REDs here. A store that adopted a DIFFERENT serialization format would
+    /// leave this green while voiding its premise, because no assertion in it reaches the store's
+    /// own writer; the canary below would silently become load-bearing with nothing here saying so.
     #[test]
     fn the_sample_store_cannot_carry_a_non_finite_session_reading() {
         for (shape, session) in NON_FINITE_PARKED_READINGS {
-            // The near end of the round trip: `f64::INFINITY` has no JSON spelling, so `serde_json`
-            // writes `null` — which is then not an `f64` on the way back in.
-            let encoded = serde_json::to_string(&sample(0, "work", *session))
-                .expect("a Sample always serializes");
+            // The near end: `f64::INFINITY` has no JSON spelling, and `null` is taken — it means
+            // the account has no session window — so the reading is refused at serialization.
+            let encoded = serde_json::to_string(&sample(0, "work", *session));
             assert!(
-                serde_json::from_str::<Sample>(&encoded).is_err(),
-                "{shape} survived a store round trip: {encoded}"
+                encoded.is_err(),
+                "{shape} must be refused at serialization, never written as `null`: {encoded:?}"
+            );
+            let hint = encoded
+                .expect_err("asserted to be an error just above")
+                .to_string();
+            assert!(
+                hint.contains("a usage value was not a finite number"),
+                "the refusal of {shape} must carry the store's own hint: {hint}"
             );
         }
         // The far end, for a file written by something other than that serializer (a torn write, a
@@ -7618,19 +7638,21 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
         // no infinity literal, and a decimal that OVERFLOWS `f64` is rejected rather than saturated
         // into one, so no byte sequence in the store decodes to a non-finite reading.
         // Positive control FIRST, and it is not decoration: every assertion in the loop below is an
-        // `is_err()`, so one typo in a field name would make all six "fail to decode" for a reason
+        // `is_err()`, so one typo in a field name would make all five "fail to decode" for a reason
         // that has nothing to do with `session` and void the whole loop silently. Measured —
         // misspelling `provider` here leaves the entire suite green without this.
         let control = r#"{"ts":0,"provider":"claude","acct":"work","session":0.42,"weekly":0.1}"#;
         assert_eq!(
-            serde_json::from_str::<Sample>(control)
-                .expect("the control spelling must decode, or the loop below proves nothing")
-                .session,
-            0.42,
+            optional_fraction(
+                serde_json::from_str::<Sample>(control)
+                    .expect("the control spelling must decode, or the loop below proves nothing")
+                    .session
+            ),
+            Some(0.42),
             "the control line must decode to its own `session`, or an `is_err()` below could be \
              any field's fault"
         );
-        for spelling in ["Infinity", "-Infinity", "NaN", "1e400", "-1e400", "null"] {
+        for spelling in ["Infinity", "-Infinity", "NaN", "1e400", "-1e400"] {
             let line = format!(
                 r#"{{"ts":0,"provider":"claude","acct":"work","session":{spelling},"weekly":0.1}}"#
             );
@@ -7638,6 +7660,40 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
                 serde_json::from_str::<Sample>(&line).is_err(),
                 "`session:{spelling}` decoded — the parked-window guard is load-bearing against real \
                  store data, not defence in depth"
+            );
+        }
+        // The `null` arm, moved: `"session":null` is the store's spelling of "this account has no
+        // session window", so the line decodes, and with NO session reading — never a number.
+        let no_window = r#"{"ts":0,"provider":"claude","acct":"work","session":null,"weekly":0.1}"#;
+        let decoded = serde_json::from_str::<Sample>(no_window)
+            .expect("`session:null` must decode: it means the account has no session window");
+        assert_eq!(
+            optional_fraction(decoded.session),
+            None,
+            "`session:null` must decode with no session reading, never as a number"
+        );
+    }
+
+    /// The weekly twin of the near end above (issue #1598, decision D12 as ruled): on disk
+    /// `"weekly":null` means the account has no weekly window, so a non-finite weekly reading is
+    /// refused at serialization the same way, never written as `null`.
+    #[test]
+    fn the_sample_store_cannot_carry_a_non_finite_weekly_reading() {
+        for (shape, weekly) in NON_FINITE_PARKED_READINGS {
+            let mut reading = sample(0, "work", 0.42);
+            reading.weekly = (*weekly).into();
+            let encoded = serde_json::to_string(&reading);
+            assert!(
+                encoded.is_err(),
+                "{shape} in the weekly reading must be refused at serialization, never written as \
+                 `null`: {encoded:?}"
+            );
+            let hint = encoded
+                .expect_err("asserted to be an error just above")
+                .to_string();
+            assert!(
+                hint.contains("a usage value was not a finite number"),
+                "the refusal of {shape} must carry the store's own hint: {hint}"
             );
         }
     }
@@ -8306,10 +8362,34 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
         /// capacity-held swap at 100 is excluded from the SLO by #719 and counted separately.
         fn golden_samples() -> Vec<Sample> {
             vec![
-                Sample::new(epoch("2026-07-11T00:01:00Z"), "claude", "work", 0.97, 0.10),
-                Sample::new(epoch("2026-07-11T00:02:00Z"), "claude", "work", 0.99, 0.10),
-                Sample::new(epoch("2026-07-11T00:06:30Z"), "claude", "work", 0.98, 0.10),
-                Sample::new(epoch("2026-07-11T00:09:30Z"), "claude", "work", 1.00, 0.10),
+                Sample::new(
+                    epoch("2026-07-11T00:01:00Z"),
+                    "claude",
+                    "work",
+                    Some(0.97),
+                    Some(0.10),
+                ),
+                Sample::new(
+                    epoch("2026-07-11T00:02:00Z"),
+                    "claude",
+                    "work",
+                    Some(0.99),
+                    Some(0.10),
+                ),
+                Sample::new(
+                    epoch("2026-07-11T00:06:30Z"),
+                    "claude",
+                    "work",
+                    Some(0.98),
+                    Some(0.10),
+                ),
+                Sample::new(
+                    epoch("2026-07-11T00:09:30Z"),
+                    "claude",
+                    "work",
+                    Some(1.00),
+                    Some(0.10),
+                ),
             ]
         }
 
