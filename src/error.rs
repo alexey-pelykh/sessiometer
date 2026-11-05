@@ -549,14 +549,18 @@ pub(crate) enum Error {
     )]
     UsageScopeMissing,
 
-    /// The poll returned `200` but the body is not JSON, carries no quota window at
-    /// all (every window is optional; a reply with none is this error), or carries a
-    /// window the parser cannot read: a present, non-null `five_hour` / `seven_day`
-    /// value, or a matching `limits[]` entry, with no numeric fraction (issue #1614).
-    /// An absent window — key missing or JSON `null`, and no matching entry — is not
-    /// this error; it is served as `None`. The wrapped message is a structural hint
-    /// (a field/shape name) — never any response bytes. Treated like missing data:
-    /// skip, never swap.
+    /// The poll returned a `2xx` status but the body is not JSON, carries no quota
+    /// window at all, or carries a window the parser cannot read (issue #1614). A
+    /// window is carried by its top-level `five_hour` / `seven_day` value when that
+    /// value is present and not JSON `null`, and by each `limits[]` entry whose `kind`
+    /// matches it. A carried window is unreadable when none of its carriers has a
+    /// numeric `utilization` or `percent`; any carrier with a number makes it readable.
+    ///
+    /// Every window is optional. A window with no carrier (key missing or JSON `null`,
+    /// and no matching entry) is absent, not unreadable. It is served as `None` when
+    /// the other window is readable; otherwise the reply is this error. The wrapped
+    /// message is a structural hint (a field/shape name) — never any response bytes.
+    /// Treated like missing data: skip, never swap.
     #[error("malformed usage response: {0}")]
     UsageParse(String),
 
