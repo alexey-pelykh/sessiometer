@@ -74,7 +74,7 @@ Models: the three Stage 3 dispatches and the second readiness round of #1670, #1
 - `/do-next` — start highest-priority ready item
 - `/do-all` — execute all ready items
 - Review the four judgments under Key Decisions, starting with `delegation-reaches-this-scope`. Each line says what changes if it is wrong.
-- Decide on one more site of this scope's class, found after the coverage gate and not filed. The comment at `src/isolated_spawn.rs:677-678` says deleting a name from `SPAWN_ENV_REMOVE` "must fail this test". That held from `86ab6aa`, when the list was exactly the six names the test spells out, until `b434419` widened it to eleven. File it as a sibling `(docs) isolated_spawn:` item, or fold it into #1670, whose `# Automated:` lines name the test.
+- One more site of this scope's class, found after the coverage gate, is filed as #1681 after the run: the comment at `src/isolated_spawn.rs:677-678` says deleting a name from `SPAWN_ENV_REMOVE` "must fail this test". That held from `86ab6aa`, when the list was exactly the six names the test spells out, until `b434419` widened it to eleven. The brief first left the choice between a sibling `(docs) isolated_spawn:` item and a fold into #1670 to the maintainer, who asked on 2026-11-05 for the remaining submissions to go ahead; the sibling form was taken because the site is under `src/**` and owes the `rust`-filtered jobs, the reason this brief keeps #1669 apart from the docs items.
 
 Found on the way, outside this scope, and not acted on:
 
