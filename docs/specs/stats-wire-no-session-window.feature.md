@@ -1,6 +1,6 @@
 # Feature: `stats` says "no session window" on its wire, in its Swift mirror and in its table — never a zero reading
 
-Issue #1601 · PRD REQ-STS-B-001 / REQ-STS-C-001 (§ 10.8; D8 in § 8; § 11.3; § 15.6; MET-T-003 in § 4) · design § 5 B-8, § 4.3, § 4.4, § 8, § 9a, § 11 Cap-5, § 12 AD-13 / OAD-3, § 14 DP-4 / R-D4 (D15 among its open questions)
+Issue #1601 · PRD REQ-STS-B-001 / REQ-STS-C-001 (§ 10.8; D8 in § 8; § 11.3; § 15.6; MET-T-003 in § 4) · design § 5 B-8, § 4.3, § 4.4, § 8, § 9a, § 11 Cap-5, § 12 AD-13 / OAD-3, § 14 DP-4 / R-D4 (D15, settled by council on 2026-11-03)
 
 Example Mapping: 🟦 5 rules · 🟩 28 examples · 🟥 0 open
 
@@ -18,7 +18,7 @@ Example Mapping: 🟦 5 rules · 🟩 28 examples · 🟥 0 open
 > regenerates `build/fixtures/wire-stats-basic.json` once, moves the Swift `StatsWire` mirror and its
 > fixtures in lockstep, leaves the panel's Stats tab a non-inventing interim until #1594 renders what
 > D15 classifies, and reuses the table's own `—` UNKNOWN sentinel, pinned by two new render goldens. It
-> lands after #1600 (which lands in #1598's pull request), in one pull request, under either D8 answer.
+> lands after #1600 (which lands in #1598's pull request), in one pull request, under either D8 answer (D8: ride first, settled by council on 2026-11-03).
 >
 > The `# Tier` line under each scenario is this stub's binding line (the `# Binds:` form of
 > `docs/specs/first-sight-readout.feature.md`). The work class is deterministic output (a byte-pinned
@@ -30,11 +30,11 @@ Example Mapping: 🟦 5 rules · 🟩 28 examples · 🟥 0 open
 > #1601 § 6 names verbatim, each with its expected values in the body: W1–W11 for the aggregate, the
 > wire and the table, and W12–W17 for the sparkline, the two text faces, the trend / heatmap picks and
 > the weekly symmetry; and on (b) a test committed at `fd8640b` that the item leaves unedited, carried
-> as a ratification-pending reading. A scenario still Tier B is graded by a read, a sweep or the merge
+> as a ratification-pending reading. A named test that does not compile against the pull request's base, because it uses a type, field, property, function or signature this item adds or alters in production code, is type-gated under umbrella #1590's RED rule, and carries the base build's compiler error inside it or a test helper it calls and its named mutant run on the pull-request head. A scenario still Tier B is graded by a read, a sweep or the merge
 > judge and owes no test;
-> every "RED" below is a reading of the tree at `fd8640b` (`origin/main`, 2026-11-01), never a run.
-> D8 / OAD-3, the weekly symmetry of AC-13 (design D12) and D15 are open decisions; each scenario
-> they reach is written for the recorded default and says so in its name. One contradiction inside
+> every "RED" below is a reading of the tree at `fd8640b` (`origin/main`, 2026-11-01) and of the pull request's base, never a run.
+> D8 / OAD-3, the weekly symmetry of AC-13 (design AD-13 and D12) and D15 were settled by council on 2026-11-03 at the maintainer's delegation (D8 ride first, on #1601; AC-13's weekly half by AD-13's ruling, on #1601, conditional on D12, on #1598; D15 with D0 on #1594); each scenario
+> they reach is written for the ruling and says so in its name. One contradiction inside
 > the body is resolved here, ratification-pending: § 3 adds a weekly-only account to
 > `statsPreviewFixtureJSON`, which seeds the committed `stats` panel frame
 > (`apps/menubar/Sources/PanelRenderHarness.swift:301-303`), while AC-5 and AC-10 require zero panel
@@ -42,7 +42,7 @@ Example Mapping: 🟦 5 rules · 🟩 28 examples · 🟥 0 open
 > (Rule 3), and the interim is graded by a unit test (Rule 4). Every rule, tier and name here is
 > ratification-pending.
 
-## Rule 1 — absence is carried as `None` from the aggregate, never reconstructed at the wire — and the weekly axis takes the same shape (AC-13 default)
+## Rule 1 — absence is carried as `None` from the aggregate, never reconstructed at the wire — and the weekly axis takes the same shape (AC-13: AD-13 and D12, settled by council)
 
 ```gherkin
 Scenario: an account whose readings carry no session reading aggregates to None on every session figure and to a weekly summary
@@ -87,7 +87,7 @@ Scenario: the contribution-only account stores None, not the zero summary
         and `ZERO` never did
     And `DimStats::ZERO` keeps only the uses that remain, or is removed with its doc comment
 
-Scenario: a reading whose weekly window is absent aggregates to a None weekly summary (AC-13 default; design D12)
+Scenario: a reading whose weekly window is absent aggregates to a None weekly summary (AC-13: AD-13 and D12, settled by council)
   # Tier A — graded by `a_weekly_less_reading_aggregates_to_none_on_the_weekly_axis`
   # (`usage_stats::tests`; #1601 § 6 W2) for the aggregate, with the mutant `Some(DimStats::ZERO)` in
   # the weekly empty arm; the wire and table clauses below by
@@ -95,7 +95,7 @@ Scenario: a reading whose weekly window is absent aggregates to a None weekly su
   # (#1601 § 6 W16, mutant `a.weekly.unwrap_or(DimStats::ZERO)` in `account_wire`), and the Swift clause
   # by `MenubarTests/StatsTests/testAWeeklyLessStatsRowRendersTheTransitionalNAAndDropsTheWeeklyClause`
   # (W17, mutant: an absent `weekly` defaulted to `0` in `statsWeeklyPeak`) — both, like W2, written
-  # only under AC-13's default. Under the operator's recorded overrule, `weekly` stays required and this
+  # for AC-13's ruling (AD-13 and D12, settled by council). Under the operator's recorded overrule, `weekly` stays required and this
   # scenario is replaced by the `AccountWire.weekly` doc sentence AC-13 names · covers AC-13
   Given one account whose samples carry `weekly == None` and `session == Some(0.42)` — the account class
         the operator named as the future case, with no observable instance today
@@ -106,7 +106,7 @@ Scenario: a reading whose weekly window is absent aggregates to a None weekly su
         and the table's `weekly m/p/p95` and `weekly` cells print `—`
     And the panel's `Weekly pk` cell reads the transitional `n/a` and the spoken summary drops its
         weekly
-        clause — the D15 interim of Rule 4, ratification-pending
+        clause — #1601's Rule 4 interim for the weekly-less case, which the D0/D15 ruling of 2026-11-03 filed as #1646 instead of classifying; the interim is #1601's own, ratification-pending
     But NOT a second `JSON_SCHEMA_VERSION` bump when that account class appears — the symmetry rides
         this one
 ```
@@ -267,7 +267,7 @@ Scenario: ADR-0035 stands — the keys' presence moves, the at-cap rule and its 
     But NOT ADR-0035 amended — #1593 owns the four in-place amendments and this item owes none
 ```
 
-## Rule 3 — the Swift mirror decodes the omission in the same bundle: `nil` for an omitted key, a throw for a present-but-invalid one, every `"schema":1` site moved, one pull request (D8 default)
+## Rule 3 — the Swift mirror decodes the omission in the same bundle: `nil` for an omitted key, a throw for a present-but-invalid one, every `"schema":1` site moved, one pull request (D8, settled by council)
 
 ```gherkin
 Scenario: a schema-2 frame whose weekly-only entry omits the four keys decodes with nil in each
@@ -350,7 +350,7 @@ Scenario: every schema:1 site under apps/menubar moves to 2 or is recorded as de
         grades
         the interim instead
 
-Scenario: the reshape, the mirror, the fixtures and the goldens land in one pull request under either D8 answer (D8 default: follow, as #1590 places this item and #1604 reads a missing answer)
+Scenario: the reshape, the mirror, the fixtures and the goldens land in one pull request under either D8 answer (D8: ride first before the deploy, council 2026-11-03)
   # Tier B — pending: the pull request's composition is a read (`gh pr view <N> --json files,body`), and
   # no test grades a delivery boundary; the mechanism it protects is itself tested — the committed
   # `testStatsFixtureMatchesRustGolden` fails on any split that regenerates the golden without the
@@ -364,23 +364,18 @@ Scenario: the reshape, the mirror, the fixtures and the goldens land in one pull
    Then the Rust reshape, the Swift optionals, both Swift fixtures, the regenerated wire golden and the
         two
         render goldens are in one pull request
-    And its body records which D8 answer was ratified: ride first (tranche 1, right after #1600's pull
-        request)
-        or follow (tranche 2), the tracker's default, recorded as "follow — no recorded answer" when the
-        operator
-        has not answered (the merge does not wait for an answer) — the item's shape is identical under
-        both;
-        the design recommends ride first
-        (OAD-3), to be ratified with D8 as one question
+    And its body records "ride first, settled by council on 2026-11-03" and links the D8 ruling (a comment on
+        #1601): #1601 lands in tranche 1, in its own pull request after #1598's (which carries #1600) and before
+        #1604 — the item's shape is identical under either answer
     And the fleet's deployment item of #1590 rebuilds the bundle after it
     But NOT the daemon half merged ahead of the app half, and NOT the app half ahead of the daemon's
         golden
 ```
 
-## Rule 4 — the panel's Stats tab decodes such a row without crashing and invents nothing: a non-inventing interim until #1594 renders what D15 classifies (D15 default)
+## Rule 4 — the panel's Stats tab decodes such a row without crashing and invents nothing: a non-inventing interim until #1594 renders what D15 classifies (D15, settled by council)
 
 ```gherkin
-Scenario: a decoded row with no session dimension renders the transitional n/a, no signal pill, and a weekly-only spoken summary (D15 default interim)
+Scenario: a decoded row with no session dimension renders the transitional n/a, no signal pill, and a weekly-only spoken summary (the interim before #1594 renders D15's classification)
   # Tier A — graded by
   # `MenubarTests/StatsTests/testAWeeklyOnlyStatsRowRendersTheTransitionalNAAndSpeaksOnlyItsWeeklyPeak`
   # (#1601 § 6 W9), over `statsSessionMeanPeak`, `statsWeeklyPeak`, `statsSignal` and the Cap-hits value
@@ -401,11 +396,11 @@ Scenario: a decoded row with no session dimension renders the transitional n/a, 
         clauses dropped
     And the `Weekly pk` cell carries `90%`
     But NOT `0 / 0%`, `0`, an `underused` pill, "Session mean 0 percent" or "0 cap hits"
-    But NOT the `—` observed-absence token, an empty cell or a new register row — those pre-empt D0 /
-        D15
-        (`apps/menubar/design/README.md:1289-1291`); #1594 replaces this interim
+    But NOT the `—` gap sentinel, an empty cell or a new register row — the register's **no-session-window account**
+        Stats row (`apps/menubar/design/README.md` § What this reference does not author, the D0/D15 ruling of 2026-11-03)
+        classifies these cells, and #1594 builds them; #1594 replaces this interim
 
-Scenario: the row's sparkline draws no line for an account with a no-session bucket, never a floor line (D15 default interim)
+Scenario: the row's sparkline draws no line for an account with a no-session bucket, never a floor line (the interim before #1594 renders D15's classification)
   # Tier A — graded by
   # `MenubarTests/StatsTests/testSparkSeriesIsEmptyForAnAccountWithANoSessionBucketNeverAFloorLine`
   # (#1601 § 6 W12), over `StatusPanelFormat.sparkSeries`
@@ -630,7 +625,7 @@ is named as such, with what grades it instead.
 | AC-10 — the diff is bounded and the gates pass | Rule 4 "the panel shows zero drift…" and Rule 5 "the two new goldens are emitted once…" (the trailer clauses only); otherwise none | `git diff --stat origin/main`; the five `test` steps, `msrv`, both `deny` checks, `./scripts/check-menubar-zero-egress.sh`, `xcodebuild test` read off its executed-test count, the armed `panel-goldens` run; the three trailer gates in CI |
 | AC-11 — one delivery under either D8 answer | Rule 3: "the reshape, the mirror, the fixtures and the goldens land in one pull request…" | a read of the pull request; the committed `testStatsFixtureMatchesRustGolden` fails on a split |
 | AC-12 — build-reference conformance | Rule 2 "the version moves once…"; Rule 3 "the Swift golden fixture follows…"; Rule 4 "the panel shows zero drift…" | `testStatsFixtureMatchesRustGolden` (Tier A); W5's baseline read of the regenerated golden (Tier A, #1601 § 6); the Rust pin after regeneration; the armed panel gate; the pull request body's statement that nothing is built against the mock |
-| AC-13 — the weekly symmetry, or its recorded overrule | Rule 1: "a reading whose weekly window is absent aggregates to a None weekly summary (AC-13 default; design D12)" | `a_weekly_less_reading_aggregates_to_none_on_the_weekly_axis` (Tier A, #1601 § 6 W2) for the aggregate; `a_weekly_less_entry_omits_the_weekly_key_and_prints_the_unknown_sentinel_in_its_weekly_cells` (Tier A, W16) for the wire and the table; `testAWeeklyLessStatsRowRendersTheTransitionalNAAndDropsTheWeeklyClause` (Tier A, W17) for the Swift mirror and its interim; under the overrule, the `AccountWire.weekly` doc sentence is the judge's read |
+| AC-13 — the weekly symmetry, or its recorded overrule | Rule 1: "a reading whose weekly window is absent aggregates to a None weekly summary (AC-13: AD-13 and D12, settled by council)" | `a_weekly_less_reading_aggregates_to_none_on_the_weekly_axis` (Tier A, #1601 § 6 W2) for the aggregate; `a_weekly_less_entry_omits_the_weekly_key_and_prints_the_unknown_sentinel_in_its_weekly_cells` (Tier A, W16) for the wire and the table; `testAWeeklyLessStatsRowRendersTheTransitionalNAAndDropsTheWeeklyClause` (Tier A, W17) for the Swift mirror and its interim; under the overrule, the `AccountWire.weekly` doc sentence is the judge's read |
 | AC-14 — the `lowest utilisation` line ranks only accounts with a session reading | Rule 5: "the lowest-utilisation line ranks only accounts with a session reading" | `the_lowest_utilisation_line_ranks_only_accounts_with_a_session_reading` (Tier A, #1601 § 6 W13) with its ranking-key mutant |
 | AC-15 — the session-distribution gauge shows a gap, never a zero gauge | Rule 5: "the session-distribution gauge keeps the account's row…" | `the_session_gauge_draws_a_bare_track_and_the_unknown_sentinel_for_an_account_with_no_session_window` (Tier A, #1601 § 6 W14) with its `unwrap_or(DimStats::ZERO)` mutant |
 | AC-16 — the interim docs #1600 plants are retired | Rule 2: "the vocabulary is stated where each absence is read" | the `git grep` of AC-16 at the head with its control on #1600's merged head, and the merge judge's read — no test |
