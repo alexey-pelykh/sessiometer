@@ -25,8 +25,8 @@ Example Mapping: 🟦 5 rules · 🟩 15 examples · 🟥 0 open
 > read
 > off `parse_usage` at that revision, never off a run: the runs are #1591's to post at its landing and
 > AC-14's to carry. Tier B names what is still unbound.
-> D1 and D2 are the operator's open decisions; every scenario below is written for the recorded
-> default and says so in its name. Every rule, tier and name here is ratification-pending.
+> D1 and D2 were settled by council on 2026-11-03 at the maintainer's delegation (recorded on #1596): D1 option (a) ratified, D2 identical ratified; every scenario either reaches is written for the ruling,
+> which ratified each recorded default, and every scenario title that names D1 or D2 says it is settled by council. Every rule, tier and name here is ratification-pending.
 
 ## Rule 1 — a window the reply does not carry is `None` on every one of its fields, never a fabricated `0`
 
@@ -233,10 +233,10 @@ Scenario: at the lookup seam, the weekly reading is weekly_all's, never weekly_s
     But NOT 0.12, "2026-11-06T22:59:59.916182+00:00" or "normal"
 ```
 
-## Rule 4 — `"five_hour":null` and an absent `five_hour` key read identically (D2 default)
+## Rule 4 — `"five_hour":null` and an absent `five_hour` key read identically (D2, settled by council)
 
 ```gherkin
-Scenario: the absent-key reply is served exactly like the null one (D2 default)
+Scenario: the absent-key reply is served exactly like the null one (D2, settled by council)
   # Tier A — graded by usage::tests::the_absent_five_hour_key_reply_is_served_exactly_like_the_null_one
   # (N1, #1596 § 4b; RED at fd8640b: both Err(UsageParse), the expect fails) · covers AC-6
   Given `CAPTURED_NULL_SESSION_QUOTA_FIELDS` and
@@ -254,7 +254,7 @@ Scenario: the absent-key reply is served exactly like the null one (D2 default)
     # ruling of *different*, this scenario is replaced by the documented difference and a branch in
     # `parse_usage`; nothing else in this stub changes.
 
-Scenario: the two bodies take the same outcome at both seams (D2 default)
+Scenario: the two bodies take the same outcome at both seams (D2, settled by council)
   # Tier A — graded by usage::tests::a_null_five_hour_and_an_absent_five_hour_key_read_identically
   # (#1592 T6; its mutant row, a null-specific branch before the session lookup, is run at #1592's
   # landing) · covers AC-6
@@ -269,7 +269,7 @@ Scenario: the two bodies take the same outcome at both seams (D2 default)
 ## Rule 5 — a reply with no applicable window takes D1's answer, and a served reading carries at least one window
 
 ```gherkin
-Scenario: a windowless reply is a hard parse error, so the loop skips and never swaps (D1 default)
+Scenario: a windowless reply is a hard parse error, so the loop skips and never swaps on the reading (the ADR-0017 preempt off a retained anchor is unchanged) (D1, settled by council)
   # Tier A — graded by usage::tests::oracle_c_a_reply_with_no_window_is_never_two_fabricated_windows
   # (#1591; green at fd8640b by construction under D1 (a), RED against the mutant that serves two 0.0
   # windows) · covers AC-5
@@ -280,14 +280,14 @@ Scenario: a windowless reply is a hard parse error, so the loop skips and never 
     And the error text names both windows and carries no response bytes — "no quota window (neither
         five_hour nor seven_day)" is the suggested wording; no test pins the text, and review reads it
     And `classify_poll` (`src/daemon/classify.rs:55-62`) maps that `Err` to `PollOutcome::Transient`,
-        the same skip-never-swap path a rejected reply takes today
+        the same path a rejected reply takes today: the loop skips and never swaps on the reading
     But NOT `Ok` with two fabricated 0.0 windows
     But NOT a fraction of any kind
     # D1 (b), the alternative: `Ok` with both windows `None` — classifies `Live`, passes every
     # viability filter and never swaps away. No instance exists (Ultra keeps the weekly window).
     # Under (b) Oracle C takes its (b) form and the pull request body says which option was built.
 
-Scenario: the empty object through the poll path stays a failed poll (D1 default)
+Scenario: the empty object through the poll path stays a failed poll (D1, settled by council)
   # Tier A — graded by usage::tests::a_200_with_an_unparseable_body_is_a_parse_error (committed at
   # fd8640b; stands unedited under D1 (a), #1596 § 4d row 13) · covers AC-5, AC-9
   Given a 200 reply whose body is `{}`, through the fake transport
@@ -295,10 +295,10 @@ Scenario: the empty object through the poll path stays a failed poll (D1 default
    Then the outcome is `Err(Error::UsageParse(_))` — no window applies, so D1's answer
     But NOT a served reading with both windows `None`, which is D1 (b), under which this test moves
     # `a_200_with_an_unparseable_body_is_a_parse_error` is at `src/usage.rs:1472`. It is a committed
-    # grader the executor may not edit under the default, and the one that would fail if the
+    # grader the executor may not edit under D1 (a), and the one that would fail if the
     # neither-window guard were dropped.
 
-Scenario: a served reading carries at least one window — invariant I-2 (D1 default)
+Scenario: a served reading carries at least one window — invariant I-2 (D1, settled by council)
   # Tier A — graded by usage::tests::a_served_reading_carries_at_least_one_window (N4, #1596 § 4b; its
   # invariant half is green at fd8640b vacuously — every `Ok` report there carries both windows — and
   # its exact-`Err`-set half is RED there, where every body but the two-window one is `Err`; its mutant

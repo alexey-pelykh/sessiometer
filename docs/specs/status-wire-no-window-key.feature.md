@@ -1,6 +1,6 @@
 # Feature: the status/watch wire says "no session window" by bytes, and a weekly-only blind active keeps its blind block without a percent
 
-Issue #1599 · PRD REQ-STL-I-001 / REQ-STL-I-002 / REQ-STL-C-001 / REQ-STL-B-001 / REQ-STL-Q-001 / REQ-CEL-C-001 / REQ-ARM-B-007's surfacing half (§ 10.6, § 10.11, § 10.3; D0, D3 and D10 in § 8; § 11.1, § 11.2) · design § 5 B-6, § 5 B-6t, § 4.3, § 4.4, § 4.6, § 8, § 9a, § 9b (iii), § 11 Cap-3, § 12 AD-6 / AD-7 / AD-8 / AD-9 / AD-24, § 14 DP-1 / R-D2 / R-D5 / R-D9 (D11 and D15 among its open questions)
+Issue #1599 · PRD REQ-STL-I-001 / REQ-STL-I-002 / REQ-STL-C-001 / REQ-STL-B-001 / REQ-STL-Q-001 / REQ-CEL-C-001 / REQ-ARM-B-007's surfacing half (§ 10.6, § 10.11, § 10.3; D0, D3 and D10 in § 8; § 11.1, § 11.2) · design § 5 B-6, § 5 B-6t, § 4.3, § 4.4, § 4.6, § 8, § 9a, § 9b (iii), § 11 Cap-3, § 12 AD-6 / AD-7 / AD-8 / AD-9 / AD-24, § 14 DP-1 / R-D2 / R-D5 / R-D9 (D11 and D15, settled by council on 2026-11-03)
 
 Example Mapping: 🟦 6 rules · 🟩 25 examples · 🟥 0 open
 
@@ -33,19 +33,17 @@ Example Mapping: 🟦 6 rules · 🟩 25 examples · 🟥 0 open
 > #1599 § 8 names verbatim together with a RED that is read off the tree (RT-1 against the tree after
 > #1597, RT-2 and RT-9 against the tree after #1597 and block B-3, ST-2 against `fd8640b` itself; the
 > runs are AC-1's, AC-2's and AC-3's to record), and (b) a test committed at `fd8640b` that the item
-> leaves unedited, carried as a ratification-pending reading. A scenario whose named test
-> is type- or compile-gated with no RED and no recorded mutant run is Tier B, and names the missing
-> row for #1599 § 8. Every "RED" below is a reading of the tree at `fd8640b` (`origin/main`,
-> 2026-11-01), never a run. D10, D11, D15 and #1599 § 2a's verdict representation (D3's surfacing half)
-> are the operator's open decisions; every scenario they
-> reach is written for the recorded default and says so in its name. The minor itself is never a
+> leaves unedited, carried as a ratification-pending reading. A type- or compile-gated test is graded under umbrella #1590's RED rule by the base build's compiler error inside it or a test helper it calls and its recorded mutant run on the pull-request head; a scenario whose named test has neither a RED nor those two records is Tier B, and names the missing row for #1599 § 8. Every "RED" below is a reading of the tree at `fd8640b` (`origin/main`,
+> 2026-11-01) and of the pull request's base, never a run. D10, D11 and D15 were settled by council on 2026-11-03
+> at the maintainer's delegation (D10 on #1597, D11 on #1599, D15 with D0 on #1594); #1599 § 2a's verdict representation (D3's surfacing half) stays open, because neither the D11 record (a comment on #1599) nor the D3/D4 record (a comment on #1602) rules it; every scenario
+> title that names one of them says it is settled by council or names the interim it is written for. The minor itself is never a
 > number here: it is read from the queue at landing (AC-7). Every rule, tier and name here is
 > ratification-pending.
 
-## Rule 1 — the wire says "no session window" with its own omittable key, emitted only from a served reading; "no reading" stays `session_pct: null` without it (D11 default)
+## Rule 1 — the wire says "no session window" with its own omittable key, emitted only from a served reading; "no reading" stays `session_pct: null` without it (D11, settled by council)
 
 ```gherkin
-Scenario: a served no-window row and a no-reading row differ by bytes (D11 default)
+Scenario: a served no-window row and a no-reading row differ by bytes (D11, settled by council)
   # Tier A — graded by
   # daemon::snapshot_build::tests::status_response_says_no_session_window_with_the_absent_windows_key_and_a_failed_poll_without_it
   # (RT-1, #1599 § 8; named verbatim with its RED read off the tree: the key does not exist at fd8640b,
@@ -70,7 +68,7 @@ Scenario: a served no-window row and a no-reading row differ by bytes (D11 defau
     # are unchanged. Under a ratified alternative to D11 (a boolean, a per-window enum) the bytes
     # change shape and every BUT NOT here still holds.
 
-Scenario Outline: the emission helper lists each absent window in a fixed order and yields nothing for a two-window reading (D11 default)
+Scenario Outline: the emission helper lists each absent window in a fixed order and yields nothing for a two-window reading (D11, settled by council)
   # Tier A — graded by
   # daemon::snapshot_build::tests::windows_absent_from_lists_each_absent_window_in_fixed_order (RT-7,
   # #1599 § 8: the four rows below with their exact lists, where RT-1 grades only the session-absent,
@@ -90,7 +88,7 @@ Scenario Outline: the emission helper lists each absent window in a fixed order 
     | Some(0.60) | Some(0.10) | []                   | omits `absent_windows`                                                                                                                                  |
     | None       | Some(0.90) | ["session"]          | carries `"absent_windows":["session"]`                                                                                                                  |
     | Some(0.42) | None       | ["weekly"]           | carries `"absent_windows":["weekly"]` — the operator's stated future case, on the same key with no second minor                                        |
-    | None       | None       | ["session","weekly"] | carries `"absent_windows":["session","weekly"]` — reachable only under D1 (b); under the default (a) a reply with neither window never reaches the wire |
+    | None       | None       | ["session","weekly"] | carries `"absent_windows":["session","weekly"]` — reachable only under D1 (b); under D1's ruling (a) a reply with neither window never reaches the wire |
   # The wire tokens `session` and `weekly` are what this item pins; the Rust enum's name is the
   # executor's (the design wrote
   # `WindowKind`, which already names a private enum in `src/stats.rs:169`).
@@ -110,10 +108,10 @@ Scenario: a blind row carries no key — its "no session window" fact rides the 
         blindness there is none
 ```
 
-## Rule 2 — a weekly-only blind active keeps its blind block, with the percent omitted and never a fabricated `0`; the `1.14` no-block interim is retired, and the restored block reads DEGRADED past the gate, never OK (D10 default; #1599 § 2a default)
+## Rule 2 — a weekly-only blind active keeps its blind block, with the percent omitted and never a fabricated `0`; the `1.14` no-block interim is retired, and the restored block reads DEGRADED past the gate, never OK (D10, settled by council; #1599 § 2a default)
 
 ```gherkin
-Scenario: a weekly-only blind active's block carries its duration and verdict and no percent key (D10 default)
+Scenario: a weekly-only blind active's block carries its duration and verdict and no percent key (D10, settled by council)
   # Tier A — graded by
   # daemon::snapshot_build::tests::a_weekly_only_blind_active_serializes_its_block_without_a_percent_and_never_a_zero
   # (RT-2, #1599 § 8; named verbatim with its RED on bytes, read off the tree: under the `1.14` interim
@@ -199,7 +197,7 @@ Scenario: a present percent still rides as before, and the reshape stops at `Bli
     But NOT the reshape stopping at `BlindActive` — the swap notice carries the same field (next
         scenario)
 
-Scenario: a Retry-After swap off a session-less anchor is narrated with its labels and no percent (#1599 § 2b default)
+Scenario: a Retry-After swap off a session-less anchor is narrated with its labels and no percent (#1599 § 2b, settled by council with D11)
   # Tier A — graded by
   # daemon::tests::a_retry_after_blind_swap_off_a_session_less_anchor_narrates_the_swap_with_no_percent_on_the_wire
   # (RT-9, #1599 § 8; named verbatim with its RED read off the tree after #1597 and block B-3: the
@@ -251,7 +249,7 @@ Scenario: a Retry-After swap off a session-less anchor is narrated with its labe
     # notice, so no Swift site moves.
 ```
 
-## Rule 3 — every reader of the new key and the reshaped field takes a named move and fabricates nothing: the Swift mirror decodes both and never throws on the absent percent, the CLI falls back and drops the clause, the panel interim renders no block (D15 interim)
+## Rule 3 — every reader of the new key and the reshaped field takes a named move and fabricates nothing: the Swift mirror decodes both and never throws on the absent percent, the CLI falls back and drops the clause, the panel interim renders no block (D15 interim, until #1594 builds the register's held-block row)
 
 ```gherkin
 Scenario: the app decodes a percent-less blind block instead of dropping the frame
@@ -273,7 +271,7 @@ Scenario: the app decodes a percent-less blind block instead of dropping the fra
         and the Swift `UInt8?` cannot land apart
     But NOT `lastKnownSessionPct == 0`
 
-Scenario: the app reads the key and defaults it to empty when absent or null (D11 default)
+Scenario: the app reads the key and defaults it to empty when absent or null (D11, settled by council)
   # Tier A — graded by MenubarTests/WireDecoderTests/testDecodesTheAbsentWindowsKeyAndDefaultsItToEmpty
   # (ST-1, #1599 § 8; compile-gated, so its evidence is the mutant run AC-3 records: the key decoded
   # with `decode` rather than `decodeIfPresent … ?? []` → the no-key row throws and ST-1 FAILS). A
@@ -290,7 +288,7 @@ Scenario: the app reads the key and defaults it to empty when absent or null (D1
         is not lost
     But NOT an enum that throws on an unknown token
     But NOT a new field on `AccountRow` (`apps/menubar/Sources/HonestStateMachine.swift:361`) —
-        carrying `absentWindows` into the row model is #1594's, because nothing renders on it until D0
+        carrying `absentWindows` into the row model is #1594's, because what renders on it is the register's D0/D15 rows (settled by council on 2026-11-03), which #1594 builds
     # `absentWindows` is the ONLY discriminator for "no session window"; `sessionPct == nil` alone
     # means the last poll failed.
 
@@ -346,7 +344,7 @@ Scenario Outline: the blind prose lines name the duration and the verdict and dr
   # `status-*` CLI render golden carries a blind row, so these lines are pinned at the renderer seam,
   # not by a golden (Rule 5).
 
-Scenario: the panel renders a decoded percent-less block as no block until D0 classifies the held block (D15 interim, glance sub-default)
+Scenario: the panel renders a decoded percent-less block as no block until #1594 builds the register's held-block row (D15 interim, glance sub-default)
   # Tier A — graded by
   # MenubarTests/StatusPanelFormatTests/testAPercentLessBlindBlockRendersAsTheTwoMeterRowUntilClassified
   # (ST-5, #1599 § 8; compile-gated, so its evidence is the three mutant runs AC-5 records: (i) the gate
@@ -381,14 +379,14 @@ Scenario: the panel renders a decoded percent-less block as no block until D0 cl
     And the decoded model keeps the block (`blindActive != nil`), so #1594 renders it later without a
         second decode change
     And the menu-bar glance input `activeBlindDegraded` (`HonestStateMachine.swift:750`) reads the raw
-        block and is `true` — the expected value: the author-chosen sub-default, reachable with no
+        block and is `true` — the expected value: #1599 § 5's glance sub-default (the D11 ruling leaves it undecided), reachable with no
         `Retry-After` hold because #1599 § 2a makes the block DEGRADED past the gate (if the operator
         overturns the sub-default before dispatch, this one step flips to `false`)
     But NOT an invented held-block render — the mock authors no such state (REQ-CEL-C-001); the
         classified render is #1594's under D15
     But NOT an eye-slash or an orange or red rule on a row whose meters read `n/a`
     But NOT the block dropped from the decoded model
-    # Cost, stated: until D0 classifies the held block, the blind duration and verdict a weekly-only
+    # Cost, stated: until #1594 builds the register's held-block row, the blind duration and verdict a weekly-only
     # blind active now carries are visible in the CLI footer and invisible on the panel row (design
     # DP-1, R-D9); the glance alone speaks for it, with the inexact authored label "auto-protection
     # degraded — acting on a stale anchor" (`HonestStateMachine.swift:304`) — inexact, never a false OK.
@@ -448,7 +446,7 @@ Scenario: the five committed goldens are regenerated by one emitter run at the l
     But NOT a no-window row or a percent-less block added to any of the five — those are the new
         golden's
 
-Scenario: one new golden carries the two new states, emitted and pinned like the five (D11 default)
+Scenario: one new golden carries the two new states, emitted and pinned like the five (D11, settled by council)
   # Tier B — pending: RT-6 (`the_committed_wire_goldens_still_match_the_daemon_encoders` extended with
   # the sixth golden) and ST-4 (`testTheNoWindowGoldenIsByteIdentical`) are both executor-authored over
   # executor-emitted bytes, so neither is independent, and a golden cannot be pre-authored at scope time
@@ -528,14 +526,14 @@ Scenario: the outgoing minor's three-field block stays under test
     But NOT this fixture counted among the lines the sweep moves
 ```
 
-## Rule 5 — CONSTRAINT: the transitional state is retired and nothing else moves — `null` keeps its steady-state meaning, the CLI and panel goldens hold, the session cells stay `n/a` until #1594 (D10 default)
+## Rule 5 — CONSTRAINT: the transitional state is retired and nothing else moves — `null` keeps its steady-state meaning, the CLI and panel goldens hold, the session cells stay `n/a` until #1594 (D10, settled by council)
 
 ```gherkin
-Scenario: the session_pct contract reverts to its steady-state sentence, and the corrected claims are swept (D10 default)
+Scenario: the session_pct contract reverts to its steady-state sentence, and the corrected claims are swept (D10, settled by council)
   # Tier B — pending: documentation —
   # `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` decides that it builds;
   # `git grep -n -i 'transitional' -- src/daemon/snapshot.rs` prints nothing on the pull-request head
-  # (nothing at fd8640b either — the sentence is #1597's to write under D10's default); AC-12's sweep
+  # (nothing at fd8640b either — the sentence is #1597's to write under D10, settled by council); AC-12's sweep
   # `git grep -n -E 'last_known_session_pct|lastKnownSessionPct|last-known session' -- src apps docs README.md CONTRIBUTING.md build/fixtures`
   # (91 lines in 16 files at fd8640b) re-measured on the pull-request head, every hit in #1590's scope
   # documents (the PRD, the design, the brief and the `docs/specs/*.feature.md` stubs, this one among
@@ -548,7 +546,7 @@ Scenario: the session_pct contract reverts to its steady-state sentence, and the
   # AC-18
   Given the doc comment at `src/daemon/snapshot.rs:758-763` — "Last-polled session-window usage
         percent (`0..=100`); `null` if the last poll for this account failed (never a fabricated
-        `0`)." — plus the transitional sentence #1597 appended under D10's default
+        `0`)." — plus the transitional sentence #1597 appended under D10, settled by council
    When this item lands
    Then the transitional sentence is deleted and the comment still says `null` means the last poll
         failed, and gains exactly one sentence (mandatory, #1599 § 7) saying that a `null` on a line
@@ -682,7 +680,7 @@ Scenario: the gates run in order with their flags verbatim, and the executed-tes
     But NOT `cargo test -- --include-ignored`, which also fires the frozen migration-fixture emitter
     But NOT `TEST SUCCEEDED` read as a pass without the executed-test count
 
-Scenario: the pull request lands after its blockers, with the repository's commit convention (D10 default)
+Scenario: the pull request lands after its blockers, with the repository's commit convention (D10, settled by council)
   # Tier B — pending: convention only — nothing parses a commit message (`CLAUDE.md` § Commit and issue
   # conventions says so); the merge judge reads `git log origin/main` for #1597 and the decision-arms
   # item #1602 landing first and, after the merge, the squash commit's subject and body; no test is owed

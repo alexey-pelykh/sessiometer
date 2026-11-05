@@ -28,7 +28,7 @@ Example Mapping: 🟦 5 rules · 🟩 17 examples · 🟥 0 open
 > request compile across the crate — and leaves the `stats` wire's shape untouched: `stats --json`
 > still carries a `session` block for such an account, holding the zero summary an empty series
 > produces, until the sibling wire item #1601 replaces that block with an omission under
-> `JSON_SCHEMA_VERSION` 2 (design OAD-3 / D8: under either answer this item's shape is the same).
+> `JSON_SCHEMA_VERSION` 2 (design OAD-3 / D8: under either answer this item's shape is the same; D8 chose ride first, settled by council on 2026-11-03).
 >
 > The `# Tier` line under each scenario is this stub's binding line, in the form of
 > `docs/specs/sample-store-session-null.feature.md`. Tier A names a grader the executor may not
@@ -57,8 +57,8 @@ Example Mapping: 🟦 5 rules · 🟩 17 examples · 🟥 0 open
 > Tier A.
 >
 > D5 (`census-excludes-absent-window`), D12 (`Sample.weekly` optional, applied symmetrically) and
-> D8 (whether #1601 rides in tranche 1) are open, each built for its recorded default with the
-> alternative stated in #1600; a scenario that depends on one says so in its name. Under D5's
+> D8 (whether #1601 rides in tranche 1) were settled by council on 2026-11-03 at the maintainer's delegation (D5 on #1600, D12 on #1598, D8 on #1601): D5 ratified the default built here; D12 ratified `Sample.weekly` optional, and its council left undecided how #1600 treats a weekly `None`; D8 chose ride first, under which #1600's interim records describe a state that exists between two merges and never deploys. Each
+> alternative is stated in #1600; a scenario that depends on one says so in its name. Under D5's
 > alternative — hold the census UNKNOWN whenever such an account is on the roster — Rule 2's three
 > D5 scenarios invert (the weekly-only account stays in the set and empties the intersection) and
 > nothing else here changes. Every rule, tier and name here is ratification-pending.
@@ -152,7 +152,7 @@ Scenario: the stats wire and table carry the interim for such an account at this
 ## Rule 2 — the two censuses: a structurally absent session window is not an unobserved reading — the all-high census excludes it (D5), the capacity-hold census keeps the sample as covering and never session-blocked
 
 ```gherkin
-Scenario: the all-high census is over the accounts that have a session window (D5 default)
+Scenario: the all-high census is over the accounts that have a session window (D5, settled by council)
   # Tier A — graded by
   # usage_stats::tests::the_all_high_census_is_over_the_accounts_that_have_a_session_window (#1600 T3;
   # mutants, AC-2's record: `unwrap_or(0.0)` keeps `a` in the set at `0 %`, the high intersection
@@ -170,9 +170,8 @@ Scenario: the all-high census is over the accounts that have a session window (D
    Then `all_high_episodes == 1`
     And `all_high_covered_secs` equals `b`'s covered seconds — the census set is the roster minus every
         account none of whose in-period samples carries a session reading
-    And the `all_high` doc comment quotes D5's sentence — "A structurally absent session window is
-        excluded from the session census — it is not an unobserved reading, and the census is over the
-        accounts that have the window" — and names
+    And the `all_high` doc comment quotes D5's ratified sentence, as ADR-0033 carries it — "A structurally absent session window is
+        excluded from the session census: it is not an unobserved reading. The census set is the roster minus every account none of whose in-period readings carries a session reading; a reading with no session window anchors nothing and covers nothing; a rostered account with no in-period readings at all stays in the set and empties the intersection" — and names
         `docs/adr/0033-weekly-saturated-session-low-stays-unknown.md`, amended by #1593, as its record —
         checked by AC-2's `git grep -c 'structurally absent session window' -- src/usage_stats.rs`,
         which prints nothing at `fd8640b`
@@ -184,7 +183,7 @@ Scenario: the all-high census is over the accounts that have a session window (D
     But NOT `a`'s share read as `0` because its weekly-only samples were left out of the in-period set
         the contribution counts read
 
-Scenario: a mixed-period account is counted only over the instants it had a session window (D5 default)
+Scenario: a mixed-period account is counted only over the instants it had a session window (D5, settled by council)
   # Tier A — graded by
   # usage_stats::tests::a_mixed_period_account_is_counted_only_over_the_instants_it_had_a_session_window
   # (#1600 T4; mutant, AC-2's record: `unwrap_or(0.0)` makes the first half covered-but-low, so
@@ -220,7 +219,7 @@ Scenario: a rostered account with no samples at all still empties the intersecti
         empties it" stays true
     But NOT `c` dropped from the set the way `a` is: no samples is "unobserved", not "no window"
 
-Scenario: without a known roster the fallback set is the sampled accounts minus those with no session reading (D5 default)
+Scenario: without a known roster the fallback set is the sampled accounts minus those with no session reading (D5, settled by council)
   # Tier A — graded by
   # stats::tests::without_a_known_roster_the_all_high_census_is_over_the_sampled_accounts_that_have_a_session_window
   # (#1600 T9, T3's `roster == None` twin, placed in `stats::tests` because `census_over_roster` is the
@@ -370,7 +369,7 @@ Scenario: the non-finite guard stays ahead of the clamp, applied to the present 
 ## Rule 5 — CONSTRAINT: never a numeric default on either axis, in the diff or its tests; the records say "every dimension the account has"; the diff is bounded to the three reader files and lands in #1598's pull request
 
 ```gherkin
-Scenario Outline: a reading with no weekly window takes the same move on the weekly axis (D12 default)
+Scenario Outline: a reading with no weekly window takes the same move on the weekly axis (on `Sample.weekly` optional, D12, settled by council; the move itself no council ruled)
   # Tier A — graded by
   # usage_stats::tests::a_sample_with_no_weekly_reading_is_excluded_from_the_weekly_figures_and_kept_in_the_session_ones
   # (the `aggregate_with_roster` row),
@@ -463,7 +462,7 @@ is named as such, with what grades it instead.
 
 | AC | Scenarios | What grades it |
 |---|---|---|
-| AC-1 — session figures exclude a reading with no session window; weekly figures keep it | Rule 1 "a sample with no session reading is excluded…"; Rule 2 "the all-high census is over the accounts…" (its `contribution_share` step); Rule 5 outline (D12 default), the `aggregate_with_roster` row | T1 and its weekly twin T13 with AC-1's mutant record, and T3's `contribution_share` step with its own mutant (Tier A) |
+| AC-1 — session figures exclude a reading with no session window; weekly figures keep it | Rule 1 "a sample with no session reading is excluded…"; Rule 2 "the all-high census is over the accounts…" (its `contribution_share` step); Rule 5 outline (on `Sample.weekly` optional, D12, settled by council; the move itself no council ruled), the `aggregate_with_roster` row | T1 and its weekly twin T13 with AC-1's mutant record, and T3's `contribution_share` step with its own mutant (Tier A) |
 | AC-2 — the all-high census is over the accounts that have the window (D5) | Rule 2 "the all-high census is over the accounts…", "a mixed-period account…", "a rostered account with no samples…", "without a known roster…" | T3, T4 and the roster-less twin T9 with AC-2's mutant records (Tier A); the committed `a_rostered_account_with_no_samples_stays_in_the_census_instead_of_vanishing` for the unsampled clause, under AC-2's careless-D5 mutant record (Tier A); the `all_high` and `census_over_roster` doc sentences by AC-2's two `git grep -c 'structurally absent session window'` checks |
 | AC-3 — a weekly-only sample is never session-blocked, and the capacity census keeps it | Rule 2 "a weekly-only sample over the weekly line…", "a weekly-only account that is viable…"; Rule 5 outline, the `blocked_windows` row | T5, the set-membership test T10 and the weekly twin T14 with AC-3's mutant records (Tier A) |
 | AC-4 — velocity is per axis over the readings that carry it | Rule 3, all three; Rule 5 outline, the `account_velocity` row | T6, the mixed-series T11, the vanished-window T12 and the weekly twin T15 with AC-4's mutant records (Tier A) |

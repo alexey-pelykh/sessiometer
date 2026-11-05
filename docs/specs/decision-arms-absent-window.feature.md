@@ -1,6 +1,6 @@
 # Feature: every decision arm names its move on an absent quota window — skip, pass, exclude or name, never a numeric default
 
-Issue #1602 · PRD REQ-RDG-C-001 / REQ-ARM-B-001 … REQ-ARM-B-012 / REQ-ARM-C-001 / REQ-ARM-Q-001 (§ 10.3; D3, D4, D7, D10 in § 8; § 11.1) · design § 5 B-3, § 4.2, § 4.4, § 4.5, § 5 B-6t, § 11 Cap-2 / Cap-10 (MET-R-001: § 5 B-3 row 12, § 12 AD-16), § 12 AD-4 / AD-4b / AD-5 / AD-6 / AD-8 / AD-14 / AD-15 / AD-16 / OAD-2, § 14 R-D4 / R-D5
+Issue #1602 · PRD REQ-RDG-C-001 / REQ-ARM-B-001 … REQ-ARM-B-012 / REQ-ARM-C-001 / REQ-ARM-Q-001 (§ 10.3; D3, D4, D7, D10 in § 8; § 11.1) · design § 5 B-3, § 4.2, § 4.4, § 4.5, § 5 B-6t, § 11 Cap-2 / Cap-10, § 12 AD-4 / AD-4b / AD-5 / AD-6 / AD-8 / AD-14 / AD-15 / AD-16 / OAD-2, § 14 R-D4 / R-D5
 
 Example Mapping: 🟦 5 rules · 🟩 30 examples · 🟥 0 open
 
@@ -40,19 +40,14 @@ Example Mapping: 🟦 5 rules · 🟩 30 examples · 🟥 0 open
 > #1591's four oracles and none of #1592's eight tests reads a decision arm — they grade `parse_usage`
 > and `dimension` — so Tier A here rests on the tests #1602 § 6 names verbatim *and* § 7 records a
 > mutant against — M-a to M-z and M-aa to M-ae, every named test — and on the committed wire-golden pin
-> whose bytes AC-19 and AC-20 forbid moving. No named
-> test carries a RED record (nothing over an `Option` field compiles before #1597's lift), so each
-> one's record is its mutant run: where the fabrication is unobservable at a skip or pass arm (§ 7),
-> the mutant is the *opposite* error — an absent window excluding or swapping the account — or the
-> **BUT NOT** the test guards (M-x, M-z). Test 8 carries its own mutant, M-aa: the substitution that
+> whose bytes AC-19 and AC-20 forbid moving. No named test compiles against the pull request's base — each uses a field or signature that #1597's lift or this item adds or alters: an `Option` window, an `Option` parameter, or test 26's census field — so none can carry a RED record, and each takes the mutant form #1590 § Binding on every child sets for such a test: its compile error against the tree before, and its failing run, by exact name, under the § 7 mutant on the pull-request head. At each site that reads a window the fabricating default runs first, and its failing run is the record; where the fabrication is unobservable at a skip or pass arm (§ 7), the fabricating default's green run is recorded as well, and the mutant is the *opposite* error — an absent window excluding or swapping the account — or the **BUT NOT** the test guards (M-x, M-z); § 8's enumeration, AC-16's grep and the review of every `Some(` wrapper grade the fabrication there. Test 8 carries its own mutant, M-aa: the substitution that
 > grades
 > test 7 finds no session reset on a weekly-only reading, so by § 7's skip-arm rule test 8 takes
 > the opposite error of its own arm. The scenarios a named
 > check or the merge judge grades with no test stay Tier B. D3, D4, D7, D10 and
-> D14 are the operator's open decisions; every scenario one reaches is written for the recorded
-> default and says so in its name. Every rule, tier and name here is ratification-pending.
+> D14 were settled by council on 2026-11-03 at the maintainer's delegation (D3, D4, D7 and D14 recorded on #1602, D10 on #1597); every scenario one reaches is written for the ruling — D3 default ratified, row amended with its cost and reopen evidence; D4 not applicable, ratified; D7 amended (pass move, typed key `observed_climb`, EMA reset; REQ-RDG-C-001 not narrowed); D10 transitional `1.14` state stands, amended, signpost dated 14 days from #1604's deploy record; D14 stands, AD-14 and the `BlindGateEligible` sentence amended — and every scenario title that names one of them says it is settled by council. Every rule, tier and name here is ratification-pending.
 
-## Rule 1 — a spare, a `use` target and the wire verdict are judged on the windows the account has: the weekly axis alone for a weekly-only account, the session axis alone for a weekly-less one (AD-4b), and one ranking axis for a mixed fleet (D7 default)
+## Rule 1 — a spare, a `use` target and the wire verdict are judged on the windows the account has: the weekly axis alone for a weekly-only account, the session axis alone for a weekly-less one (AD-4b), and one ranking axis for a mixed fleet (D7, settled by council)
 
 ```gherkin
 Scenario Outline: a spare's viability is decided by the windows it has
@@ -93,30 +88,35 @@ Scenario Outline: a spare's viability is decided by the windows it has
     # the weekly line becomes `usage.weekly.is_none_or(|w| w < weekly_ceiling)` (`:247`); `filter_map`
     # at `:246` drops only a failed poll; the `min_by` at `:256-265` is unchanged. REQ-ARM-B-001 BUT
     # NOT admitted because its session read as `0.0`; REQ-ARM-B-002 BUT NOT a second weekly line.
-    # AD-4b is author-chosen by symmetry: no weekly-less account exists to measure against.
+    # AD-4b is settled by council (2026-11-03) on the premise that a weekly `None` is a window the account does not have, never a window the reply carries in a shape the parser cannot read (#1614, Answer 2); no weekly-less account exists to measure against.
     # Test 2 asserts the weekly-only half with no other viable spare in the fleet, so the exclusion
     # reads as `None`: beside a viable peer the admitted spare can lose the ranking and M-x stays
     # invisible. Test 3 asserts its viable half with the weekly-less spare as the fleet's only spare:
     # it carries no weekly reset, so beside a viable peer with a known reset it loses the ranking
     # under the correct code and the mutant alike (§ 7).
 
-Scenario: a weekly-only spare and a two-window spare rank on one weekly-reset axis, and an absent EMA reads as the safest landing on a tie (D7 default)
+Scenario: a weekly-only spare and a two-window spare rank on one weekly-reset axis, and a spare with no session window passes the velocity axis as "no observed climb" on a tie
   # Tier A — graded by
   # `pick_target_ranks_a_weekly_only_spare_and_a_two_window_spare_on_the_same_weekly_reset_axis` (#1602
-  # § 6 test 24, `src/daemon/selection.rs`; mutant-proven by § 7 M-t: `velocity_rate` reading an absent
-  # EMA as `f64::INFINITY` in `src/daemon/selection.rs` makes its tie arm FAIL, the test ranking with a
-  # `Some` seed); under D7's alternative the tie expectation moves with the ratified rule · covers AC-11
-  Given two viable spares: a weekly-only one with no retained session-velocity EMA and a two-window
-        one with a sustained, climbing EMA
-    And the selection carries a per-daemon seed, so the #612 tie-break axes are live
+  # § 6 test 24, `src/daemon/selection.rs`; mutant-proven by § 7 M-t: the tie-break reading the weekly-only
+  # spare's EMA slot instead of its reading (HEAD's `velocity_rate`) makes arm (B) FAIL, the test ranking
+  # with a `Some` seed) · covers AC-11
+  Given two viable spares: a weekly-only one and a two-window one
+    And the selection carries a per-daemon seed, so the #612 tie-break axes are live (arm (E) runs with `seed: None`)
    When their weekly resets differ
-   Then the spare with the sooner weekly reset wins, whichever kind it is
-   When their weekly resets tie exactly
-   Then the weekly-only spare is preferred — its absent EMA reads `0.0`, "the safest
-        (lowest-velocity) landing", the rule `velocity_rate` already applies to any untrusted signal
+   Then the spare with the sooner weekly reset wins, whichever kind it is (arm (D))
+   When their weekly resets tie exactly and the two-window spare carries a sustained, climbing EMA
+   Then the spare with no session window passes the velocity axis as "no observed climb": the weekly-only spare wins, for every seed (arm (A)),
+        and still wins when its own slot keeps a sustained EMA steeper than its peer's from an earlier
+        window, because the key is read from the reading and never from the slot (arm (B))
+   When their weekly resets tie exactly and the two-window spare has no sustained EMA, or a sustained zero rate
+   Then the two share the no-observed-climb class and the jitter key orders them — each wins for at least
+        one seed (arm (C)); with `seed: None` the roster index decides (arm (E))
     # REQ-ARM-B-012: a mixed fleet competes on one axis; the session filters apply only to accounts
-    # whose session window applies. D7 is the pipeline default, ratification-pending, watched by
-    # MET-R-001. BUT NOT a weekly-only spare preferred or penalised by a rule nobody ratified.
+    # whose session window applies. D7, settled by council on 2026-11-03; MET-R-001 does not observe it.
+    # BUT NOT a weekly-only spare preferred or penalised by a rule nobody ratified: the typed key
+    # (`observed_climb`) returns `None` for a spare with no session window, for no sustained EMA and for
+    # a zero rate, and `Some(rate)` otherwise; `None` ranks ahead of every `Some`.
 
 Scenario Outline: `use` serves the weekly verdict from a served reading, never an abort
   # Tier A — graded by `poll_viability_reads_a_weekly_less_reading_as_viable` (#1602 § 6 test 20,
@@ -313,7 +313,7 @@ Scenario: the fleet is not out of capacity while a weekly-only spare has headroo
     # the lift, reported out of capacity because their readings failed to parse. BUT NOT
     # `AwaitingData` while served readings exist.
 
-Scenario: the near-limit fast poll reads false for a weekly-only active, stated and pinned (D4 default)
+Scenario: the near-limit fast poll reads false for a weekly-only active, stated and pinned (D4, settled by council)
   # Tier A — graded by `active_near_limit_reads_false_for_a_weekly_only_active` (#1602 § 6 test 16,
   # `src/daemon.rs`; mutant-proven by § 7 M-o: the floor comparison read as
   # `active_usage.session.unwrap_or(1.0) >= floor` at `src/daemon.rs:5802` makes it FAIL — the band
@@ -375,7 +375,7 @@ Scenario: the high-water fold yields no mark without a session and seeds a fresh
     # window that reappears is a fresh window with every session gate applying again.
 ```
 
-## Rule 3 — the blind gate's surfacing half: every pure predicate reads false on an absent anchor session, no `blind_active` block is fabricated under the transitional `1.14` wire (D10 default), and the server-directed arm is unchanged (D3 default) but retains no `status` notice off a session-less anchor under that wire (D10's analogue)
+## Rule 3 — the blind gate's surfacing half: every pure predicate reads false on an absent anchor session, no `blind_active` block is fabricated under the transitional `1.14` wire (D10, settled by council), and the server-directed arm is unchanged (D3, settled by council) but retains no `status` notice off a session-less anchor under that wire (D10's analogue)
 
 ```gherkin
 Scenario: the pure gate predicates and the anchor correction read false, and `None`, on an absent anchor session
@@ -401,11 +401,11 @@ Scenario: the pure gate predicates and the anchor correction read false, and `No
     # against the config thresholds `session_blind_risk_band` and `session_blind_swap_secs` in its
     # own expression, and reads false on a `None` anchor by the same move. ADR-0017's "Never fires
     # on a `None`/missing reading"
-    # (`docs/adr/0017-bounded-blindness-preemptive-swap-not-header-observation.md:189`)
+    # (`docs/adr/0017-bounded-blindness-preemptive-swap-not-header-observation.md:257`)
     # is extended by #1593 to an anchor whose session window does not apply. The arming half —
     # whether a weekly anchor arms a preemptive swap — is OAD-2 (D3), outside this item.
 
-Scenario: a weekly-only active blind past the gate fires no blind swap and no eligibility event (D3 default)
+Scenario: a weekly-only active blind past the gate fires no blind swap and no eligibility event (D3, settled by council)
   # Tier A — graded by
   # `a_weekly_only_blind_active_past_the_gate_fires_no_blind_swap_and_no_eligibility_event` (#1602 § 6
   # test 13, `src/daemon.rs`; mutant-proven by § 7 M-n: `blind_swap`'s anchor arm read as
@@ -420,16 +420,15 @@ Scenario: a weekly-only active blind past the gate fires no blind swap and no el
     And because that event is only ever emitted past `blind_gate_armed`, its `session_pct` stays
         `u8` — an `Option` that is always `Some` would misdescribe the seam
     # REQ-ARM-B-007 BUT NOT a swap fired on an absent anchor; AC-6 BUT NOT a weekly arming rule
-    # (OAD-2). The `u8` is a ratification-pending deviation from design B-3 row 15, which lists
-    # `src/observability.rs` among the fields that move; under the uniform-`Option` alternative
+    # (OAD-2). The `u8` is as design B-3 row 15 and AD-14 record (D14, settled by council on 2026-11-03); under the uniform-`Option` alternative
     # the emitter writes `Some(to_pct(s))` from the bound `Some` and no assertion here changes.
 
-Scenario: no `blind_active` block is emitted for a weekly-only blind active until the wire can say "none" (D10 default)
+Scenario: no `blind_active` block is emitted for a weekly-only blind active until the wire can say "none" (D10, settled by council)
   # Tier A — graded by
   # `blind_active_view_emits_no_block_for_a_weekly_only_blind_active_until_the_wire_can_say_so` (#1602 §
   # 6 test 15, `src/daemon/records.rs`; mutant-proven by § 7 M-c: emitting the block with
   # `last_known_session_pct: to_pct(anchor.session.unwrap_or(0.0))` at `src/daemon/records.rs:515` makes
-  # it FAIL under the D10 default) · covers AC-6
+  # it FAIL under the D10 ruling) · covers AC-6
   Given an anchor whose session window is absent, the active blind past `BLIND_GATE_SECS`, not
         quarantined
    When `blind_active_view` projects the status block under `STATUS_SCHEMA_VERSION` `1.14`
@@ -438,9 +437,14 @@ Scenario: no `blind_active` block is emitted for a weekly-only blind active unti
     And `status` therefore makes no auto-protection claim on the strength of the session gate
     # The cost, stated (design B-6t row 5): until B-6 lands, such an account reads as a failed-poll
     # row on the CLI and the panel, its blind duration and percent are not shown, and the
-    # `Retry-After` and velocity report arms are silent for it — no regression against the bundle
-    # that ran before tranche 0, which could not read such an account at all (the #1613 build reads
-    # it, as an idle session). Under D10's alternative (B-6 in the same pull
+    # `Retry-After` report arm is silent for it (the D11 ruling's correction of AD-8: the velocity arm cannot fire on a session-less anchor either way) — measured against the tranche-0
+    # bundle that serves today (the #1613 build, which reads such an account as an idle session),
+    # which emits the block for such an anchor with `last_known_session_pct: 0` and, blind past `BLIND_GATE_SECS` with
+    # no `Retry-After` hold, `auto_protection_degraded: false` (the anchor arm reads `0.0 >= 0.60` as false), so `status` prints a false
+    # "auto-protection OK"; the omitted block loses the blind duration, the verdict and the CORNERED alarm (`cornered_state` composes `blind_active` with `no_viable_target`), and removes both
+    # fabrications. Whether the bundle before tranche 0 ever emitted a block for such an account is
+    # unestablished, and the cost landing on the operator's active account is the whole exposure,
+    # not a bound on it. Under D10's alternative (B-6 in the same pull
     # request) the block is emitted with `last_known_session_pct: None`, and `auto_protection_degraded`
     # is computed from four arms: the session gate false, the `Retry-After` arm unchanged, the velocity
     # arm false, and #1599's fourth, status-only arm — `blind_secs > BLIND_GATE_SECS &&
@@ -471,7 +475,7 @@ Scenario: the server-directed arm still swaps a weekly-only active away, and its
     # arm itself read false (the first scenario of this rule). PR #1538's velocity arm on this seam
     # composes with it through `plausible_anchor_session`; whichever lands second rebases.
 
-Scenario: a `Retry-After` swap off a session-less anchor retains no `status` notice under `1.14` (D10's analogue)
+Scenario: a `Retry-After` swap off a session-less anchor retains no `status` notice under `1.14` (D10's analogue, settled by council with D10)
   # Tier A — graded by `a_retry_after_blind_preempt_from_a_weekly_only_anchor_retains_no_status_notice`
   # (#1602 § 6 test 30, `src/daemon.rs`; mutant-proven by § 7 M-ae: the record built whatever the anchor
   # carries, with
@@ -499,7 +503,7 @@ Scenario: a `Retry-After` swap off a session-less anchor retains no `status` not
     # BUT NOT a notice whose percent is fabricated.
 ```
 
-## Rule 4 — every per-window event field is a typed absence rendered as an omitted token; `reliability` decodes the omission; a served weekly-only reply is a live poll and the velocity fold skips the axis it lacks (D14 default)
+## Rule 4 — every per-window event field is a typed absence rendered as an omitted token; `reliability` decodes the omission; a served weekly-only reply is a live poll and the velocity fold skips the axis it lacks (D14, settled by council)
 
 ```gherkin
 Scenario: a weekly-only active entering blindness logs `near_limit=false` and no session percent
@@ -538,7 +542,7 @@ Scenario: a served weekly-only reading ends a blind episode, and the exit line c
     # `blind_exit` (`src/observability.rs:3193`), `blind_window` (`:3149`), `blind_enter` (`:3165`).
     # Every other token on those lines is unchanged.
 
-Scenario: the velocity event skips an absent axis and the session EMA is untouched
+Scenario: the velocity event skips an absent axis and the session EMA is reset to `None`
   # Tier A — graded by `usage_velocity_skips_an_absent_axis` (#1602 § 6 test 23,
   # `src/daemon/classify.rs`; mutant-proven by § 7 M-d: computing the session delta from
   # `unwrap_or(0.0)` on each side at `src/daemon/classify.rs:121-125` makes it FAIL) · covers AC-11,
@@ -551,14 +555,19 @@ Scenario: the velocity event skips an absent axis and the session EMA is untouch
         carries `weekly_pct_per_min=` and `weekly_delta_pct=`, and neither `session_pct_per_min=` nor
         `session_delta_pct=` — `reliability` reads only the second (`src/reliability.rs:1722`)
     And the retained session-velocity EMA is not folded — `note_session_velocity` runs only when both
-        endpoints carry a session, and the retained EMA is untouched
+        endpoints carry a session — and the slot reads `None`: the fold resets it on every served reading
+        with no session window, outside the `if let` so the first served reading after a failed poll
+        resets too (D7, settled by council on 2026-11-03)
+    # The reset itself, directly and across a failed poll, is graded by #1602 § 6 test 31,
+    # `a_served_reading_without_a_session_window_resets_the_session_velocity_ema`, which § 7 M-ah (the
+    # fold keeps the slot on a served reading with no session) makes FAIL.
     # The `usage_velocity` call and the `UsageVelocity` push at `src/daemon.rs:2990-3001`; the
-    # stale-low gate (`is_stale_low`) and the `note_session_velocity` fold at `:2835-2840`;
+    # stale-low gate (`is_stale_low`) and the `note_session_velocity` fold at `:2920-2930` on `main` (2835-2840 at fd8640b);
     # `UsageVelocity`'s deltas
     # (`src/observability.rs:2039`) become `Option<i16>`. REQ-ARM-B-011: a window that disappears
     # stops acting as a current reading. AD-16.
 
-Scenario: a `blind_window` line without a session axis is censused as "no session window", never `malformed` (D14 default)
+Scenario: a `blind_window` line without a session axis is censused as "no session window", never `malformed` (D14, settled by council)
   # Tier A — graded by
   # `a_blind_window_line_without_a_session_axis_is_censused_as_no_session_window_not_malformed` (#1602 §
   # 6 test 26, `src/reliability.rs`; mutant-proven by § 7 M-v: `record_blind_projection`'s `fd8640b`
@@ -591,8 +600,8 @@ Scenario: a `blind_window` line without a session axis is censused as "no sessio
     # (the bump rule on `JSON_SCHEMA_VERSION` in `src/log.rs:159-166`); `RELIABILITY_USAGE`
     # (`src/cli.rs:1260`) advertises `schema:14`, and the three
     # `build/fixtures/cli-renders/reliability-*.txt`
-    # goldens regenerate with the `CLI-Goldens-Rebaselined:` trailer. Decided by the scoping party,
-    # ratification-pending; the no-bucket arm is rejected because it breaks the #484 partition.
+    # goldens regenerate with the `CLI-Goldens-Rebaselined:` trailer. Settled by council on 2026-11-03
+    # (D14; the record is a comment on #1602): the bucket ratified, the no-bucket arm rejected because it breaks the #484 partition.
     # REQ-RDG-C-001 BUT NOT an event-field change that moves `reliability`'s `JSON_SCHEMA_VERSION`
     # without saying so; BUT NOT `n_malformed` changed by a well-formed no-session line. The
     # blind-window SLIs gated on `near_limit=true` (`:1513`) exclude a weekly-only account's windows
@@ -632,7 +641,7 @@ Scenario Outline: each fabrication on a name surface is caught by its recorded m
     | id  | site                           | mutant                                                                          | test                                                                                           |
     | M-a | `src/daemon.rs:4597`           | `session_pct: Some(to_pct(active_usage.session.unwrap_or(0.0)))`                 | test 5 `a_weekly_only_active_swaps_with_reason_weekly_and_arms_no_parked_landing`               |
     | M-b | `src/daemon.rs:3591`           | `session_pct: Some(to_pct(prev.session.unwrap_or(0.0)))`                         | test 14 `a_weekly_only_active_entering_blindness_logs_near_limit_false_and_no_session_percent` |
-    | M-c | `src/daemon/records.rs:515`    | the block emitted with `last_known_session_pct: to_pct(anchor.session.unwrap_or(0.0))` | test 15 `blind_active_view_emits_no_block_for_a_weekly_only_blind_active_until_the_wire_can_say_so` (D10 default) |
+    | M-c | `src/daemon/records.rs:521-535` on `main` (`last_known_session_pct`, `to_pct`; 515 at fd8640b) | the block emitted with `last_known_session_pct: to_pct(anchor.session.unwrap_or(0.0))` | test 15 `blind_active_view_emits_no_block_for_a_weekly_only_blind_active_until_the_wire_can_say_so` (D10, settled by council) |
     | M-d | `src/daemon/classify.rs:121-125` | the session delta computed from `unwrap_or(0.0)` on each side                  | test 23 `usage_velocity_skips_an_absent_axis`                                                   |
     | M-e | `src/daemon.rs:5229`           | `to_pct(anchor.session.unwrap_or(0.0))`                                          | test 27 `the_swap_line_omits_session_pct_for_a_blind_preempt_from_a_weekly_only_anchor`         |
     | M-ae | `src/daemon.rs:5248-5253`     | the record built whatever the anchor carries, with `last_known_session_pct: last_known_session_pct.unwrap_or(0)` | test 30 `a_retry_after_blind_preempt_from_a_weekly_only_anchor_retains_no_status_notice` |
@@ -644,13 +653,14 @@ Scenario Outline: each fabrication on a name surface is caught by its recorded m
 
 Scenario: the twelve production files carry no numeric default over a window fraction
   # Tier B — pending: a named mechanical check, not a test — over the twelve production files AC-19
-  # names, the AC-16 float grep prints exactly the twelve lines it prints at fd8640b, compared by
+  # names, the AC-16 float grep prints exactly eleven lines — the twelve it prints at fd8640b minus the
+  # `src/daemon/selection.rs` `map_or(0.0, |v| v.rate)` line, which D7's typed key deletes — compared by
   # content and count and never by line number because this item's own edits shift the numbers (at
   # fd8640b): ten
   # `unwrap_or_default()` lines over text, collection or config values (`src/daemon/commands.rs:5595`, `src/daemon/snapshot_build.rs:83`, `src/use_account.rs:1638`, `:4955`, `:6903`, `:7101`, `:7274`, `:7678`, `src/cli.rs:5132`,
-  # `:5744`) and two
-  # `map_or(0.0, |v| v.rate)` lines over the velocity EMA rate (`src/daemon.rs:4389` and `src/daemon/selection.rs:148`,
-  # row 12's D7 default), none over a window fraction, and nothing else; AC-16's integer grep
+  # `:5744`) and one
+  # `map_or(0.0, |v| v.rate)` line over the active account's reactive lookahead (`src/daemon.rs:4335` on `main`, the last line of `decide_action`'s `velocity` binding, line 4204 at fd8640b, which stays;
+  # D7, settled by council on 2026-11-03, deletes the tie-break's, `src/daemon/selection.rs` line 148 at fd8640b), none over a window fraction, and nothing else; AC-16's integer grep
   # (`unwrap_or\(0\)|map_or\(0,|unwrap_or\(100\)|map_or\(100,`) prints exactly its 17 lines at fd8640b
   # (six wall-clock fallbacks, five column widths, a hash seed, two bearer counts, two comments, and
   # `src/cli.rs:4114`'s `weekly_pct.unwrap_or(100)`, unreachable behind `weekly_exhausted`; 7 of them
@@ -661,7 +671,7 @@ Scenario: the twelve production files carry no numeric default over a window fra
   Given the pull-request head
    When `git grep -nE 'unwrap_or\(0\.0\)|unwrap_or\(1\.0\)|unwrap_or_default\(\)|or\(Some\(0\.0\)\)|map_or\(0\.0|map_or\(1\.0'`
         runs over the twelve production files this item touches
-   Then it prints the same twelve lines as at fd8640b — ten `unwrap_or_default()` and two
+   Then it prints eleven lines — the twelve at fd8640b minus the deleted `src/daemon/selection.rs` tie-break line: ten `unwrap_or_default()` and one
         `map_or(0.0, |v| v.rate)` — compared by content and count, never by line number, and
         nothing else
     And `git grep -nE 'unwrap_or\(0\)|map_or\(0,|unwrap_or\(100\)|map_or\(100,'` over the same files
@@ -755,7 +765,7 @@ Scenario: the compiler's enumeration is reconciled for this item's share, and th
     # is not a row of Specification § 1 is a copy-through #1597 missed — then the order is wrong,
     # not the site.
 
-Scenario: the five committed wire goldens reproduce byte-identical under `1.14` (D10 default)
+Scenario: the five committed wire goldens reproduce byte-identical under `1.14` (D10, settled by council)
   # Tier A — graded by
   # `the_committed_wire_goldens_still_match_the_daemon_encoders` (`src/daemon/snapshot_build.rs:3929`,
   # committed at fd8640b, named verbatim in AC-20; the goldens it reads under `build/fixtures/` stay
@@ -794,7 +804,7 @@ is named as such, with what grades it instead.
 | AC-8 — the high-water fold and nothing durable (row 9; REQ-ARM-B-004, B-011) | Rule 2 "the high-water fold yields no mark without a session and seeds a fresh one…" | test 18 against M-q (Tier A); the committed `session_high_water_needs_a_window_stamp` staying green; the `'^\+.*(weekly_only\|session_absent\|no_session)'` grep over added lines, judged against the `#[cfg(test)]` modules |
 | AC-9 — the `use` verb (row 10; REQ-ARM-B-009, AD-4b) | Rule 1 "`use` serves the weekly verdict from a served reading…" (three rows); Rule 1 "the daemon-routed `use` gate reads the cached weekly-only reading's weekly axis" | tests 19, 20, 21 against M-z, M-r, M-w (Tier A) |
 | AC-10 — liveness and the exit edge (row 11; REQ-ARM-B-010) | Rule 4 "a served weekly-only reading ends a blind episode…"; Rule 5 "the three unchanged arms are unchanged" | test 22 against M-s (Tier A); the `classify.rs` diff check |
-| AC-11 — the velocity EMA and the tie-break (row 12; REQ-ARM-B-012; D7) | Rule 4 "the velocity event skips an absent axis…"; Rule 1 "a weekly-only spare and a two-window spare rank on one weekly-reset axis…"; Rule 2 "the stale-low correction never fabricates a session…" (`is_stale_low`) | tests 23, 24, 17 against M-d, M-t, M-p (Tier A) |
+| AC-11 — the velocity EMA and the tie-break (row 12; REQ-ARM-B-012; D7, settled by council) | Rule 4 "the velocity event skips an absent axis…" (the slot reads `None`); Rule 1 "a weekly-only spare and a two-window spare rank on one weekly-reset axis…" (arms (A)–(E), passing the velocity axis as "no observed climb"); Rule 2 "the stale-low correction never fabricates a session…" (`is_stale_low`) | test 23 against M-d; test 24 against M-t (arm (B)), M-af ("after" rival, arm (A)) and M-ag ("before" rival, arm (C)); test 31, `a_served_reading_without_a_session_window_resets_the_session_velocity_ema`, against M-ah (kept slot); test 17 against M-p (Tier A) |
 | AC-12 — the weekly-exhausted wire verdict (row 13; AD-4b) | Rule 1 "the status wire's weekly-exhausted verdict comes from the weekly window alone" (three rows) | test 25 against M-u (Tier A) |
 | AC-13 — keep-warm and rate neutrality (row 14; REQ-ARM-C-001, Q-001) | Rule 5 "the three unchanged arms are unchanged, and the poll cadence with them" | the `keep_warm.rs` diff check; the committed stagger-lock tests; the pull request body |
 | AC-14 — event fields are typed absences with omitted tokens (row 15; REQ-RDG-C-001; D14) | Rule 2 "a weekly-only active at weekly 0.99 swaps…"; Rule 3 "the server-directed arm still swaps…"; Rule 4, all five | tests 5, 14, 22, 23, 26, 27 against M-a, M-b, M-s, M-d, M-v, M-e (Tier A); the sentinel's committed tests (executor-adapted) |

@@ -34,13 +34,9 @@ Example Mapping: 🟦 5 rules · 🟩 19 examples · 🟥 0 open
 > rests on this item's own tests M1–M7 and on the committed wire test
 > `status_response_carries_handles_and_percentages_and_never_a_secret`, each named verbatim in #1597
 > § 6 or AC-7 together with the mutant AC-7 record against it, and on the committed wire-golden pin
-> whose bytes AC-5 forbids moving. None of them carries a RED record — M1 and M3–M7 do not compile
-> before the lift, M2 is green at fd8640b already (the three types are `Copy` today), and so is the
-> committed wire test — so the recorded mutant row (AC-7 (i)–(viii)) is each one's grader, M2's a
-> compile-failure row (the mutant removes `Copy`; the run ends in the compiler's error, not in
-> `FAILED`). Tier B
-> names what is still unbound. D10 is the operator's open decision; every scenario it reaches is
-> written for the recorded default (ship the transitional `1.14` state) and says so in its name.
+> whose bytes AC-5 forbids moving. Under umbrella #1590's RED rule M1 and M3–M7 are type-gated — they do not compile against the pull request's base — so each carries the base build's compiler error inside it or a test helper it calls and its AC-7 mutant run on the pull-request head. M2 and the committed wire test pass on the base (the three types are `Copy` there; the wire test's failed-poll arm is unchanged, and AC-8 only wraps its present reading in `Some`), so they pin contracts the lift keeps and carry their AC-7 mutant rows only, M2's a compile-failure row (the mutant removes `Copy`; the run ends in the compiler's error, not in `FAILED`). Tier B
+> names what is still unbound. D10 was settled by council on 2026-11-03 (recorded on #1597); every scenario it reaches is
+> written for the ruling (ship the transitional `1.14` state, amended) and says so in its name.
 > Every rule, tier and name here is ratification-pending.
 
 ## Rule 1 — a window the reply did not carry is `None` on the reading: "does not apply", distinct by type from a measured `0 %` and from no reading at all
@@ -170,10 +166,10 @@ Scenario: a weekly-only account's live-to-blind entry anchors its reading with t
     # (`src/daemon.rs`), decides something and so belongs to B-3 row 7, in the same pull request.
 ```
 
-## Rule 3 — the status/watch wire projects an absent window to `null` beside the window that is present, under an unchanged schema minor (`1.14` at fd8640b), with no golden moved (D10 default)
+## Rule 3 — the status/watch wire projects an absent window to `null` beside the window that is present, under an unchanged schema minor (`1.14` at fd8640b), with no golden moved (D10, settled by council)
 
 ```gherkin
-Scenario: a served weekly-only reading rides the wire as session null beside weekly 90 (D10 default)
+Scenario: a served weekly-only reading rides the wire as session null beside weekly 90 (D10, settled by council)
   # Tier A — graded by
   # daemon::snapshot_build::tests::status_response_maps_an_absent_session_window_to_null_beside_a_present_weekly
   # (M5, #1597 § 6; mutant-proven by AC-7 (ii):
@@ -188,7 +184,7 @@ Scenario: a served weekly-only reading rides the wire as session null beside wee
     # (`src/daemon/snapshot.rs:999-1000`); `to_pct` stays `f64 -> u8` (`src/daemon/snapshot.rs:1075`).
     # The no-window key is the status-wire item's (block B-6), at the next free minor, never here.
 
-Scenario: a served session-only reading rides the wire as weekly null beside session 42 (D10 default)
+Scenario: a served session-only reading rides the wire as weekly null beside session 42 (D10, settled by council)
   # Tier A — graded by
   # daemon::snapshot_build::tests::status_response_maps_an_absent_weekly_window_to_null_beside_a_present_session
   # (M7, #1597 § 6; mutant-proven by AC-7 (viii):
@@ -220,7 +216,7 @@ Scenario: a failed poll still rides as null on both percents — the steady-stat
     # differ on `weekly_pct`, present only for the served reading. The steady-state contract — `null`
     # means the last poll failed — is what B-6's key restores. AC-4 BUT NOT: a redefinition of `null`.
 
-Scenario: the five committed wire goldens reproduce byte-identical with no regeneration (D10 default)
+Scenario: the five committed wire goldens reproduce byte-identical with no regeneration (D10, settled by council)
   # Tier A — graded by
   # daemon::snapshot_build::tests::the_committed_wire_goldens_still_match_the_daemon_encoders (`src/daemon/snapshot_build.rs:3929`,
   # committed at fd8640b, named verbatim in AC-4 and AC-5; the goldens it reads under `build/fixtures/`
@@ -244,19 +240,19 @@ Scenario: the five committed wire goldens reproduce byte-identical with no regen
     # (B-6 in tranche 1) the minor moves and the goldens with it — this scenario then does not hold on
     # the pull-request head, which is why it is tagged.
 
-Scenario: the session_pct doc comment names the transitional meaning and the item that reverts it (D10 default)
+Scenario: the session_pct doc comment names the transitional meaning and the item that reverts it (D10, settled by council)
   # Tier B — pending: documentation —
   # `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` decides that it builds,
   # the merge judge the wording; under D10's alternative the sentence is not written and B-6's key lands
   # in the same pull request · covers AC-4
   Given the doc comment at `src/daemon/snapshot.rs:758-763`: "Last-polled session-window usage
         percent (`0..=100`); `null` if the last poll for this account failed (never a fabricated `0`)."
-   When this item lands under D10's default
+   When this item lands under D10, settled by council
    Then the comment gains, after "(never a fabricated `0`)", one sentence: "Transitionally, until the
         status-wire item #1599 lands its no-window key, also `null` when the served reading
-        carried no session window; that item reverts this sentence."
+        carried no session window — then beside a non-null `weekly_pct`, because a failed poll nulls both percents; that item reverts this sentence."
     And the steady-state contract is not redefined
-    # Cost of the default, stated: for those days a healthy weekly-only account's session cell reads
+    # Cost of D10's transitional state, stated: for those days a healthy weekly-only account's session cell reads
     # `n/a` on the CLI and in the 1.14 app exactly like a failed poll, while its weekly figures return.
 ```
 

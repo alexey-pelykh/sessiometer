@@ -34,7 +34,7 @@ Example Mapping: 🟦 6 rules · 🟩 34 examples · 🟥 0 open
 > or the mutant record one of its acceptance criteria owes. None of #1591's four oracles and none of
 > #1592's eight tests reaches the store, so no scenario
 > here binds to them. Every "RED at `fd8640b`" below is read off the store's source at that revision,
-> never off a run: the runs are AC-13's to carry in the pull request body. Tier B names what is still
+> never off a run: the runs are AC-13's to carry in the pull request body. A named test that does not compile against the pull request's base, because it uses a type, field, property, function or signature this item adds or alters in production code, is type-gated under umbrella #1590's RED rule, and carries the base build's compiler error inside it or a test helper it calls and its named mutant run on the pull-request head. Tier B names what is still
 > unbound and the item that should bind it.
 >
 > D6 (`null` on the versionless sample line) and D13 (the per-axis `Option` tier representation) were
@@ -49,8 +49,8 @@ Example Mapping: 🟦 6 rules · 🟩 34 examples · 🟥 0 open
 > and its count-posture sweep (AC-27) under Rule 5 and its pins in Rule 6's T17; and `CLAUDE.md`'s
 > naming of the store's generation sits under Rule 5. Every scenario holds under both rulings, and a
 > scenario added or amended under a ruling carries that ruling in its name. D12
-> (`Sample.weekly` optional), the omitted-key reader (design AD-10 against PRD § 11.4) and the
-> serialization refusal of a non-finite `Some` are open, each built for its recorded default with the
+> (`Sample.weekly` optional) and the omitted-key reader (design AD-10 against PRD § 11.4) were settled by council at the maintainer's delegation (both on #1598: D12 on 2026-11-03; AD-10 with D6 on 2026-11-02 and D12 on 2026-11-03), and the
+> serialization refusal of a non-finite `Some` (design AD-12) is open, built for its recorded default with the
 > alternative stated in #1598; a scenario that depends on one says so in its name. Every rule, tier
 > and name here is ratification-pending.
 
@@ -96,8 +96,8 @@ Scenario: a successful poll of a weekly-only account appends one line carrying "
         (`let Ok(reading) = polled else { return }`, `src/daemon.rs:724-726`), and a failed poll still
         writes nothing
     # The `Option` copies through from `reading.usage.session` at `src/daemon.rs:742-743` once
-    # `Sample::new` takes `Option<f64>`; a served reading carries at least one window under D1's
-    # default (a), so a line with both axes `null` never arises there.
+    # `Sample::new` takes `Option<f64>`; a served reading carries at least one window under D1
+    # (a), settled by council, so a line with both axes `null` never arises there.
 
 Scenario: the #1613 sample skip is gone — a reading with no session window writes one line, not a gap
   # Tier A — graded by
@@ -168,7 +168,7 @@ Scenario: a weekly-only line decodes with its session reading absent
     # or `decoded.session.into()` at the call site: after the lift each is an identity conversion,
     # which fails `clippy::useless_conversion` under `-D warnings`.
 
-Scenario: a session-only line decodes with its weekly reading absent (D12 default)
+Scenario: a session-only line decodes with its weekly reading absent (D12, settled by council)
   # Tier A — graded by usage_store::tests::a_session_only_line_decodes_with_its_weekly_reading_absent
   # (#1598 T2; RED at fd8640b, the same refusal on the weekly axis) · covers AC-2
   Given the raw line `{"ts":0,"provider":"claude","acct":"work","session":0.42,"weekly":null}`
@@ -176,13 +176,13 @@ Scenario: a session-only line decodes with its weekly reading absent (D12 defaul
    Then the decode is `Ok`
     And the session reading is `Some(0.42)` and the weekly reading is `None`
     But NOT `Some(0.0)` for the weekly axis
-    # D12 (design AD-10, author-chosen): the weekly axis takes the same shape because a weekly-less
+    # D12 (design AD-10, settled by council on 2026-11-03 as a faithful application of D6): the weekly axis takes the same shape because a weekly-less
     # served reading — #1596's session-only case, Oracle D — leaves the writer the same three choices
     # on that axis. A ruling against D12 makes the session-only line unrepresentable: this scenario
     # and T2 are dropped, T5's weekly-null row goes with them, and the weekly axis of the fold, the
     # same-key merge and the readers loses its `None` arm; the session axis is untouched.
 
-Scenario: a line omitting the session key reads as no session reading (AD-10 default)
+Scenario: a line omitting the session key reads as no session reading (AD-10, settled by council with D6 and D12)
   # Tier A — graded by usage_store::tests::a_line_omitting_the_session_key_reads_as_no_session_reading
   # (#1598 T4, written form; RED at fd8640b: a `missing field` error, the field has no default) · covers
   # AC-8
@@ -190,8 +190,8 @@ Scenario: a line omitting the session key reads as no session reading (AD-10 def
    When it is decoded as a `Sample`
    Then the decode is `Ok` with a session reading of `None` and a weekly reading of `Some(0.1)`
     But NOT `Err` — PRD § 11.4's row said "still rejected"; #1598 follows design AD-10's
-        `#[serde(default)]`, recorded ratification-pending, and under a ruling of "reject" T4 asserts
-        `is_err()` and a custom deserializer refuses the omitted key
+        `#[serde(default)]`, ratified by council on 2026-11-02 (D6; the weekly axis with D12 on 2026-11-03);
+        were that reversed for "reject", T4 would assert `is_err()` and a custom deserializer would refuse the omitted key
     # Every writer in this crate serializes a `Sample`, so the key is always present; rejecting an
     # omitted key would drop a line in silence — the loss class this item ends — to defend against a
     # writer that does not exist. `serde`'s derive already treats a missing `Option` field as `None`
@@ -245,7 +245,7 @@ Examples:
   # `fold_landings`' `is_finite` guard (`src/reliability.rs:2098-2099`) rests on, which becomes
   # `is_some_and(f64::is_finite)` in the reliability rule's own move (same pull request, not this item).
 
-Scenario Outline: a Sample round-trips with a null reading on either axis, and the four optional keys stay absent when unset (D12 default)
+Scenario Outline: a Sample round-trips with a null reading on either axis, and the four optional keys stay absent when unset (D12, settled by council)
   # Tier A — graded by usage_store::tests::sample_round_trips_with_and_without_optionals (#1598 T5,
   # extended; no RED at fd8640b — it does not compile against origin/main, where `Sample::new` takes
   # `f64`, and T1 and T3 carry the session half; mutant, AC-7's record:
@@ -397,10 +397,7 @@ Scenario: an hour and a day holding only session-less samples fold to a finite, 
 Scenario: a bucket whose readings carried no session reading omits its session statistic and keeps its whole-bucket count (D13 as ruled)
   # Tier A — graded by
   # usage_store::tests::a_bucket_whose_readings_carry_no_session_window_omits_the_session_statistic
-  # (#1598 T8b; cannot compile against fd8640b, green by construction; its evidence is AC-4's mutant,
-  # under which `read_rollup` fails before T8b's typed reads. A zero-fabricating guard —
-  # `Some(HourStat { max: 0.0, mean: 0.0 })` for an all-absent axis — would pass T8a and fail only T8b,
-  # so that row is worth adding to AC-4's record) · covers AC-4, AC-5
+  # (#1598 T8b; type-gated — it does not compile against the pull request's base — and green by construction on the head; its mutant record is AC-4's second, the zero-fabricating fold the next scenario names, which fails T8b at its own assertions; AC-4's first, the emptiness guard removed, stops T8b at `read_rollup` before its typed reads, so it grades T8a, not T8b) · covers AC-4, AC-5
   Given the rollup of the scenario above
    When the day bucket 14688000 and the hour bucket 14695200 are read
    Then the day bucket has `count` 4, `coverage` 4/288, `session` `None`, and `weekly` `Some` with
@@ -539,7 +536,7 @@ Scenario: each present statistic records how many of its bucket's readings it is
     # are AC-23's over the same readings. A recorded count is at least 1 and at most the bucket's
     # `count`; the fold sets it to the length of the per-axis vector it already builds (#1598 § 5).
 
-Scenario Outline: the count invariant holds at both tiers for both axes, whether no reading, one or all four carry the axis (D13 as ruled, D12 default)
+Scenario Outline: the count invariant holds at both tiers for both axes, whether no reading, one or all four carry the axis (D13 as ruled, D12 as ruled)
   # Tier A — graded by usage_store::tests::count_invariants_hold_for_every_folded_bucket (#1598 AC-24
   # as absorbed, a new test beside T8b; no RED at fd8640b: the field does not exist at the base tree,
   # so the test can only fail to compile there; mutant, AC-24's record: counting a sample whose reading

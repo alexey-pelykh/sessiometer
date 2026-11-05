@@ -17,9 +17,7 @@ dimension?* The answer is **no**, and the reason is a measurement rather than a 
 why it is recorded here instead of as a note on the spec. Companion to **ADR-0019** (the widened
 cadence that creates the blind spot in the first place).
 
-**Amended 2026-11-02 (#1593) — a structurally absent session window is excluded from the session
-census: it is not an unobserved reading, and the census is over the accounts that have the window
-(open decision D5's default, ratification-pending).** Since 2026-10-30 Anthropic has been removing
+**Amended 2026-11-02 (#1593); settled by council 2026-11-03 — a structurally absent session window is excluded from the session census: it is not an unobserved reading. The census set is the roster minus every account none of whose in-period readings carries a session reading; a reading with no session window anchors nothing and covers nothing; a rostered account with no in-period readings at all stays in the set and empties the intersection (decision D5, ratified at the maintainer's delegation).** Since 2026-10-30 Anthropic has been removing
 the five-hour session window from verified Ultra accounts, per account and automatically, so such an
 account's usage reply carries `"five_hour": null` beside a present weekly window; Pro and Max
 accounts keep their session window, so a fleet holds both shapes at once (the dated sources are
@@ -28,19 +26,15 @@ over readings that carry a session fraction, and "The census reports what it obs
 interpolate across what it did not" presumes every rostered account has a session window to observe.
 That premise is falsified on the wire; the decision stands and its premise is rewritten.
 
-**The decision in force, under open decision D5 — this record takes the default.** Open decision
+**The decision, settled by council on 2026-11-03 at the maintainer's delegation (D5).** Decision
 **D5** `census-excludes-absent-window` (`docs/requirements/optional-quota-windows.md` § 8) has two
 options. The default, which this paragraph records: a structurally absent session window is excluded
-from the session census — it is not an unobserved reading, and the census is over the accounts that
-have the window. The alternative — § 8's "hold the census UNKNOWN whenever such an account is
+from the session census — it is not an unobserved reading; the census set is the roster minus every account none of whose in-period readings carries a session reading, a reading with no session window anchors nothing and covers nothing, and a rostered account with no in-period readings at all stays in the set and empties the intersection. The alternative — § 8's "hold the census UNKNOWN whenever such an account is
 present" — which this paragraph does not record, would read: "While any account on the roster has no
-session window, the session census reports UNKNOWN." The default is pipeline-recommended,
-ratification-pending; the operator has not ruled on D5, and a ruling for the alternative replaces
-this paragraph's sentence with that one. `high_windows` (`src/usage_stats.rs`) and its asymmetry are
+session window, the session census reports UNKNOWN." The council ratified the default on 2026-11-03; it is sound while a stored `None` means a window the reply did not carry — a window the reply carries in a shape the parser cannot read is #1614's, and an instance of it served as `None` reopens D5, when a ruling for the alternative would replace this paragraph's sentence with that one. `high_windows` (`src/usage_stats.rs`) and its asymmetry are
 unchanged either way: a high reading is still anchored to its `session_resets_at`, a low reading is
 still not, no low reading is anchored, and a reading with no session window is simply not a reading
-on this axis — it anchors nothing and it covers nothing. UNKNOWN keeps its meaning: an account that
-has the window and was not observed still empties the intersection, exactly as the weekly-drained
+on this axis — it anchors nothing and it covers nothing. UNKNOWN keeps its meaning: a rostered account that was not observed in the period still empties the intersection, whether or not it has the window — the census cannot tell, and treats both alike — exactly as the weekly-drained
 corpus in § Context below does, and unobserved is not the same as no window. The weekly figures of
 such an account are untouched; only the session axis excludes it.
 
@@ -64,7 +58,7 @@ independently optional, a weekly-less account the explicit future case; the requ
 work, from the same day, is quoted beside it. The corrected-premise sentence recorded above is the
 solution design's draft (`docs/design/optional-quota-windows-solution-design.md` § 5 B-10); the rest
 of this amendment was written for #1593 against that design and the requirements document. All of it
-is pipeline-authored and ratification-pending under umbrella #1590; the operator has reworded
+is pipeline-authored and ratification-pending under umbrella #1590, except the D5 sentences, settled by council on 2026-11-03 at the maintainer's delegation; the operator has reworded
 nothing and ratified no sentence here.
 
 ## Context
