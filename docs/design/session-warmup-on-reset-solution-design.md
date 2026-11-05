@@ -42,7 +42,7 @@ delete the second item, and a build item that is small because the machinery alr
 
 | # | Component | Responsibility | Reuses | Feasibility |
 |---|---|---|---|---|
-| C-1 | **Stopped-clock predicate** | From an existing poll reading, decide "this parked account has no session window running" | `Usage::session_resets_at: Option<i64>` (`src/usage.rs`; cited by symbol — this repo has a recorded line-ref drift, issue #1058) already polled every tick | **FEASIBLE — with one open sub-question**, see § 6 R-3 |
+| C-1 | **Stopped-clock predicate** | *decide, from an existing poll reading, which of two states a parked account is in: `session.is_none()` is no window, nothing to warm (R-2 never matches); `session.is_some() && session_resets_at.is_none()` is the stopped clock* *Amended 2026-11-04 (issue #1595): this said "From an existing poll reading, decide 'this parked account has no session window running'".* *Provenance: the operator's 2026-11-01 direction ("we need to make the parser more robust and flexible", `docs/requirements/optional-quota-windows.md` § 2.1), umbrella #1590. The requirement it implements (REQ-REC-B-001) is pipeline-authored and ratification-pending.* | `Usage::session: Option<f64>` (the reading-model item #1597), shipped by PR #1653 as `458c9fa`, and `Usage::session_resets_at: Option<i64>` (`src/usage.rs`; cited by symbol — this repo has a recorded line-ref drift, issue #1058) already polled every tick. *Amended 2026-11-04 (issue #1595): adds `Usage::session`; this cell named `Usage::session_resets_at` alone.* | **FEASIBLE — with one open sub-question**, see § 6 R-3 |
 | C-2 | **Eligibility gate** | Exclude active, quarantined, throttled, and config-disabled accounts | The `keep_active_warm` gate ladder (`src/daemon/keep_warm.rs`) is the same shape, including `last_keep_warm_attempt` throttling | **FEASIBLE** — direct precedent |
 | C-3 | **Warm-up actuator** | Perform one real use against a parked account | `crate::refresh` isolated engine (#102); `src/poke.rs` is already a thin caller over it | **FEASIBLE for the spawn; UNPROVEN for the effect** — see § 5 D-1 and § 6 R-1 |
 | C-4 | **Config surface** | `enabled` flag + throttle interval | `[refresh].proactive_keep_warm` precedent | **FEASIBLE** |
@@ -54,11 +54,14 @@ delete the second item, and a build item that is small because the machinery alr
 tick
  └─ poll account i  ──►  Usage { session_pct, session_resets_at, weekly_* }
        │
-       ├─ C-1  session_resets_at == None  (and account parked)  ──► clock stopped
+       ├─ C-1  session == None  ──► no window applies, nothing to warm (R-2 never matches)
+       ├─ C-1  session == Some(_) ∧ session_resets_at == None  (and account parked)  ──► clock stopped
        ├─ C-2  not active ∧ not quarantined ∧ enabled ∧ throttle elapsed
        ├─ C-3  refresh-engine cycle against isolated CLAUDE_CONFIG_DIR   ← the "use"
        └─ C-5  Event::SessionWarmup { label, trigger_ts, outcome }
 ```
+
+> *Amended 2026-11-04 (issue #1595): this sequence's C-1 step was one line, `session_resets_at == None  (and account parked)  ──► clock stopped`, keyed on the stamp alone; it is now the two arms above, because since 2026-10-30 an absent stamp also describes an account with no session window at all, and only the fraction (`session`, the poll line's `session_pct`, held as `Usage::session`) tells the two apart.* *Provenance: the operator's 2026-11-01 direction ("we need to make the parser more robust and flexible", `docs/requirements/optional-quota-windows.md` § 2.1), umbrella #1590. The requirement it implements (REQ-REC-B-001) is pipeline-authored and ratification-pending.*
 
 No new socket surface, no wire/schema change, no `STATUS_SCHEMA_VERSION` bump — C-1 consumes a field
 already serialized, and C-5 adds an event, not a status field.
@@ -87,7 +90,7 @@ so the build item is *blocked by* the spike rather than merely informed by it.
 |---|---|---|---|
 | R-1 | **The warm-up may not start the clock.** `poke`'s purpose is credential refresh; if its `claude -p` cycle does not make a billable inference call, it may refresh the token without opening a session window — in which case C-3 actuates nothing and the whole feature is void | **HIGH** | The spike measures **both** the weekly cost *and* whether `session_resets_at` appears after a cycle. This is why R-1 gates rather than informs. Cheap to falsify: one cycle against a parked account |
 | R-2 | Weekly-quota debit on the binding axis | **HIGH** | R-1 quantifies it; NO-GO deletes the build item |
-| R-3 | `session_resets_at == None` may not mean "no window". The corpus also holds 2 843 samples with `session = 0` **and** a reset instant present, which C-1 must not treat as stopped | **MEDIUM** | Fold into R-1: confirm the absent/present split against a known-idle account before C-1 is written |
+| R-3 | *`session_resets_at == None` has two meanings since 2026-10-30: a stopped clock on an account that has a session window, and nothing at all on an account that has none. C-1 tells them apart by the fraction, never by the stamp alone.* *Amended 2026-11-04 (issue #1595): this said "`session_resets_at == None` may not mean 'no window'. The corpus also holds 2 843 samples with `session = 0` **and** a reset instant present, which C-1 must not treat as stopped".* | **MEDIUM** | *The stamp-versus-zero half was confirmed by #1231's AC-3 (2026-08-11): absent stamp = clock stopped; present stamp with `session == 0` = running window, nothing spent. The no-window half is this amendment. Residual: C-1 is unbuilt (#1232).* *Amended 2026-11-04 (issue #1595): this said "Fold into R-1: confirm the absent/present split against a known-idle account before C-1 is written".* *Provenance: the operator's 2026-11-01 direction ("we need to make the parser more robust and flexible", `docs/requirements/optional-quota-windows.md` § 2.1), umbrella #1590. The requirement it implements (REQ-REC-B-001) is pipeline-authored and ratification-pending.* |
 | R-4 | **Warm-up synchronises rather than staggers.** Warming every account at its own reset preserves existing phase and could tighten co-exhaustion | **MEDIUM** | C-5's readout must report reset **spread** alongside idle-clock, so a regression is visible; per-account jitter is the lever if it appears |
 | R-5 | Spawn cost / storm | **LOW** | C-2 throttle, precedent-identical to `keep_warm` |
 
@@ -106,7 +109,7 @@ so the build item is *blocked by* the spike rather than merely informed by it.
 
 | Layer | Coverage |
 |---|---|
-| Unit | C-1 predicate over the three observed shapes (absent / present-with-0 / present-with-usage); C-2 gate ladder incl. active + quarantined exclusion, mirroring the existing `should_keep_warm_retry` tests |
+| Unit | *C-1 predicate over the four shapes (fraction absent / fraction present with stamp absent / stamp present with session 0 / stamp present with session > 0); the reading-model invariant (a stamp implies its fraction) makes 'fraction absent, stamp present' unconstructible, which the test states rather than exercises.* C-2 gate ladder incl. active + quarantined exclusion, mirroring the existing `should_keep_warm_retry` tests. *Amended 2026-11-04 (issue #1595): the C-1 clause said "C-1 predicate over the three observed shapes (absent / present-with-0 / present-with-usage)".* *Provenance: the operator's 2026-11-01 direction ("we need to make the parser more robust and flexible", `docs/requirements/optional-quota-windows.md` § 2.1), umbrella #1590. The requirement it implements (REQ-REC-B-001) is pipeline-authored and ratification-pending.* |
 | Integration | Daemon tick drives C-1 → C-2 → C-3 through the existing keep-warm seam (`with_keep_warm_engine`), asserting the active account is never targeted |
 | Manual / operational | R-1's measurement is an operator-run procedure against the live fleet, not a test |
 

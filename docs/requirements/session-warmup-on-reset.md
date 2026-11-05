@@ -92,7 +92,7 @@ are the holds an earlier session reset could shorten, by up to the idle-clock du
 
 | Object | Core attributes | Relationships |
 |---|---|---|
-| **Account** | label, uuid, `session_pct`, `session_resets_at` (nullable = no window running), `weekly_pct`, `weekly_resets_at`, quarantined | belongs to Roster |
+| **Account** | *Amended 2026-11-04 (issue #1595): since 2026-10-30 a verified Ultra account carries no five-hour session window at all, so the reading model (`docs/requirements/optional-quota-windows.md`, umbrella #1590) makes the session fraction itself optional. Read `session_pct` nullable as 'no session window applies' and `session_resets_at` nullable as 'no window running', a state that exists only where `session_pct` is present. For such an account the Session window relationship is 0 per Account by construction, not by idleness.* *Provenance: the operator's 2026-11-01 direction ("we need to make the parser more robust and flexible", `docs/requirements/optional-quota-windows.md` § 2.1), umbrella #1590. The requirement it implements (REQ-REC-B-001) is pipeline-authored and ratification-pending.* As first written: label, uuid, `session_pct`, `session_resets_at` (nullable = no window running), `weekly_pct`, `weekly_resets_at`, quarantined | belongs to Roster |
 | **Session window** | anchored-at (first use), resets-at, running? | 0..1 per Account |
 | **Warm-up attempt** | account, trigger instant, outcome, weekly cost observed | targets one Account |
 | **Warm-up policy** | enabled?, eligibility predicate, per-account throttle | governs Roster |
@@ -119,9 +119,14 @@ cycles across at least two accounts, and SHALL record a GO / NO-GO for R-2..R-6 
 benefit.
 *Origin*: pipeline-authored from § 4. *Ratification*: operator ratified the spike-first shape (session, 2026-08-11).
 
-**R-2 — Warm-up on reset.** WHEN a managed account's session window is observed to have ended and no
+**R-2 — Warm-up on reset.** *(Read the 2026-11-04 amendment below, issue #1595, before this clause.)* WHEN a managed account's session window is observed to have ended and no
 new window is running, the daemon SHALL initiate one warm-up cycle against that account.
 *Conditional on R-1 = GO.*
+
+> *Amended 2026-11-04 (issue #1595): R-2 applies only to an account whose session fraction is present.
+> An account whose session fraction is absent has no session window to warm; a warm-up against it would spend weekly quota and open nothing (premortem P-4 of the optional-quota-windows PRD), so R-2 never matches it.
+> The spike R-1 and its verdict (#1231, GO, 2026-08-11) are unchanged.*
+> *Provenance: the operator's 2026-11-01 direction ("we need to make the parser more robust and flexible", `docs/requirements/optional-quota-windows.md` § 2.1), umbrella #1590. The requirement it implements (REQ-REC-B-001) is pipeline-authored and ratification-pending.*
 
 **R-3 — Opt-in, off by default.** The warm-up behaviour SHALL be disabled unless explicitly enabled in
 configuration, following the precedent of `[refresh].proactive_keep_warm`.
