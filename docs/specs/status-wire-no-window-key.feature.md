@@ -564,15 +564,19 @@ Scenario: the session_pct contract reverts to its steady-state sentence, and the
         (`src/daemon/snapshot.rs:200-204`), the present-percent test literals,
         `src/config/render.rs:520-526`, `build/fixtures/cross-surface-severity.json:342` and the mock's
         prose at `apps/menubar/design/menubar-preview.html:3757` do not restate the posture
-    And four sites that restate the corrected propositions without carrying the sweep's token take a
+    And the sites that restate the corrected propositions without carrying the sweep's token take a
         disposition too,
         found by path: `apps/menubar/Tests/WireDecoderTests.swift:604-606` ("three fields … throw when
         one is missing") and
         `apps/menubar/Sources/WireModel.swift:647` ("`nil` if the last poll failed") are corrected
-        in-band; `src/cli.rs` and
-        `apps/menubar/Sources/StatusPanelFormat.swift:862` stay, as #1594's cells; and
+        in-band; the `StatusRow.session` doc and the `pct` doc in `src/cli.rs`, the `pct` doc at
+        `apps/menubar/Sources/StatusPanelFormat.swift:862` and the `README.md` status-table bullet name
+        #1594 as the end of the cells' `n/a`, and #1594 deletes those clauses
+        (council 12, 2026-11-05); and
         `apps/menubar/Sources/PanelRenderHarness.swift:209`,
         which the token does return, stays (the harness authors no percent-less block)
+    And the `weekly_pct` doc in `src/daemon/snapshot.rs` and its Swift mirror `weeklyPct` name both
+        their `null` meanings, the second keyed on `absent_windows` listing `weekly` (council 12)
     But NOT the contract redefined — after this item `null` never means "no session window"; the key
         does
     But NOT a zero reported for the sweep without its canary
@@ -647,7 +651,8 @@ Scenario: the diff is bounded to the named files, carries no secret and touches 
   Given the pull request against `origin/main`
    When its changed files are listed
    Then production changes sit only in the files AC-13 names (the snapshot, records, daemon, emitter,
-        CLI, Swift mirror and panel files, plus ADR-0017 and its index row), and everything else is
+        CLI, Swift mirror and panel files, plus ADR-0017 and its index row, and the top-level
+        `README.md`'s status-table bullet), and everything else is
         fixtures and tests
     And each literal the compiler forces in test code outside those files changes its type and nothing
         else:
