@@ -172,6 +172,97 @@ of this amendment was written for #1593 against that design and the requirements
 is pipeline-authored and ratification-pending under umbrella #1590; the operator has reworded
 nothing and ratified no sentence here.
 
+**Amended 2026-11-11 (#1692) — the header-observation rejection reaches every request this daemon
+would send to a model endpoint itself, for every credential class and every purpose; a credential
+the usage endpoint refuses for scope has no usage source and is to be refused at capture; disqualifier
+(a)'s premise has decayed, and the rejection now stands on (b) alone.** Fork pull request #1588
+proposes a second usage source. For a credential whose OAuth scopes include inference but not
+profile access (the `claude setup-token` class, which the pull request registers from a token file
+as a "token-only account"), the daemon would send one minimal request of its own to
+`https://api.anthropic.com/v1/messages` and read the `anthropic-ratelimit-unified-5h-*` and `-7d-*`
+response headers, selected automatically from the credential's scope list, at every poll of that
+account, active or peer, and for the pre-swap canary. Its hunk on this record calls that an
+"Experimental exception" and says the decision "remains unchanged for profile-scoped credentials".
+The decision draws no such line: Alternatives considered item 2 names the mechanism, "a
+minimal-inference probe with the subscription OAuth tokens", as disqualifier (b), and the Decision,
+the Consequences ("`/oauth/usage` remains the **only** usage source — no header probe is added") and
+the #539, #586 and #1593 amendments restate the rejection with no credential-class or purpose
+qualifier. Re-labelling the probe a primary usage source for one credential class changes its
+purpose, not the mechanism (b) rejects. **The decision stands; the pull request's exception does
+not land.**
+
+**The ruling, in mechanism terms.** (i) `GET /api/oauth/usage` stays the one usage source and the
+one outbound request this process originates (README § Privacy: no telemetry; the capability guard
+`the_sole_egress_endpoint_is_the_documented_usage_url` in `src/usage.rs`), and the daemon sends no
+request that carries another client's name in its `User-Agent` (the proposed probe sends
+`claude-code/2.1.0`). (ii) A request to a model endpoint spends the quota it would read, at the
+documented cadence: under ADR-0012 the active account is polled about every `2·poll_secs/N` and a
+peer about every `2·poll_secs·(N-1)/N`, `poll_secs` default 300, and near its limit
+`near_limit_poll_secs` (default 60) caps the active account's poll spacing so it is re-polled at
+least about every 120 s whatever the roster size (for a roster of five the base cadence is already
+that). For a roster of five at the defaults that is about 720 model requests a day for the active
+account and about 180 for each peer, before back-off and slow-poll, and most of them exactly when
+the account's quota is scarcest. The #1231 spike measured that one short request through the official client (`claude -p "say
+pong"`, the refresh engine's prompt) opens a rested account's five-hour window in 130 of 131 cycles, so an automatic probe is also an
+unthrottled form of the opt-in, per-account-throttled warm-up that #1232 scopes. (iii) The one
+request this daemon sends beyond the usage GET, the online canary, is off by default and sends
+nothing while off; a probe keyed on a scope list the registration path writes itself would spend an
+account's quota from the moment the account is registered, with no setting that says so. No form
+of the probe lands under this ruling: not automatic, not a per-account opt-in, not canary-only. An
+opt-in would bound what a user spends and change nothing about the request; a canary-only form is
+still a model request this daemon sends itself.
+
+**What an inference-only credential gets.** No usage source. The usage endpoint answers `403`
+`OAuth token does not meet scope requirement user:profile` to a `claude setup-token` credential
+(measured on 2026-06-19; issue #5 records the requirement to surface it), the daemon surfaces that as
+`Error::UsageScopeMissing` with the re-capture remedy. No path on `main` registers such a
+credential today; the pull request's token-file path would. The disposition this ruling sets is
+that registration of such a credential is to be refused at capture with the same remedy, rather
+than rostering an account the daemon can neither rank as a swap target nor protect while active (the blind arm keys on a `last_good` anchor such an
+account never gets). Not the #1612 window: that proposal widens, and never stops, a poll whose
+answer is already known, exempts the active account, and fits a credential already rostered whose
+scope metadata is unknown. Not the #1590 no-window rendering: that state means a window the account
+does not have, and an account the daemon cannot read is not an account without limits.
+
+**Disqualifier (a)'s premise has decayed; the rejection stands on (b) alone.** This record says the
+upstream request to persist the headers, anthropics/claude-code#55333, "is open" and that "Passive
+reading is impossible". That issue was closed as completed on 2026-05-01, before this record was
+accepted, and the official client's status line now hands a subscriber session
+`rate_limits.five_hour.used_percentage`, `rate_limits.seven_day.used_percentage` and their
+`resets_at` after the session's first response, each window independently absent (the status-line
+documentation, read 2026-11-05; the field schema is in the 2.1.318 binary). Whether a
+status-line-fed reading, which needs no request from this daemon, should become a usage source is a
+separate decision this amendment does not take; it would amend Alternative 2(a), not (b). "Either
+disqualifier alone is fatal" (Alternatives considered, item 2) is what carries the rejection today.
+
+**Mechanism claims the pull request rests on, tagged.** That a setup-token credential has inference
+scope without profile scope: read from dated provider documentation ("It can only make model
+requests", read 2026-11-05); the pull request discovers no scope from the token: its registration path
+writes `scopes: ["user:inference"]` into the stored credential from a prefix check, and its
+selector then reads that list back. The `403` from the usage endpoint: measured once,
+2026-06-19. That a minimal request under a setup-token credential is accepted and its reply carries
+both utilization headers: unverified; the pull request defers it to "separate live acceptance
+checks". The quota one probe costs, and whether a header percentage and the usage endpoint's windows
+coincide: unverified; no record exists.
+
+**Falsifier, and the measurement it waits on.** The ruling rests on this record and on the egress
+contract, not on a measurement, so no probe run is owed. It is falsified by (i) `GET
+/api/oauth/usage` answering `200` to a freshly minted `claude setup-token` credential, operator-run
+with the daemon's own headers, repeating the 2026-06-19 request and sending no model request: the
+class then has a usage source and the capture refusal lifts, with this decision untouched; or (ii)
+the decision-maker narrowing (b) to the active-account freshness purpose or to interactive tokens,
+which would take a new record. A second check, owed before any record restates (a), spends one model
+request through the official client, since the status line populates only after the session's
+first response: run the official client under `CLAUDE_CODE_OAUTH_TOKEN` with a status-line command
+that saves its input, and read whether `rate_limits` is populated for a setup-token session and whether its values match
+the usage endpoint's at the same moment on an account that holds both token types.
+
+**Provenance.** Prepared on 2026-11-05 by a three-lens council under the maintainer's 2026-11-02
+delegation of decisions of this kind to a council; the maintainer approved this text on 2026-11-11,
+and that approval is the ruling. The pull request author is asked to open an issue for the storage
+concern and to split the pull request by concern; the split drops the probe, the `User-Agent`
+override, the widening of the egress guard, the README probe paragraphs and the hunk on this record.
+
 ## Context
 
 sessiometer keeps **one** live Claude Code credential active by rotating across a
@@ -216,7 +307,9 @@ more observation:
 1. **Claude Code does not persist its usage.** The `anthropic-ratelimit-unified-5h-*`
    headers carry exact usage on every inference response, but Claude Code stashes
    nothing locally to harvest (verified by a local sweep 2026-07-11; upstream FR
-   [anthropics/claude-code#55333](https://github.com/anthropics/claude-code/issues/55333)).
+   [anthropics/claude-code#55333](https://github.com/anthropics/claude-code/issues/55333)) —
+   **but see Amended 2026-11-11 (#1692)**: that request was closed as completed on 2026-05-01, and
+   the status line now carries the windows.
 2. **Eliciting the headers means impersonating Claude Code.** The only way to draw a
    fresh header is a minimal-inference probe using the subscription OAuth tokens —
    i.e. impersonating Claude Code — which courts an **account ban**.
@@ -282,7 +375,9 @@ The path honours the **#369** cautions on a reactive fast-path:
      - **(a) There is nothing to harvest.** Claude Code does not persist the
        headers — a local sweep (2026-07-11) found no stash; the upstream FR to
        persist them ([anthropics/claude-code#55333](https://github.com/anthropics/claude-code/issues/55333))
-       is open. Passive reading is impossible.
+       is open. Passive reading is impossible. **But see Amended 2026-11-11 (#1692)**: closed as
+       completed on 2026-05-01; the status line now carries the windows, so (a) no longer holds and
+       the rejection stands on (b).
      - **(b) Eliciting them is impersonation.** The only way to draw a fresh header
        is a minimal-inference probe with the subscription OAuth tokens — i.e.
        impersonating Claude Code. For a **fleet-health** tool whose entire purpose is
