@@ -1618,12 +1618,14 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             .collect();
         let report = aggregate(&samples, &[], period, &params());
         let a = &report.per_account["work"];
-        assert!((a.session.mean - 0.7).abs() < 1e-9, "session mean");
-        assert!((a.session.peak - 1.2).abs() < 1e-9, "session peak");
+        let session = a.session.expect("every reading carries a session value");
+        let weekly = a.weekly.expect("every reading carries a weekly value");
+        assert!((session.mean - 0.7).abs() < 1e-9, "session mean");
+        assert!((session.peak - 1.2).abs() < 1e-9, "session peak");
         // Nearest-rank p95 of 6 values: ceil(0.95·6)=6 → the 6th (largest) = 1.2.
-        assert!((a.session.p95 - 1.2).abs() < 1e-9, "session p95");
-        assert!((a.weekly.mean - 0.30).abs() < 1e-9, "weekly mean");
-        assert!((a.weekly.peak - 0.30).abs() < 1e-9, "weekly peak");
+        assert!((session.p95 - 1.2).abs() < 1e-9, "session p95");
+        assert!((weekly.mean - 0.30).abs() < 1e-9, "weekly mean");
+        assert!((weekly.peak - 0.30).abs() < 1e-9, "weekly peak");
     }
 
     /// Issue #1600: a reading with no session window is excluded from the session figures and kept
@@ -1641,17 +1643,18 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         let a = &report.per_account["work"];
         assert_eq!(
             a.session,
-            DimStats {
+            Some(DimStats {
                 mean: 0.9,
                 peak: 0.9,
                 p95: 0.9
-            },
+            }),
             "T1: the session figures are over the one reading that carries a session value"
         );
+        let weekly = a.weekly.expect("T1: every reading carries a weekly value");
         assert!(
-            (a.weekly.mean - 0.5).abs() < 1e-12,
+            (weekly.mean - 0.5).abs() < 1e-12,
             "T1: the weekly mean is over all three readings: {}",
-            a.weekly.mean
+            weekly.mean
         );
         assert_eq!(
             a.seen, 3,
@@ -1662,11 +1665,13 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             "T1: and coverage counts all three: 3 seen over the 900 s period at the 300 s cadence"
         );
         assert_eq!(
-            a.cap_hits, 1,
+            a.cap_hits,
+            Some(1),
             "T1: one reading sits at or above the 0.8 session cap"
         );
         assert_eq!(
-            a.time_at_cap_secs, 300,
+            a.time_at_cap_secs,
+            Some(300),
             "T1: the cap time is that one reading's validity window, [300, 600)"
         );
     }
@@ -1712,30 +1717,35 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         let a = &report.per_account["work"];
         assert_eq!(
             a.weekly,
-            DimStats {
+            Some(DimStats {
                 mean: 0.9,
                 peak: 0.9,
                 p95: 0.9
-            },
+            }),
             "T13: the weekly figures are over the one reading that carries a weekly value"
         );
+        let session = a
+            .session
+            .expect("T13: every reading carries a session value");
         assert!(
-            (a.session.mean - 0.55).abs() < 1e-12,
+            (session.mean - 0.55).abs() < 1e-12,
             "T13: the session mean is over all three readings: {}",
-            a.session.mean
+            session.mean
         );
-        assert_eq!(a.session.peak, 0.85, "T13: and so is the session peak");
+        assert_eq!(session.peak, 0.85, "T13: and so is the session peak");
         assert_eq!(
             a.seen, 3,
             "T13: a session-only reading is still an observation"
         );
         assert_eq!(a.coverage, 1.0, "T13: three readings of three expected");
         assert_eq!(
-            a.cap_hits, 1,
+            a.cap_hits,
+            Some(1),
             "T13: the third reading is at or above the session cap"
         );
         assert_eq!(
-            a.time_at_cap_secs, 300,
+            a.time_at_cap_secs,
+            Some(300),
             "T13: the window of the third reading, whose weekly is absent"
         );
     }
@@ -1754,7 +1764,8 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         ];
         let report = aggregate(&samples, &[], period, &params());
         assert_eq!(
-            report.per_account["work"].cap_hits, 3,
+            report.per_account["work"].cap_hits,
+            Some(3),
             "0.80, 0.81, 0.99 are cap hits; 0.7999 is not"
         );
     }
@@ -1778,7 +1789,10 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         // Gap honesty: the 9 missing polls are NOT invented as 0.0 — the mean stays high
         // (~0.947), it is not dragged toward zero by the absent samples.
         assert!(
-            a.session.mean > 0.9,
+            a.session
+                .expect("every reading carries a session value")
+                .mean
+                > 0.9,
             "absent samples are not counted as zero"
         );
     }
@@ -2047,13 +2061,20 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             "the fixture no longer measures both figures at one water, which is the whole premise"
         );
         assert_eq!(
-            (a.cap_hits as usize, samples.len()),
+            (
+                a.cap_hits.expect("every reading carries a session value") as usize,
+                samples.len()
+            ),
             (24, 24),
             "every reading must be a cap-hit for the two figures to run over one population"
         );
 
         assert_eq!(
-            (a.time_at_cap_secs, report.roster.all_high_secs),
+            (
+                a.time_at_cap_secs
+                    .expect("every reading carries a session value"),
+                report.roster.all_high_secs
+            ),
             (7_200, 86_400),
             "the cadence-bounded / session-anchored gap moved. Both rules are deliberate — see \
              `AccountStats::time_at_cap_secs` and ADR-0035 — so this is a signal that one of them \
@@ -2098,7 +2119,7 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         let report = aggregate(&samples, &[], period, &params());
         // First three cover [0,300)+[300,600)+[600,900) = 900 s; the last covers
         // [5000, min(5000+300, 5200)) = 200 s. The gap 900..5000 adds NOTHING.
-        assert_eq!(report.per_account["work"].time_at_cap_secs, 900 + 200);
+        assert_eq!(report.per_account["work"].time_at_cap_secs, Some(900 + 200));
     }
 
     // --- all-accounts-high episodes -------------------------------------------
@@ -2944,8 +2965,12 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
                 .collect();
             let lenient = AggregateParams::new(300, 0.50, 0.80);
             let strict = AggregateParams::new(300, 0.90, 0.80);
-            let lo = aggregate(&samples, &[], period, &lenient).per_account["work"].cap_hits;
-            let hi = aggregate(&samples, &[], period, &strict).per_account["work"].cap_hits;
+            let lo = aggregate(&samples, &[], period, &lenient).per_account["work"]
+                .cap_hits
+                .expect("every sample carries a session reading");
+            let hi = aggregate(&samples, &[], period, &strict).per_account["work"]
+                .cap_hits
+                .expect("every sample carries a session reading");
             assert!(
                 lo >= hi,
                 "a lower cap can only admit MORE hits ({lo} >= {hi})"
@@ -4016,25 +4041,26 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         let mut witnessed = 0;
         for handle in REPLAY_ROSTER {
             let stats = &report.per_account[handle];
-            if stats.cap_hits == 0 {
-                continue;
-            }
+            let time_at_cap = match (stats.cap_hits, stats.time_at_cap_secs) {
+                (Some(hits), Some(secs)) if hits > 0 => secs,
+                _ => continue,
+            };
             witnessed += 1;
             let group: Vec<&Sample> = samples.iter().filter(|s| s.acct == handle).collect();
             let (highs, _) = high_windows(&group, period, params.stale_after_secs, water);
             let anchored: i64 = highs.iter().map(|(lo, hi)| hi - lo).sum();
             assert!(
-                anchored > stats.time_at_cap_secs,
+                anchored > time_at_cap,
                 "`{handle}`: anchoring did not widen the at-cap span ({anchored} vs {}), so this \
                  corpus no longer prices the alternative ADR-0035 rejects",
-                stats.time_at_cap_secs
+                time_at_cap
             );
             assert!(
-                anchored < stats.time_at_cap_secs * 10,
+                anchored < time_at_cap * 10,
                 "`{handle}`: anchoring moved the at-cap span by an order of magnitude ({anchored} \
                  vs {}) on REAL data. The synthetic gate above owns that claim; if the corpus now \
                  shows it too, ADR-0035's evidence section understates the case and should say so",
-                stats.time_at_cap_secs
+                time_at_cap
             );
         }
         assert_eq!(

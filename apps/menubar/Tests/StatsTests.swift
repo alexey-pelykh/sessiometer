@@ -53,7 +53,7 @@ final class StatsTests: XCTestCase {
         guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsBasic) else {
             return XCTFail("expected a StatsWire document, not an error envelope")
         }
-        XCTAssertEqual(wire.schema, 1)
+        XCTAssertEqual(wire.schema, 2)
 
         // Window
         XCTAssertEqual(wire.window.start, 1_782_864_000)
@@ -72,7 +72,7 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(bucket.start, 0)
         XCTAssertEqual(bucket.end, 21_600)
         let bucketWork = try XCTUnwrap(bucket.accounts["work"])
-        XCTAssertEqual(bucketWork.session.peak, 0.9, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(bucketWork.session).peak, 0.9, accuracy: 1e-9)
 
         // Summary roster: the aggregate callout's source.
         XCTAssertEqual(wire.summary.roster.swapCount, 1)
@@ -89,22 +89,22 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(work.seen, 3)
         XCTAssertEqual(work.coverage, 1.0, accuracy: 1e-9)
         XCTAssertEqual(work.coverageClass, .complete)
-        XCTAssertEqual(work.session.mean, 0.5, accuracy: 1e-9)
-        XCTAssertEqual(work.session.peak, 0.9, accuracy: 1e-9)
-        XCTAssertEqual(work.session.p95, 0.85, accuracy: 1e-9)
-        XCTAssertEqual(work.weekly.mean, 0.3, accuracy: 1e-9)
-        XCTAssertEqual(work.weekly.peak, 0.4, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.session).mean, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.session).peak, 0.9, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.session).p95, 0.85, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.weekly).mean, 0.3, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.weekly).peak, 0.4, accuracy: 1e-9)
         XCTAssertEqual(work.capHits, 1)
         XCTAssertEqual(work.timeAtCapSecs, 300)
         XCTAssertEqual(work.contributionShare, 1.0, accuracy: 1e-9)
         XCTAssertEqual(work.band, .high)
 
         // Back-compat (#642): the golden is emitted from a HEALTHY report, so `config_unreadable` is
-        // ABSENT (not null) and decodes to nil — the `decodeIfPresent` additive-default path. These
-        // are the same bytes a PRE-#642 daemon sends, so the ~40 assertions above are also the proof
-        // that an older daemon's reply still decodes field-for-field: that is what makes the field
-        // safe WITHOUT a `schema` bump. The panel renders no caveat and reads the numbers as the
-        // operator's own.
+        // ABSENT (not null) and decodes to nil — the `decodeIfPresent` additive-default path. A
+        // PRE-#642 daemon's reply lacks the key the same way, so the ~40 assertions above are also the
+        // proof that a reply without it still decodes field-for-field: that is what makes the field
+        // safe WITHOUT a `schema` bump of its own. The panel renders no caveat and reads the numbers as
+        // the operator's own.
         XCTAssertNil(wire.configUnreadable,
                      "a healthy (or pre-#642) daemon omits `config_unreadable` entirely — no caveat to render")
     }
@@ -168,7 +168,9 @@ final class StatsTests: XCTestCase {
         XCTAssertFalse(detail.contains("@"), "no address-shaped token from an echoed config line")
         // The series is still fully served — the panel keeps its best-effort data and qualifies it, rather
         // than losing the tab. That is why the daemon does NOT degrade to an `{"error":…}` envelope here.
-        XCTAssertEqual(wire.schema, 1, "an additive field, so still schema:1 — no bump")
+        XCTAssertEqual(wire.schema, 2,
+                       "an additive field, so no bump of its own — the version is 2 since the session keys "
+                       + "became omittable")
         XCTAssertEqual(wire.series.count, 1, "the series survives the degraded path")
         XCTAssertEqual(try XCTUnwrap(wire.summary.accounts["work"]).capHits, 1)
     }
@@ -871,7 +873,7 @@ final class StatsTests: XCTestCase {
     /// gate survives the DECODE: a misnamed `CodingKey` yields `nil`, which takes the drop path and
     /// would render this exact payload as a confident `0 episodes (0s)`.
     func testAnEmptyRosterReportsUnknownRatherThanAMeasuredZero() throws {
-        let line = #"{"schema":1,"window":{"start":0,"end":604800,"label":"last 7 days","period":"week"},"# +
+        let line = #"{"schema":2,"window":{"start":0,"end":604800,"label":"last 7 days","period":"week"},"# +
                    #""accounts":[],"series":[],"summary":{"roster":{"swap_count":0,"# +
                    #""swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"# +
                    #""all_high_episodes":0,"all_high_secs":0,"all_high_threshold":0.95,"# +
@@ -1048,7 +1050,7 @@ final class StatsTests: XCTestCase {
         guard case .loaded(let wire) = model.phase else {
             return XCTFail("expected .loaded, got \(model.phase)")
         }
-        XCTAssertEqual(wire.schema, 1)
+        XCTAssertEqual(wire.schema, 2)
         XCTAssertEqual(wire.summary.accounts["work"]?.band, .high)
     }
 

@@ -1,0 +1,10 @@
+usage — last 24h (Jun 30–Jul 1)
+
+account  signal      cov  session m/p/p95  weekly m/p/p95  caps  t@cap  share  velocity  runway
+spare    —          100%                —        20/30/30     —      —     0%         —       —
+work     saturated  100%         50/90/85        30/40/38     1     5m   100%  0.2%/min     ~2h
+
+  lowest utilisation: work (session mean 50%)
+  accounts last: ~2 days at the current combined rate (2 of 2 counted)
+t@cap covers at most one poll interval per at-cap reading; all-accounts-high covers each high reading to its own session reset — so the two can differ widely on the same readings
+roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): 0 episodes (0s) · capacity holds: —

@@ -1927,6 +1927,13 @@ fn render_text(report: &Report, config_unreadable: Option<&str>) -> String {
 /// lines are then `0.0`, whereas the water here is carried and IS still stated on `—`. So one
 /// parameter of this cell is stated on a non-reading and the other is not, deliberately.
 ///
+/// The account table spends the same UNKNOWN token on an account with no session window: its
+/// `signal`, `session`, `caps` and `t@cap` cells read `—` exactly as a never-observed account's
+/// do. The token does not tell those two absences apart; only the wire does, by omitting the
+/// session keys from an entry whose `seen` is non-zero. On the piped table the row around the
+/// token names the difference: a weekly-only row reads `—` beside a non-zero `cov`; a
+/// never-observed row reads `—` beside `0%`.
+///
 /// The residual, stated rather than implied: an ABSENT config with an untaken census gets
 /// neither this qualifier (suppressed) nor [`config_regime_line`]'s caveat (no fault to report),
 /// so those two regimes do still print identical bytes. That corner is the one where the
@@ -2314,10 +2321,9 @@ impl SignalBand {
 /// neutral descriptors, never a recommendation or forecast (issue #160).
 fn render_summary(report: &Report) -> String {
     // OBSERVED accounts only — gap honesty. An account can be in the summary with `seen ==
-    // 0` (it held the active credential but the daemon polled a different one), its readings
-    // zeroed rather than measured; ranking its fabricated 0% as the lowest would invent a low
-    // reading the aggregator deliberately never does. The block summarises what was MEASURED,
-    // so an unmeasured account is simply not in it.
+    // 0` (it held the active credential but the daemon polled a different one) and no figures
+    // at all, because nothing was measured for it. The block summarises what was MEASURED, so an
+    // unmeasured account is simply not in it.
     let observed: Vec<(&String, &AccountStats)> = report
         .summary
         .per_account
@@ -2330,17 +2336,19 @@ fn render_summary(report: &Report) -> String {
 
     let mut lines: Vec<String> = Vec::new();
 
-    // Lowest-utilisation account: the smallest session MEAN among the observed — a
-    // magnitude, not a verdict. The handle breaks ties, so the pick is deterministic.
-    if let Some((handle, a)) = observed.iter().min_by(|a, b| {
-        a.1.session
-            .mean
-            .total_cmp(&b.1.session.mean)
-            .then_with(|| a.0.cmp(b.0))
-    }) {
+    // Lowest-utilisation account: the smallest session MEAN among the observed accounts that
+    // carry a session reading — a magnitude, not a verdict. An account with no session window
+    // has no mean to rank, so it stays out of the ranking: ranking it at 0% would name it the
+    // lowest on a reading nobody made. With no ranked account the line is not printed at all.
+    // The handle breaks ties, so the pick is deterministic.
+    if let Some((handle, mean)) = observed
+        .iter()
+        .filter_map(|(handle, a)| a.session.map(|d| (*handle, d.mean)))
+        .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(b.0)))
+    {
         lines.push(format!(
             "  lowest utilisation: {handle} (session mean {}%)",
-            pct(a.session.mean)
+            pct(mean)
         ));
     }
 
@@ -3349,31 +3357,34 @@ fn shade_glyph(v: Option<f64>, ascii: bool) -> char {
 }
 
 /// One account's per-bucket `pick` values across the series, with GAPS (`None`) where the
-/// account had NO reading in that bucket — it is absent from the bucket, or present with
-/// `seen == 0`. Charts render those as breaks, never a fabricated 0% (issue #159 gap
-/// honesty, mirroring the aggregator: an absent bucket is unknown, not calm).
+/// account had NO reading in that bucket — it is absent from the bucket, present with
+/// `seen == 0`, or present with no reading on the picked axis (`pick` returns `None`). Charts
+/// render those as breaks, never a fabricated 0% (issue #159 gap honesty, mirroring the
+/// aggregator: an absent bucket is unknown, not calm).
 fn account_series(
     series: &[UsageReport],
     handle: &str,
-    pick: fn(&AccountStats) -> f64,
+    pick: fn(&AccountStats) -> Option<f64>,
 ) -> Vec<Option<f64>> {
     series
         .iter()
         .map(|b| match b.per_account.get(handle) {
-            Some(a) if a.seen > 0 => Some(pick(a)),
+            Some(a) if a.seen > 0 => pick(a),
             _ => None,
         })
         .collect()
 }
 
-/// The per-bucket session peak — the sparkline / heatmap "how hot did it get" pick.
-fn session_peak(a: &AccountStats) -> f64 {
-    a.session.peak
+/// The per-bucket session peak — the sparkline / heatmap "how hot did it get" pick — or `None`
+/// for a bucket in which the account carried no session reading.
+fn session_peak(a: &AccountStats) -> Option<f64> {
+    a.session.map(|d| d.peak)
 }
 /// The per-bucket session mean — the heatmap "average load" pick (complements the peak
-/// trend so the two views are not the same number twice).
-fn session_mean(a: &AccountStats) -> f64 {
-    a.session.mean
+/// trend so the two views are not the same number twice) — or `None` for a bucket in which
+/// the account carried no session reading.
+fn session_mean(a: &AccountStats) -> Option<f64> {
+    a.session.map(|d| d.mean)
 }
 
 /// A sparkline string for a per-bucket value series: one glyph per bucket, gaps as breaks.
@@ -3517,8 +3528,9 @@ fn col_account() -> Column {
         color: |_| None,
     }
 }
-/// The neutral `signal` class word (`—` for an unobserved account — gap honesty), tinted by its
-/// symmetric emphasis SGR when colour is on (the tint is dropped on the piped surface).
+/// The neutral `signal` class word (`—` for an unobserved account or one with no session window —
+/// gap honesty), tinted by its symmetric emphasis SGR when colour is on (the tint is dropped on
+/// the piped surface).
 fn col_signal() -> Column {
     Column {
         header: "signal",
@@ -3541,18 +3553,20 @@ fn col_cov() -> Column {
     }
 }
 /// The full `session` `mean/peak/p95` triple (the WIDE piped surface; the TTY keeps the compact
-/// [`col_session_compact`]). Part of the `account · signal · session` floor — never dropped.
+/// [`col_session_compact`]), `—` for an account with no session reading. Part of the
+/// `account · signal · session` floor — never dropped.
 fn col_session_triple() -> Column {
     Column {
         header: "session m/p/p95",
         lead_gap: 2,
         align: Align::Right,
         priority: None,
-        cell: |r| triple(&r.stats.session),
+        cell: |r| triple(r.stats.session.as_ref()),
         color: |_| None,
     }
 }
-/// The compact `session` `mean/peak` (the TTY surface), tinted by the session-peak band.
+/// The compact `session` `mean/peak` (the TTY surface), tinted by the session-peak band — or an
+/// untinted `—` for an account with no session reading, which has no band to tint by.
 fn col_session_compact() -> Column {
     Column {
         header: "session",
@@ -3560,51 +3574,68 @@ fn col_session_compact() -> Column {
         align: Align::Right,
         priority: None,
         cell: |r| session_cell(r.stats),
-        color: |r| Some(Band::of(r.stats.session.peak).sgr()),
+        color: |r| r.stats.session.map(|d| Band::of(d.peak).sgr()),
     }
 }
-/// The full `weekly` `mean/peak/p95` triple (the WIDE piped surface).
+/// The full `weekly` `mean/peak/p95` triple (the WIDE piped surface), `—` for an account with no
+/// weekly reading.
 fn col_weekly_triple() -> Column {
     Column {
         header: "weekly m/p/p95",
         lead_gap: 2,
         align: Align::Right,
         priority: None,
-        cell: |r| triple(&r.stats.weekly),
+        cell: |r| triple(r.stats.weekly.as_ref()),
         color: |_| None,
     }
 }
-/// The compact `weekly` peak percent (the TTY surface), tinted by the weekly-peak band; drops
-/// after `trend` / `velocity` / `runway` under a narrow terminal.
+/// The compact `weekly` peak percent (the TTY surface), tinted by the weekly-peak band — or an
+/// untinted `—` for an account with no weekly reading; drops after `trend` / `velocity` /
+/// `runway` under a narrow terminal.
 fn col_weekly_peak() -> Column {
     Column {
         header: "weekly",
         lead_gap: 2,
         align: Align::Right,
         priority: Some(5),
-        cell: |r| format!("{}%", pct(r.stats.weekly.peak)),
-        color: |r| Some(Band::of(r.stats.weekly.peak).sgr()),
+        cell: |r| {
+            r.stats
+                .weekly
+                .map_or_else(|| "—".to_owned(), |d| format!("{}%", pct(d.peak)))
+        },
+        color: |r| r.stats.weekly.map(|d| Band::of(d.peak).sgr()),
     }
 }
-/// `caps` — cap-hit count (piped-only wide column).
+/// `caps` — cap-hit count (piped-only wide column), `—` for an account with no session reading:
+/// a cap count is a statistic of the session series, and a `0` would read as a measured "never
+/// reached the cap".
 fn col_caps() -> Column {
     Column {
         header: "caps",
         lead_gap: 2,
         align: Align::Right,
-        priority: None,
-        cell: |r| r.stats.cap_hits.to_string(),
+        priority: Some(6),
+        cell: |r| {
+            r.stats
+                .cap_hits
+                .map_or_else(|| "—".to_owned(), |n| n.to_string())
+        },
         color: |_| None,
     }
 }
-/// `t@cap` — coarse time-at-cap duration (piped-only wide column).
+/// `t@cap` — coarse time-at-cap duration (piped-only wide column), `—` for an account with no
+/// session reading, for the reason [`col_caps`] gives.
 fn col_time_at_cap() -> Column {
     Column {
         header: "t@cap",
         lead_gap: 2,
         align: Align::Right,
         priority: None,
-        cell: |r| fmt_dur(r.stats.time_at_cap_secs),
+        cell: |r| {
+            r.stats
+                .time_at_cap_secs
+                .map_or_else(|| "—".to_owned(), fmt_dur)
+        },
         color: |_| None,
     }
 }
@@ -4006,7 +4037,9 @@ fn render_heatmap(
 /// The per-account session-distribution gauge: a 0–100% track marking `mean` (`m`), `p95`
 /// (`P`) and `peak` (`x`), with the exact percents alongside so the distribution reads in
 /// text without colour. `None` when the terminal is too narrow for a readable track. On a
-/// marker collision the higher statistic wins the cell (peak over p95 over mean).
+/// marker collision the higher statistic wins the cell (peak over p95 over mean). An account
+/// with no session reading keeps its row as a bare track with no marker beside the gap
+/// sentinel `—` — a gap, never a zero gauge.
 fn render_percentiles(
     report: &Report,
     accounts: &[&String],
@@ -4020,18 +4053,19 @@ fn render_percentiles(
         ('─', '┤', '├')
     };
     let label_w = accounts.iter().map(|h| display_width(h)).max().unwrap_or(0);
-    // The widest "NN% · NN% · NN%" trailer, so every gauge shares one width and aligns.
-    let trailer = |a: &AccountStats| {
-        format!(
-            "{}% · {}% · {}%",
-            pct(a.session.mean),
-            pct(a.session.p95),
-            pct(a.session.peak)
-        )
-    };
-    let trailer_w = accounts
+    // Each account's session figures, read once: `None` for an account with no session reading.
+    let rows: Vec<_> = accounts
         .iter()
-        .map(|&h| display_width(&trailer(&summary.per_account[h])))
+        .map(|&h| (h, summary.per_account[h].session))
+        .collect();
+    // The widest "NN% · NN% · NN%" trailer, so every gauge shares one width and aligns.
+    let trailer = |d: Option<crate::usage_stats::DimStats>| match d {
+        Some(d) => format!("{}% · {}% · {}%", pct(d.mean), pct(d.p95), pct(d.peak)),
+        None => "—".to_owned(),
+    };
+    let trailer_w = rows
+        .iter()
+        .map(|&(_, d)| display_width(&trailer(d)))
         .max()
         .unwrap_or(0);
     // line = label + "  " + lb + gauge + rb + "  " + trailer; brackets are one cell each.
@@ -4041,18 +4075,19 @@ fn render_percentiles(
     }
     let pos = |v: f64| (v.clamp(0.0, 1.0) * (gauge_w - 1) as f64).round() as usize;
     let mut out = String::from("session distribution — mean · p95 · peak\n");
-    for &h in accounts {
-        let a = &summary.per_account[h];
+    for &(h, d) in &rows {
         let mut buf = vec![track; gauge_w];
-        // Lower statistic first, so a higher one overwrites it on a shared cell.
-        buf[pos(a.session.mean)] = 'm';
-        buf[pos(a.session.p95)] = 'P';
-        buf[pos(a.session.peak)] = 'x';
+        if let Some(d) = d {
+            // Lower statistic first, so a higher one overwrites it on a shared cell.
+            buf[pos(d.mean)] = 'm';
+            buf[pos(d.p95)] = 'P';
+            buf[pos(d.peak)] = 'x';
+        }
         let gauge: String = buf.into_iter().collect();
         out.push_str(&format!(
             "{}  {lb}{gauge}{rb}  {}\n",
             pad_end(h, label_w),
-            trailer(a),
+            trailer(d),
         ));
     }
     Some(out)
@@ -4168,10 +4203,10 @@ mod tests {
             seen,
             expected: 1.0,
             coverage: 1.0,
-            session,
-            weekly: ds(0.0, weekly_peak, 0.0),
-            cap_hits: 0,
-            time_at_cap_secs: 0,
+            session: Some(session),
+            weekly: Some(ds(0.0, weekly_peak, 0.0)),
+            cap_hits: Some(0),
+            time_at_cap_secs: Some(0),
             contribution_share: share,
         }
     }
@@ -4855,9 +4890,10 @@ mod tests {
         // halves are independent: sizing to content is not a licence to left-align, and aligning
         // right is not a return to fixed-width fields.
         // The piped-contract risk was resolved before reflowing:
-        // no workflow parses piped column positions; `--json schema:1` is the machine contract. It
-        // still pins the exact bytes so a future SILENT reflow (reordered / re-spaced columns) is
-        // caught — the circular `piped == render_text` check cannot see a layout regression.
+        // no workflow parses piped column positions; the versioned `--json` wire is the machine
+        // contract. It still pins the exact bytes so a future SILENT reflow (reordered /
+        // re-spaced columns) is caught — the circular `piped == render_text` check cannot see a
+        // layout regression.
         //
         // The validity-rule note above the roster line is issue #1098's: this view is the only one
         // rendering BOTH `t@cap` and the all-accounts-high census, and until it landed nothing said
@@ -5749,11 +5785,11 @@ mod tests {
 
     #[test]
     fn charts_never_leak_into_the_json_wire() {
-        // The charts are presentation-only: the schema:1 wire carries no glyph, no ANSI, no
+        // The charts are presentation-only: the `--json` wire carries no glyph, no ANSI, no
         // chart field — the #158 contract is unchanged by #159.
         let json = render_json(&two_account_charts(), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["schema"], 1);
+        assert_eq!(v["schema"], 2);
         assert!(!json.contains('\x1b'));
         for glyph in ['▁', '▂', '█', '░', '▒', '▓', '┤', '├', '─'] {
             assert!(
@@ -6131,7 +6167,8 @@ mod tests {
             "read the 3 samples"
         );
         assert_eq!(
-            report.summary.per_account["work"].cap_hits, 2,
+            report.summary.per_account["work"].cap_hits,
+            Some(2),
             "0.85 and 0.99 are both ≥ the 0.80 cap"
         );
         assert_eq!(
@@ -6142,7 +6179,7 @@ mod tests {
         assert!(read.rollup.daily.is_empty());
     }
 
-    // --- AC 5: --json schema:1 stable + redacted ------------------------------
+    // --- AC 5: the versioned --json wire stable + redacted ---------------------
 
     fn report_fixture() -> Report {
         let now = epoch("2026-07-01T12:00:00Z");
@@ -6159,10 +6196,10 @@ mod tests {
     }
 
     #[test]
-    fn json_is_schema_1_with_series_summary_and_window() {
+    fn json_is_schema_2_with_series_summary_and_window() {
         let json = render_json(&report_fixture(), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["schema"], 1);
+        assert_eq!(v["schema"], 2);
         assert_eq!(v["window"]["period"], "day");
         assert!(v["window"]["label"]
             .as_str()
@@ -7214,8 +7251,9 @@ mod tests {
         assert_eq!(roster["all_high_threshold"], 0.95);
         assert_eq!(roster["all_high_covered_secs"], 21_600);
         assert_eq!(
-            v["schema"], 1,
-            "both keys are ADDITIVE — no existing field changed, so `schema` does not move"
+            v["schema"], 2,
+            "both keys are ADDITIVE — no existing field changed, so they bump no `schema` of their \
+             own"
         );
         // The series buckets carry them too, so a per-bucket reader is not left guessing.
         assert_eq!(v["series"][0]["roster"]["all_high_threshold"], 0.95);
@@ -7254,9 +7292,9 @@ mod tests {
             degraded["summary"]["roster"]
         );
 
-        // Additive: `schema` does not move, and a per-bucket reader gets the same regime as the
-        // summary — one report, one census, one set.
-        assert_eq!(degraded["schema"], 1);
+        // Additive: the key bumps no `schema` of its own, and a per-bucket reader gets the same
+        // regime as the summary — one report, one census, one set.
+        assert_eq!(degraded["schema"], 2);
         assert_eq!(degraded["series"][0]["roster"]["census_over_roster"], false);
         assert_eq!(
             configured["series"][0]["roster"]["census_over_roster"],
@@ -7278,10 +7316,10 @@ mod tests {
         let out = render_text(&report, None);
         assert!(out.contains("no per-account usage in this window"));
         assert!(out.contains("0 swaps"));
-        // JSON of an empty window is still a valid schema:1 document.
+        // JSON of an empty window is still a valid document at the current schema.
         let v: serde_json::Value =
             serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
-        assert_eq!(v["schema"], 1);
+        assert_eq!(v["schema"], 2);
         assert!(v["summary"]["accounts"].as_object().unwrap().is_empty());
     }
 
@@ -7566,19 +7604,10 @@ mod tests {
     }
 
     /// A minimal, fully-deterministic report exercising every `--json` wire field once —
-    /// one account (band `high`, coverage `complete`), one series bucket, a session swap,
+    /// one account with every figure (band `high`, coverage `complete`) beside one with no
+    /// session window, whose entry omits the session keys, one series bucket, a session swap,
     /// and a UTC (offset 0) `day` window. Small enough to freeze byte-for-byte.
     fn wire_golden_report() -> Report {
-        let acct = AccountStats {
-            seen: 3,
-            expected: 3.0,
-            coverage: 1.0,
-            session: ds(0.50, 0.90, 0.85),
-            weekly: ds(0.30, 0.40, 0.38),
-            cap_hits: 1,
-            time_at_cap_secs: 300,
-            contribution_share: 1.0,
-        };
         let roster = RosterStats {
             swap_count: 1,
             swaps: crate::usage_stats::SwapBreakdown {
@@ -7599,7 +7628,12 @@ mod tests {
         };
         let bucket = |start, end| UsageReport {
             period: Period::new(start, end),
-            per_account: [("work".to_string(), acct)].into_iter().collect(),
+            per_account: [
+                ("work".to_string(), work_stats()),
+                ("spare".to_string(), spare_stats()),
+            ]
+            .into_iter()
+            .collect(),
             roster,
         };
         Report {
@@ -7722,7 +7756,7 @@ mod tests {
             "the charts view carries the roster block"
         );
 
-        // The band is HUMAN-only — none of its vocabulary reaches the schema:1 wire (which
+        // The band is HUMAN-only — none of its vocabulary reaches the `--json` wire (which
         // keeps the finer per-account `band`/`coverage_class` enums, byte-stable vs #159).
         let json = render_json(&report_fixture(), None).unwrap();
         for token in [
@@ -9069,9 +9103,14 @@ mod tests {
                 report.velocity[handle].weekly_headroom, None,
                 "{handle} contributes no head-room — excluded, not zero-burned"
             );
+            let weekly_peak = |h: &str| {
+                report.summary.per_account[h]
+                    .weekly
+                    .expect("every reading carries a weekly value")
+                    .peak
+            };
             assert!(
-                report.summary.per_account["spare"].weekly.peak
-                    < report.summary.per_account[handle].weekly.peak,
+                weekly_peak("spare") < weekly_peak(handle),
                 "the counted account sits further from its ceiling than excluded {handle}"
             );
         }
@@ -10644,17 +10683,18 @@ mod tests {
         }
     }
 
-    // --- AC: --json schema:1 stays byte-stable vs #158/#159 --------------------------
+    // --- AC: the versioned --json wire stays byte-stable vs #158/#159 -----------------
 
-    /// The frozen schema:1 wire. #160 is HUMAN-render only — it adds no field, no
-    /// recommendation, no glyph — so this is the #158/#159 contract plus, since issue #804,
-    /// the roster block's two ADDITIVE census fields (`all_high_threshold` +
-    /// `all_high_covered_secs`), and since issue #866 its third (`census_over_roster`, the
-    /// census's SET). Additive is why `schema` still reads `1`: no existing field
-    /// changed type, name, order or meaning, so every pre-#804 reader decodes these bytes
-    /// exactly as before.
+    /// The frozen wire. #160 is HUMAN-render only — it adds no field, no recommendation, no
+    /// glyph — so this is the #158/#159 contract plus, since issue #804, the roster block's two
+    /// ADDITIVE census fields (`all_high_threshold` + `all_high_covered_secs`), and since issue
+    /// #866 its third (`census_over_roster`, the census's SET). Those three moved no `schema`:
+    /// no existing field changed type, name, order or meaning. `schema` reads `2` because the
+    /// session-keyed keys became omittable — an existing key's presence changed — which the
+    /// second account here pins: `spare` has no session window, so its entry carries no session
+    /// key at all.
     const WIRE_GOLDEN: &str = r#"{
-  "schema": 1,
+  "schema": 2,
   "window": {
     "start": 1782864000,
     "end": 1782907200,
@@ -10689,6 +10729,17 @@ mod tests {
         "capacity_weekly_line": 0.0
       },
       "accounts": {
+        "spare": {
+          "seen": 3,
+          "coverage": 1.0,
+          "coverage_class": "complete",
+          "weekly": {
+            "mean": 0.2,
+            "peak": 0.3,
+            "p95": 0.3
+          },
+          "contribution_share": 0.0
+        },
         "work": {
           "seen": 3,
           "coverage": 1.0,
@@ -10735,6 +10786,17 @@ mod tests {
       "capacity_weekly_line": 0.0
     },
     "accounts": {
+      "spare": {
+        "seen": 3,
+        "coverage": 1.0,
+        "coverage_class": "complete",
+        "weekly": {
+          "mean": 0.2,
+          "peak": 0.3,
+          "p95": 0.3
+        },
+        "contribution_share": 0.0
+      },
       "work": {
         "seen": 3,
         "coverage": 1.0,
@@ -10768,8 +10830,8 @@ mod tests {
         assert_eq!(
             render_json(&wire_golden_report(), None).unwrap(),
             WIRE_GOLDEN,
-            "the schema:1 wire drifted — only an ADDITIVE change (a new key, as issue #804 \
-             made) may move these bytes without a `schema` bump"
+            "the frozen wire drifted — only an ADDITIVE change (a new key, as issue #804 made) \
+             may move these bytes without a `schema` bump"
         );
     }
 
@@ -10859,78 +10921,6 @@ mod tests {
         assert_eq!((col_session_triple().cell)(&row), "42/42/42");
         assert_eq!((col_caps().cell)(&row), "0");
         assert_eq!((col_time_at_cap().cell)(&row), "0s");
-    }
-
-    /// Issue #1600, the interim on the wire and in the table: under `"schema":1` an account whose
-    /// readings carry no session value serialises the all-zero `session` block, the `idle` band
-    /// and zero cap counts, and no `velocity` object; its table row reads `underused` and `0/0`,
-    /// with no `velocity` or `runway` column. Those zeros are the interim representation, not a
-    /// measurement. Issue #1601 replaces them with an omission under schema 2 and deletes this
-    /// test.
-    #[test]
-    fn an_account_with_no_session_reading_wires_the_interim_zero_block_and_no_velocity_under_schema_1(
-    ) {
-        let now = epoch("2026-07-01T12:00:00Z");
-        let report = velocity_report(
-            vec![
-                sample_from_line(now - 900, "work", None, Some(0.30)),
-                sample_from_line(now - 600, "work", None, Some(0.31)),
-                sample_from_line(now - 300, "work", None, Some(0.32)),
-            ],
-            now,
-        );
-
-        let v: serde_json::Value =
-            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
-        assert_eq!(v["schema"], 1, "T8: the wire is still schema 1");
-        let work = &v["summary"]["accounts"]["work"];
-        assert_eq!(
-            work["session"],
-            serde_json::json!({"mean": 0.0, "peak": 0.0, "p95": 0.0}),
-            "T8: the interim zero session block: {work}"
-        );
-        assert_eq!(work["band"], "idle", "T8: the zero summary's band: {work}");
-        assert_eq!(work["cap_hits"], 0, "T8: no cap hit: {work}");
-        assert_eq!(
-            work["time_at_cap_secs"], 0,
-            "T8: no time at the cap: {work}"
-        );
-        assert_eq!(
-            work["weekly"]["peak"], 0.32,
-            "T8: the weekly figures are over the weekly readings: {work}"
-        );
-        assert!(
-            work.get("velocity").is_none(),
-            "T8: an unknown session rate omits the velocity object: {work}"
-        );
-
-        let table = render_chart_table(&report, &keys(&report), 120, false, false);
-        let header: Vec<&str> = table
-            .lines()
-            .next()
-            .expect("T8: the table has a header line")
-            .split_whitespace()
-            .collect();
-        assert!(
-            !header.contains(&"velocity"),
-            "T8: the all-unknown velocity column is elided: {table}"
-        );
-        assert!(
-            !header.contains(&"runway"),
-            "T8: the all-unknown runway column is elided: {table}"
-        );
-        let row: Vec<&str> = table
-            .lines()
-            .find(|line| line.split_whitespace().next() == Some("work"))
-            .expect("T8: the table has a `work` row")
-            .split_whitespace()
-            .take(3)
-            .collect();
-        assert_eq!(
-            row,
-            ["work", "underused", "0/0"],
-            "T8: the zero summary's signal word and session cell: {table}"
-        );
     }
 
     // --- AC: degenerate periods render a neutral summary without panic ---------------
@@ -11125,7 +11115,7 @@ mod tests {
     #[test]
     fn json_omits_orphans_key_when_no_orphans() {
         // Roster covers every present handle → no orphans → the key is omitted entirely
-        // (additive to schema:1; a consumer sees `orphans` only when there are some).
+        // (additive, no bump; a consumer sees `orphans` only when there are some).
         let live = roster(&["work", "spare", "backup", "third"]);
         let json = render_json(&orphan_report(Some(&live)), None).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -11362,7 +11352,7 @@ mod tests {
         let now = epoch("2026-07-08T00:00:00Z");
         let reply = stats_socket_json(&data(vec![], ""), now, 0, Some("week"));
         let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(v["schema"], 1);
+        assert_eq!(v["schema"], 2);
         assert_eq!(
             v["series"].as_array().unwrap().len(),
             7,
@@ -11434,7 +11424,10 @@ mod tests {
             v.as_object().unwrap().get("config_unreadable").is_none(),
             "a healthy config must leave NO trace on the wire (absent, not null): {v}"
         );
-        assert_eq!(v["schema"], 1, "an additive field does not bump `schema`");
+        assert_eq!(
+            v["schema"], 2,
+            "an additive field bumps no `schema` of its own"
+        );
     }
 
     #[test]
@@ -11470,8 +11463,8 @@ mod tests {
         assert!(v.get("error").is_none(), "not an error envelope: {v}");
         assert!(v["summary"]["accounts"].is_object(), "series still served");
         assert_eq!(
-            v["schema"], 1,
-            "and still `schema:1` — the field is additive"
+            v["schema"], 2,
+            "and `schema` is unmoved by this field — it is additive"
         );
     }
 
@@ -11523,7 +11516,7 @@ mod tests {
             "the offending key still reaches the daemon log, just not the wire"
         );
         // Still a FULL document — the panel keeps its series and annotates it.
-        assert_eq!(v["schema"], 1);
+        assert_eq!(v["schema"], 2);
         assert_eq!(v["series"].as_array().unwrap().len(), 7);
 
         // And the ABSENT-config counterpart over the SAME path leaves no trace.
@@ -11888,10 +11881,10 @@ mod tests {
                 seen,
                 expected: 12.0,
                 coverage,
-                session,
-                weekly,
-                cap_hits,
-                time_at_cap_secs,
+                session: Some(session),
+                weekly: Some(weekly),
+                cap_hits: Some(cap_hits),
+                time_at_cap_secs: Some(time_at_cap_secs),
                 contribution_share: share,
             }
         }
@@ -12378,18 +12371,18 @@ mod tests {
                                 seen: 0,
                                 expected: 12.0,
                                 coverage: 0.0,
-                                session: crate::usage_stats::DimStats {
+                                session: Some(crate::usage_stats::DimStats {
                                     mean: 0.0,
                                     peak: 0.0,
                                     p95: 0.0,
-                                },
-                                weekly: crate::usage_stats::DimStats {
+                                }),
+                                weekly: Some(crate::usage_stats::DimStats {
                                     mean: 0.0,
                                     peak: 0.0,
                                     p95: 0.0,
-                                },
-                                cap_hits: 0,
-                                time_at_cap_secs: 0,
+                                }),
+                                cap_hits: Some(0),
+                                time_at_cap_secs: Some(0),
                                 contribution_share: 0.0,
                             },
                         )
@@ -12408,6 +12401,91 @@ mod tests {
                 series: Vec::new(),
                 orphans: BTreeMap::new(),
                 velocity: BTreeMap::new(),
+                ..base
+            }
+        }
+
+        /// A full account beside one with NO session window: `work` carries both windows, while
+        /// every reading of `spare` carries a weekly value and no session value. The aggregate
+        /// holds `None` for `spare`'s session figures and cap counts, so its row reads the gap
+        /// sentinel `—` in every session-keyed cell — `signal`, `session`, `caps`, `t@cap`, and
+        /// `velocity` / `runway`, whose session rate is unknown — with no colour, while its weekly
+        /// cells carry its weekly figures. In the TTY charts its trend and heatmap buckets are
+        /// breaks rather than a zero bar, it takes no rank in the `lowest utilisation` line, and
+        /// its gauge row is a bare track beside `—`.
+        ///
+        /// `work`'s velocity overlay keeps the `velocity` / `runway` columns from eliding, so
+        /// `spare`'s `—` in them is on the page. `spare`'s known weekly rate counts it in the
+        /// fleet runway: a weekly fact, with no session figure behind it.
+        fn weekly_only_report() -> Report {
+            let base = golden_report();
+            let d = |mean, peak, p95| crate::usage_stats::DimStats { mean, peak, p95 };
+            let work = acct(
+                12,
+                1.0,
+                d(0.50, 0.90, 0.85),
+                d(0.30, 0.40, 0.38),
+                1,
+                300,
+                1.0,
+            );
+            // Spelled out rather than built by `acct`, whose figures are always present.
+            let spare = AccountStats {
+                seen: 12,
+                expected: 12.0,
+                coverage: 1.0,
+                session: None,
+                weekly: Some(d(0.20, 0.30, 0.30)),
+                cap_hits: None,
+                time_at_cap_secs: None,
+                contribution_share: 0.0,
+            };
+            // Three hourly buckets, `spare` sampled in each and never with a session reading.
+            let bucket = |mean: f64, peak: f64, start: i64| UsageReport {
+                period: Period::new(start, start + HOUR_SECS),
+                per_account: [
+                    (
+                        "work".to_owned(),
+                        acct(1, 1.0, d(mean, peak, peak), d(0.0, 0.0, 0.0), 0, 0, 0.0),
+                    ),
+                    ("spare".to_owned(), spare),
+                ]
+                .into_iter()
+                .collect(),
+                roster: RosterStats::default(),
+            };
+            Report {
+                summary: UsageReport {
+                    period: base.summary.period,
+                    per_account: [("work".to_owned(), work), ("spare".to_owned(), spare)]
+                        .into_iter()
+                        .collect(),
+                    roster: base.summary.roster,
+                },
+                series: vec![
+                    bucket(0.30, 0.40, 0),
+                    bucket(0.50, 0.70, HOUR_SECS),
+                    bucket(0.70, 0.90, 2 * HOUR_SECS),
+                ],
+                orphans: BTreeMap::new(),
+                velocity: [
+                    (
+                        "work".to_owned(),
+                        vel(
+                            Some(0.01 / 300.0),
+                            Some(0.001 / 300.0),
+                            Some(8_400),
+                            Some(194_400),
+                            Some(0.648),
+                        ),
+                    ),
+                    (
+                        "spare".to_owned(),
+                        vel(None, Some(0.001 / 300.0), None, Some(194_400), Some(0.648)),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
                 ..base
             }
         }
@@ -12551,6 +12629,19 @@ mod tests {
                         None,
                     ),
                 ),
+                // An account with NO session window beside a full one: the gap sentinel `—` in
+                // every session-keyed cell of its row, never a zero reading. Piped for the wide
+                // numeric column set (`caps` / `t@cap` and both triples); the wide colour TTY for
+                // the charts, where its `—` cells carry no tint while its weekly cell keeps its
+                // own, and where its trend, heatmap and gauge rows show the gap.
+                Case::new(
+                    "stats-weekly-only-piped",
+                    render_human(&weekly_only_report(), PIPED, None),
+                ),
+                Case::new(
+                    "stats-weekly-only-wide",
+                    render_human(&weekly_only_report(), WIDE_UNICODE_COLOR, None),
+                ),
             ]
         }
 
@@ -12575,6 +12666,8 @@ mod tests {
             "stats-expiry-wide",
             "stats-sub-threshold-velocity-piped",
             "stats-sub-threshold-velocity-wide",
+            "stats-weekly-only-piped",
+            "stats-weekly-only-wide",
         ];
 
         /// One-time emitter for the committed `stats` render goldens (issue #767).
@@ -12612,6 +12705,8 @@ mod tests {
                 .get_mut("alpha")
                 .expect("`alpha` is in the golden roster")
                 .session
+                .as_mut()
+                .expect("`alpha` carries a session reading")
                 .peak = 0.98; // was 0.99
             render_golden::assert_perturbed_input_is_rejected(
                 "stats",

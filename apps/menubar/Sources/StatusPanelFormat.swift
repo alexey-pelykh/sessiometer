@@ -2330,14 +2330,49 @@ enum StatusPanelFormat {
     }
 
     /// The Stats row's "Session m/pk" cell — mean then peak, mock `.sc-val` "42 / 100%" (the mean bare, the
-    /// peak carrying the single trailing `%`).
+    /// peak carrying the single trailing `%`) — or `n/a` for an account with no session reading, the
+    /// unknown token `pct` already prints, never a `0 / 0%` nobody measured. The `n/a` is transitional
+    /// until #1594 renders the classified state.
     static func statsSessionMeanPeak(_ account: StatsAccountStats) -> String {
-        "\(statsPercent(account.session.mean)) / \(statsPercent(account.session.peak))%"
+        guard let session = account.session else { return "n/a" }
+        return "\(statsPercent(session.mean)) / \(statsPercent(session.peak))%"
     }
 
-    /// The Stats row's "Weekly pk" cell — the weekly peak percent, mock `.sc-val` "88%".
+    /// The Stats row's "Weekly pk" cell — the weekly peak percent, mock `.sc-val` "88%" — or `n/a` for an
+    /// account with no weekly reading, transitional in the same way as the session cell.
     static func statsWeeklyPeak(_ account: StatsAccountStats) -> String {
-        "\(statsPercent(account.weekly.peak))%"
+        guard let weekly = account.weekly else { return "n/a" }
+        return "\(statsPercent(weekly.peak))%"
+    }
+
+    /// The Stats row's "Cap-hits" cell — the bare count — or `n/a` for an account with no session reading:
+    /// a cap count is a statistic of the session series, and a `0` would read as a measured "never reached
+    /// the cap". Lifted out of the row view so the cell's value is unit-asserted.
+    static func statsCapHits(_ account: StatsAccountStats) -> String {
+        account.capHits.map { "\($0)" } ?? "n/a"
+    }
+
+    /// The Stats row's spoken summary — identity, then the signal and the numeric body, so the sparkline
+    /// (accessibility-hidden, a purely visual trend) is still conveyed as facts. A clause whose figure the
+    /// account does not carry is left out rather than spoken as a zero: no signal clause without a `band`,
+    /// no session or cap-hit clause without a session reading, no weekly clause without a weekly one.
+    /// Lifted out of the row view so the spoken string is unit-asserted.
+    static func statsRowAccessibilityLabel(handle: String, account: StatsAccountStats, isActive: Bool) -> String {
+        var clauses = ["\(handle)\(isActive ? ", active" : "")."]
+        if let signal = statsSignal(account.band) {
+            clauses.append("\(signal.label).")
+        }
+        if let session = account.session {
+            clauses.append("Session mean \(statsPercent(session.mean)) percent, "
+                + "peak \(statsPercent(session.peak)) percent.")
+        }
+        if let weekly = account.weekly {
+            clauses.append("Weekly peak \(statsPercent(weekly.peak)) percent.")
+        }
+        if let capHits = account.capHits {
+            clauses.append("\(capHits) cap hits.")
+        }
+        return clauses.joined(separator: " ")
     }
 
     /// The honest one-line message the Stats tab shows when the query did not yield a series — never a blank
@@ -2388,8 +2423,10 @@ enum StatusPanelFormat {
         }
     }
 
-    /// Collapse a wire `band` into the mock's three-way signal (see `StatSignal`).
-    static func statsSignal(_ band: StatsBand) -> StatSignal {
+    /// Collapse a wire `band` into the mock's three-way signal (see `StatSignal`) — or `nil` for an absent
+    /// `band`, which draws no pill: an account with no session reading has no session peak to classify.
+    static func statsSignal(_ band: StatsBand?) -> StatSignal? {
+        guard let band else { return nil }
         switch band {
         case .idle, .low: return .underused
         case .moderate: return .balanced
@@ -2610,10 +2647,22 @@ enum StatusPanelFormat {
 
     /// The per-bucket session-peak series for `handle`, in bucket order — the CLI trend sparkline's pick
     /// (`src/stats.rs`: "the per-bucket session peak — the sparkline 'how hot did it get' pick"). A bucket
-    /// with no reading for the handle plots at the floor (`0`), honestly — the aggregator never invents a
-    /// reading, and neither does this: an unmeasured bucket is a real low, not a gap the sparkline hides.
+    /// with no entry for the handle, or with a `seen == 0` entry (the aggregate's contribution-only record,
+    /// which holds no reading on any axis), plots at the floor (`0`): an unmeasured bucket is a real low,
+    /// not a gap the sparkline hides.
+    ///
+    /// An account with NO session window draws no line at all: when any bucket holds a SAMPLED entry for
+    /// the handle (`seen > 0`) that carries no session reading, the series is empty — never a floor line,
+    /// which would plot a zero for readings nobody made. The empty series is transitional until #1594
+    /// renders the classified state, and it costs the whole line, earlier peaks included, of an account
+    /// whose session window disappeared partway through the window.
     static func sparkSeries(_ series: [StatsBucket], handle: String) -> [Double] {
-        series.map { $0.accounts[handle]?.session.peak ?? 0 }
+        let hasASampledBucketWithNoSessionReading = series.contains { bucket in
+            guard let entry = bucket.accounts[handle] else { return false }
+            return entry.seen > 0 && entry.session == nil
+        }
+        if hasASampledBucketWithNoSessionReading { return [] }
+        return series.map { $0.accounts[handle]?.session?.peak ?? 0 }
     }
 
     /// Map a value series to sparkline vertices in a `width` × `height` box, on the FIXED [0, 1] (0–100% of
