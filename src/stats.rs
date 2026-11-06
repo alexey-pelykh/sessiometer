@@ -3614,7 +3614,7 @@ fn col_caps() -> Column {
         header: "caps",
         lead_gap: 2,
         align: Align::Right,
-        priority: Some(6),
+        priority: None,
         cell: |r| {
             r.stats
                 .cap_hits
@@ -5163,7 +5163,7 @@ mod tests {
     #[test]
     fn the_signal_cell_is_a_dash_for_an_unobserved_account_never_a_fabricated_class() {
         // Gap honesty at the CELL level (§D-STA-5): an OBSERVED account carries its neutral class
-        // word; an unobserved one (`seen == 0`, zeroed readings) shows `—`, never a fabricated
+        // word; an unobserved one (`seen == 0`, no measured reading) shows `—`, never a fabricated
         // "underused". `signal_sgr` leaves both the gap and the balanced middle un-emphasised (an
         // empty SGR would emit a bare reset), colouring only the two symmetric deviations alike.
         assert_eq!(
@@ -10923,6 +10923,44 @@ mod tests {
         assert_eq!((col_time_at_cap().cell)(&row), "0s");
     }
 
+    /// The velocity clause of the omission at its own seam, the whole document: a weekly-only
+    /// summary entry carries its `velocity` object — the weekly rate and runway beside a `null`
+    /// session rate — while the account beside it, with no overlay, carries none. The velocity
+    /// object's other graders sit below this seam (the encoder alone, or a report with no
+    /// overlay), so without this a weekly-only account's weekly rate could drop out of the
+    /// document with every one of them green.
+    #[test]
+    fn the_document_carries_a_weekly_only_accounts_velocity_beside_a_null_session_rate() {
+        let mut report = charts_report(&[("work", work_stats()), ("spare", spare_stats())], &[]);
+        report.velocity.insert(
+            "spare".to_owned(),
+            AccountVelocity {
+                session_rate: None,
+                weekly_rate: Some(0.001 / 300.0),
+                weekly_runway_secs: Some(194_400),
+                weekly_headroom: Some(0.648),
+                ..Default::default()
+            },
+        );
+        let compact = serde_json::to_string(&stats_wire(&report, None)).expect("the frame encodes");
+        let v: serde_json::Value = serde_json::from_str(&compact).expect("the frame is JSON");
+        let accounts = &v["summary"]["accounts"];
+        assert_eq!(
+            accounts["spare"]["velocity"],
+            serde_json::json!({
+                "session_pct_per_min": null,
+                "weekly_pct_per_min": 0.02,
+                "session_runway_secs": null,
+                "weekly_runway_secs": 194_400
+            }),
+            "the weekly-only entry's velocity rides the document: {compact}"
+        );
+        assert!(
+            accounts["work"].get("velocity").is_none(),
+            "no overlay, no velocity key: {compact}"
+        );
+    }
+
     // --- AC: degenerate periods render a neutral summary without panic ---------------
 
     #[test]
@@ -10974,7 +11012,7 @@ mod tests {
 
     #[test]
     fn summary_band_excludes_unsampled_accounts_and_never_fabricates_a_low_reading() {
-        // Gap honesty: an account active but never polled (`seen == 0`, zeroed readings) has
+        // Gap honesty: an account active but never polled (`seen == 0`, no measured reading) has
         // UNKNOWN utilisation. The band must not fabricate it as "underused", and the
         // lowest-utilisation callout must not rank its fabricated 0% mean as the lowest — it
         // ranges over OBSERVED accounts only.
