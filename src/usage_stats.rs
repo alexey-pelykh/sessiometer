@@ -259,25 +259,24 @@ pub(crate) struct AccountStats {
     /// `seen ÷ expected`, clamped to `1.0`. Below 1 means the period is under-sampled
     /// for this account and its metrics should be read with that caveat.
     pub(crate) coverage: f64,
-    /// Session-dimension mean/peak/p95, over the samples that carry a session reading. An
-    /// account none of whose samples carries one holds the finite zero summary here: an INTERIM
-    /// representation, not a measurement, which issue #1601 replaces with an omission under
-    /// `JSON_SCHEMA_VERSION` 2.
-    pub(crate) session: DimStats,
-    /// Weekly-dimension mean/peak/p95, over the samples that carry a weekly reading. An account
-    /// none of whose samples carries one holds the same interim zero summary — not a
-    /// measurement — until issue #1601 replaces it with an omission under `JSON_SCHEMA_VERSION` 2.
-    pub(crate) weekly: DimStats,
+    /// Session-dimension mean/peak/p95, over the samples that carry a session reading — or
+    /// `None` when none of the account's in-period samples carries one: no reading on that axis
+    /// (the account has no five-hour session window, or none was observed on it). No zero
+    /// summary stands in for it.
+    pub(crate) session: Option<DimStats>,
+    /// Weekly-dimension mean/peak/p95, over the samples that carry a weekly reading — or `None`
+    /// when none of them carries one: no reading on that axis, and no zero summary in its place.
+    pub(crate) weekly: Option<DimStats>,
     /// Samples whose session reading is present and `>= session_cap` (inclusive at the
-    /// boundary). The `0` of an account with no session reading is the same interim
-    /// representation as `session`'s zero summary, not a measured "never at the cap"; issue
-    /// #1601 replaces it with an omission under `JSON_SCHEMA_VERSION` 2.
-    pub(crate) cap_hits: u32,
+    /// boundary). `None` exactly when [`session`](AccountStats::session) is: a cap count is a
+    /// statistic of the session series, so an account with no session reading has none — where a
+    /// `0` would read as a measured "never reached the cap". An account whose present readings all
+    /// sit under the cap holds `Some(0)`.
+    pub(crate) cap_hits: Option<u32>,
     /// Sampled seconds spent at/above the session cap — the summed forward-coverage
-    /// windows of the cap-hit samples (gap-honest: a gap adds nothing). The `0` of an account
-    /// with no session reading is the same interim representation as `cap_hits`'s, not a
-    /// measured "never at the cap"; issue #1601 replaces it with an omission under
-    /// `JSON_SCHEMA_VERSION` 2.
+    /// windows of the cap-hit samples (gap-honest: a gap adds nothing). `None` exactly when
+    /// [`session`](AccountStats::session) is, for the reason [`cap_hits`](AccountStats::cap_hits)
+    /// gives; `Some(0)` for an account whose present session readings never reached the cap.
     ///
     /// Purely CADENCE-anchored ([`validity_windows`]) and DECIDED to stay so — unlike the two
     /// censuses, which anchor a qualifying reading to its own carried expiry. Since issue #1030
@@ -298,7 +297,7 @@ pub(crate) struct AccountStats {
     /// figure would read the whole window beside a fractional `cov` with no denominator to
     /// reconcile them — the same test pins both halves of that pair. Read the ADR before
     /// re-deriving it.
-    pub(crate) time_at_cap_secs: i64,
+    pub(crate) time_at_cap_secs: Option<i64>,
     /// The fraction of the period's observations made while THIS account was the active
     /// (swapped-in) credential, from the swap-active spans. Across all accounts these
     /// shares sum to 1 (a single active account → 1.0); `0.0` for an account that held
@@ -560,14 +559,33 @@ pub(crate) fn aggregate_with_roster(
         let weekly: Vec<f64> = group.iter().filter_map(|s| s.weekly).collect();
         let seen = group.len() as u32;
 
+        // A dimension none of the samples carries has no figures at all: `None`, never the
+        // summary of an empty series.
+        let session_figures = if session.is_empty() {
+            None
+        } else {
+            Some(dim_stats(&session))
+        };
+        let weekly_figures = if weekly.is_empty() {
+            None
+        } else {
+            Some(dim_stats(&weekly))
+        };
+
+        // The two cap counts are statistics of the session series, so they exist exactly when
+        // it does: an account with no session reading has no count, where a present reading
+        // under the cap counts a measured `0`.
         let windows = validity_windows(group, period, params.stale_after_secs);
-        let cap_hits = session.iter().filter(|&&v| v >= params.session_cap).count() as u32;
-        let time_at_cap_secs = windows
-            .iter()
-            .zip(group.iter())
-            .filter(|(_, s)| s.session.is_some_and(|v| v >= params.session_cap))
-            .map(|((lo, hi), _)| hi - lo)
-            .sum();
+        let cap_hits = session_figures
+            .map(|_| session.iter().filter(|&&v| v >= params.session_cap).count() as u32);
+        let time_at_cap_secs = session_figures.map(|_| {
+            windows
+                .iter()
+                .zip(group.iter())
+                .filter(|(_, s)| s.session.is_some_and(|v| v >= params.session_cap))
+                .map(|((lo, hi), _)| hi - lo)
+                .sum()
+        });
 
         let share = share_of(&contribution, acct, total_obs);
         per_account.insert(
@@ -576,8 +594,8 @@ pub(crate) fn aggregate_with_roster(
                 seen,
                 expected,
                 coverage: (f64::from(seen) / expected).min(1.0),
-                session: dim_stats(&session),
-                weekly: dim_stats(&weekly),
+                session: session_figures,
+                weekly: weekly_figures,
                 cap_hits,
                 time_at_cap_secs,
                 contribution_share: share,
@@ -587,8 +605,8 @@ pub(crate) fn aggregate_with_roster(
 
     // An account that was active for some observations but never itself sampled in the
     // period (the daemon polled a different account) still holds a contribution share —
-    // record it with zeroed readings so the shares always sum to 1 (gap honesty: active
-    // time is known, its utilisation is not).
+    // record it with no figures on either axis so the shares always sum to 1 (gap honesty:
+    // active time is known, its utilisation is not).
     for acct in contribution.keys() {
         per_account
             .entry(acct.clone())
@@ -596,10 +614,10 @@ pub(crate) fn aggregate_with_roster(
                 seen: 0,
                 expected,
                 coverage: 0.0,
-                session: DimStats::ZERO,
-                weekly: DimStats::ZERO,
-                cap_hits: 0,
-                time_at_cap_secs: 0,
+                session: None,
+                weekly: None,
+                cap_hits: None,
+                time_at_cap_secs: None,
                 contribution_share: share_of(&contribution, acct, total_obs),
             });
     }
@@ -1281,25 +1299,12 @@ fn intersect(a: &[(i64, i64)], b: &[(i64, i64)]) -> Vec<(i64, i64)> {
     out
 }
 
-impl DimStats {
-    /// The all-zero summary. Two cases hold it: an account with a contribution share but no
-    /// readings of its own (see [`aggregate`]), and — the same value, from [`dim_stats`] over an
-    /// empty series — an account whose samples carry no reading on the dimension. In the second
-    /// case it is an INTERIM representation, not a measurement: issue #1601 replaces it with an
-    /// omission under `JSON_SCHEMA_VERSION` 2.
-    const ZERO: DimStats = DimStats {
-        mean: 0.0,
-        peak: 0.0,
-        p95: 0.0,
-    };
-}
-
-/// Mean / peak / p95 over a dimension's values. `xs` holds the readings that carry the
-/// dimension, so it IS empty for a real account whose samples carry no reading on it (an
-/// account with no session window). An empty slice yields the finite all-zero summary rather
-/// than a NaN/∞ that JSON could not represent: an INTERIM representation of "no reading on
-/// this dimension", not a measurement, until issue #1601 omits the summary under
-/// `JSON_SCHEMA_VERSION` 2.
+/// Mean / peak / p95 over a dimension's values — the readings that carry the dimension.
+/// [`aggregate_with_roster`] calls it only on a non-empty series: an account whose samples carry
+/// no reading on the dimension holds `None` there instead (no reading on that axis), so no
+/// summary is ever computed over nothing. The helpers below still return a finite `0.0` for an
+/// empty slice rather than a NaN/∞ that JSON could not represent, but no figure is built that
+/// way.
 fn dim_stats(xs: &[f64]) -> DimStats {
     DimStats {
         mean: mean_of(xs),
@@ -1666,12 +1671,11 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         );
     }
 
-    /// Issue #1600, the interim: an account none of whose readings carries a session value holds
-    /// the all-zero session summary ([`DimStats::ZERO`]) and no cap hit. That zero is the interim
-    /// representation, not a measurement: issue #1601 omits those figures on the wire and prints
-    /// `—` in the table, and this test moves with it.
+    /// Issue #1600: an account none of whose readings carries a session value holds no session
+    /// figures and no cap counts — `None`, not a zero summary, which would be a measurement never
+    /// made — while its weekly figures are over its weekly readings.
     #[test]
-    fn an_account_with_no_session_reading_holds_the_interim_zero_summary_until_the_wire_omits_it() {
+    fn an_account_with_no_session_reading_holds_no_session_figures_and_no_cap_counts() {
         let period = Period::new(0, 900);
         let samples = [
             sample_from_line(0, "work", None, Some(0.3)),
@@ -1680,15 +1684,16 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         ];
         let report = aggregate(&samples, &[], period, &params());
         let a = &report.per_account["work"];
-        assert_eq!(a.session, DimStats::ZERO, "T2: the interim zero summary");
-        assert_eq!(a.cap_hits, 0, "T2: no session reading, so no cap hit");
-        assert_eq!(a.time_at_cap_secs, 0, "T2: and no time at the cap");
+        assert_eq!(a.session, None, "T2: no session figures");
+        assert_eq!(a.cap_hits, None, "T2: no session reading, so no cap count");
+        assert_eq!(a.time_at_cap_secs, None, "T2: and no time at the cap");
+        let weekly = a.weekly.expect("T2: the weekly readings are summarised");
         assert!(
-            (a.weekly.mean - 0.5).abs() < 1e-12,
+            (weekly.mean - 0.5).abs() < 1e-12,
             "T2: the weekly mean is over the weekly readings: {}",
-            a.weekly.mean
+            weekly.mean
         );
-        assert_eq!(a.weekly.peak, 0.7, "T2: and so is the weekly peak");
+        assert_eq!(weekly.peak, 0.7, "T2: and so is the weekly peak");
         assert_eq!(a.seen, 3, "T2: each reading is an observation");
     }
 
@@ -1827,8 +1832,8 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
     fn contribution_share_credits_an_active_account_with_no_readings_of_its_own() {
         // `dark` is the active credential the whole period (a prior swap TO it), but the
         // only readings are ABOUT `work` (the daemon happened to poll a non-active
-        // account). The active account still earns the contribution — with a zeroed
-        // readings row — so the shares sum to 1 and no observation is dropped.
+        // account). The active account still earns the contribution — with a row that holds
+        // no figures — so the shares sum to 1 and no observation is dropped.
         let period = Period::new(1_000, 2_000);
         let swaps = vec![mk_swap_ab(500, "work", "dark", SwapKind::Emergency)];
         let samples = vec![
@@ -1843,9 +1848,8 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         );
         assert_eq!(dark.seen, 0, "dark has no readings of its own");
         assert_eq!(
-            dark.session,
-            DimStats::ZERO,
-            "no readings → zeroed, not invented"
+            dark.session, None,
+            "no readings → no session figures, not invented"
         );
         // `work` was sampled but never active → zero contribution, real readings.
         let work = &report.per_account["work"];
@@ -1860,6 +1864,126 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             .map(|a| a.contribution_share)
             .sum();
         assert!((total - 1.0).abs() < 1e-9, "shares still sum to 1");
+    }
+
+    /// An account whose in-period readings carry no session reading holds `None` on the session
+    /// axis and on both cap counts — there is no session series to summarise — and never a zero
+    /// summary; its weekly figures are over its weekly readings. Four accounts over the same three
+    /// instants: `spare` carries no session reading, `mixed` one, `work` three (all under the
+    /// cap, so its counts are a measured `Some(0)`), and `dark`, the active credential for every
+    /// reading and never itself sampled, holds `None` on every figure.
+    #[test]
+    fn an_account_with_no_session_reading_aggregates_to_none_never_a_zero_summary() {
+        // 3 600 s at the 300 s cadence: 12 expected readings per account.
+        let period = Period::new(1_000, 4_600);
+        let swaps = [mk_swap_ab(500, "work", "dark", SwapKind::Emergency)];
+        let samples = [
+            Sample::new(1_200, "claude", "spare", None, Some(0.3)),
+            Sample::new(1_500, "claude", "spare", None, Some(0.5)),
+            Sample::new(1_800, "claude", "spare", None, Some(0.7)),
+            Sample::new(1_200, "claude", "mixed", None, Some(0.3)),
+            Sample::new(1_500, "claude", "mixed", Some(0.9), Some(0.5)),
+            Sample::new(1_800, "claude", "mixed", None, Some(0.7)),
+            Sample::new(1_200, "claude", "work", Some(0.4), Some(0.3)),
+            Sample::new(1_500, "claude", "work", Some(0.5), Some(0.5)),
+            Sample::new(1_800, "claude", "work", Some(0.6), Some(0.7)),
+        ];
+        let report = aggregate_with_roster(&samples, &swaps, period, &params(), None);
+        let weekly = Some(DimStats {
+            mean: 0.5,
+            peak: 0.7,
+            p95: 0.7,
+        });
+
+        let spare = &report.per_account["spare"];
+        assert_eq!(spare.session, None, "spare: no session figures");
+        assert_eq!(spare.cap_hits, None, "spare: no cap count");
+        assert_eq!(spare.time_at_cap_secs, None, "spare: no time at the cap");
+        assert_eq!(spare.weekly, weekly, "spare: its weekly figures");
+        assert_eq!(spare.seen, 3, "spare: each reading is an observation");
+        assert_eq!(spare.coverage, 0.25, "spare: 3 of 12 expected");
+
+        let mixed = &report.per_account["mixed"];
+        assert_eq!(
+            mixed.session,
+            Some(DimStats {
+                mean: 0.9,
+                peak: 0.9,
+                p95: 0.9
+            }),
+            "mixed: over its one session reading"
+        );
+        assert_eq!(mixed.cap_hits, Some(1), "mixed: that reading is at the cap");
+        assert_eq!(
+            mixed.time_at_cap_secs,
+            Some(300),
+            "mixed: the 1 500 reading's window"
+        );
+        assert_eq!(mixed.weekly, weekly, "mixed: its weekly figures");
+
+        let work = &report.per_account["work"];
+        assert_eq!(
+            work.session,
+            Some(DimStats {
+                mean: 0.5,
+                peak: 0.6,
+                p95: 0.6
+            }),
+            "work: over its three session readings"
+        );
+        assert_eq!(
+            work.cap_hits,
+            Some(0),
+            "work: a present reading under the cap is a measured zero, never `None`"
+        );
+        assert_eq!(work.time_at_cap_secs, Some(0), "work: likewise");
+
+        let dark = &report.per_account["dark"];
+        assert_eq!(dark.seen, 0, "dark: never sampled");
+        assert_eq!(dark.coverage, 0.0, "dark: no coverage");
+        assert_eq!(dark.contribution_share, 1.0, "dark: active throughout");
+        assert_eq!(dark.session, None, "dark: no session figures");
+        assert_eq!(dark.weekly, None, "dark: no weekly figures");
+        assert_eq!(dark.cap_hits, None, "dark: no cap count");
+        assert_eq!(dark.time_at_cap_secs, None, "dark: no time at the cap");
+
+        assert_eq!(report.per_account.len(), 4, "the four accounts");
+        let total: f64 = report
+            .per_account
+            .values()
+            .map(|a| a.contribution_share)
+            .sum();
+        assert_eq!(total, 1.0, "the four shares sum to 1");
+    }
+
+    /// The weekly twin: an account whose readings carry no weekly reading holds `None` on the
+    /// weekly axis — never a zero summary — while its session figures and cap counts, present and
+    /// under the cap, read as measured.
+    #[test]
+    fn a_weekly_less_reading_aggregates_to_none_on_the_weekly_axis() {
+        let period = Period::new(0, 3_600);
+        let samples = [
+            Sample::new(0, "claude", "future", Some(0.42), None),
+            Sample::new(300, "claude", "future", Some(0.42), None),
+            Sample::new(600, "claude", "future", Some(0.42), None),
+        ];
+        let report = aggregate_with_roster(&samples, &[], period, &params(), None);
+        let future = &report.per_account["future"];
+        assert_eq!(future.weekly, None, "no weekly figures");
+        assert_eq!(
+            future.session,
+            Some(DimStats {
+                mean: 0.42,
+                peak: 0.42,
+                p95: 0.42
+            }),
+            "its session figures"
+        );
+        assert_eq!(future.cap_hits, Some(0), "a measured zero");
+        assert_eq!(future.time_at_cap_secs, Some(0), "a measured zero");
+        assert_eq!(future.seen, 3);
+        assert_eq!(future.coverage, 0.25, "3 of 12 expected");
+        assert_eq!(future.contribution_share, 1.0, "the only account");
     }
 
     // --- swap frequency (incl. manual + emergency) ----------------------------
