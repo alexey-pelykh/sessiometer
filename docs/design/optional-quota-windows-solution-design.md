@@ -383,7 +383,7 @@ parse error. The oracles stay `#[ignore]`d, and each RED record names the tree i
 
 **Why the two halves land together.** `blindActive` is decoded with `decodeIfPresent(BlindActive.self, …)` (`apps/menubar/Sources/WireModel.swift:712`), and `BlindActive`'s doc says a present block missing a required field throws rather than mis-reads (`apps/menubar/Sources/WireModel.swift:486-493`), so a frame carrying a percent-less block fails to decode on an un-updated app, and the decode half ships with S6. In the other direction, `lastKnownSessionPct: UInt8?` does not compile until `BlindMeter`'s `utilSeverity(_:)` and `Double(_:)` reads (`lastKnownSessionPct` at `apps/menubar/Sources/StatusPanelRoster.swift:911-922`) change with it: both take a non-optional `UInt8`. The spoken interpolation (`lastKnownSessionPct` at `apps/menubar/Sources/StatusPanelFormat.swift:2197`) compiles against an optional with a warning only — `apps/menubar/project.yml` sets no warnings-as-errors — and is changed with them so that it never prints `Optional(87)`.
 
-**The panel interim, and its cost.** The one non-inventing option `REQ-CEL-C-001` leaves: until #1594 builds the held block as D0/D15 classified it (council, 2026-11-03), the panel renders a decoded percent-less block **as no block**, today's two-meter `n/a` row, the mock-authored state B-6t already ships. On the panel the blind duration and verdict the wire now carries stay invisible until then (the CLI footer shows them), so if #1594 stalls, DP-1's days become "until #1594" on the panel alone (R-D9).
+**The panel interim, and its cost.** D15 (settled by council, 2026-11-03) classifies the percent-less held block and leaves its build to B-11 (#1594), so S6 draws none of it: until #1594 lands, the panel renders a decoded percent-less block **as no block**, today's two-meter `n/a` row — the failed-poll row B-6t already ships for this account, which no mock frame draws — while the menu-bar glance reads the block's verdict (#1599 § 5, settled by council, 2026-11-04). On the panel row the blind duration and verdict the wire now carries stay invisible until #1594 (the CLI footer shows them), so if #1594 stalls after S6 deploys, DP-1's days become "until #1594" on the panel row alone (R-D9).
 
 **CLI**: the `~N%` cell at `src/cli.rs:3867` (`last_known_session_pct`) falls back to
 `pct(account.session_pct)` on `None`, and the blind sentence in `render_blind_active` (`src/cli.rs:3236`) states the duration without a percent — prose in the footer, not a token in the
@@ -710,7 +710,7 @@ bought. **Addressed.**
 
 ### Accessibility
 
-No new control. Three spoken strings change meaning and are **a Gap handed to D0** (§ 9b), recorded here so the register entry carries them: the label of an absent Session meter; the blind held block's "last-known session N percent" (`lastKnownSessionPct` at `apps/menubar/Sources/StatusPanelFormat.swift:2197`) when there is no percent; and the Stats-tab row summary's "Session mean N percent, peak N percent" (`accessibilityLabel` at `apps/menubar/Sources/StatusPanelStats.swift:216-224`).
+No new control. Three spoken strings change meaning and are **a Gap handed to D0** (§ 9b; settled by council, 2026-11-03; the record is a comment on #1594), recorded here so the register entry carries them: the label of an absent Session meter; the blind held block's "last-known session N percent" (`lastKnownSessionPct` at `apps/menubar/Sources/StatusPanelFormat.swift:2197`) when there is no percent; and the Stats-tab row summary's "Session mean N percent, peak N percent" (`accessibilityLabel` at `apps/menubar/Sources/StatusPanelStats.swift:216-224`).
 
 ### Testing strategy
 
@@ -1020,7 +1020,7 @@ no UI track ran (the mock authors no frame; D0). No conflict to resolve.
 | REQ-ARM-B-004 | Technical | § 5 B-3 row 9 | Cap-2 | covered |
 | REQ-ARM-B-005 | Technical | § 5 B-3 row 6 | Cap-2 | covered |
 | REQ-ARM-B-006 | Technical | § 5 B-3 row 6 | Cap-2 | covered |
-| REQ-ARM-B-007 | Technical | § 5 B-3 row 7, B-6t, B-6 | Cap-2, Cap-3 | covered (surfacing half); arming half OAD-2, settled (a) by council 2026-11-03 with its reopen evidence |
+| REQ-ARM-B-007 | Technical | § 5 B-3 row 7, B-6t, B-6 | Cap-2, Cap-3 | covered (surfacing half: #1599 § 2a's fourth report arm, settled by council, 2026-11-04); arming half OAD-2, settled (a) by council 2026-11-03 with its reopen evidence |
 | REQ-ARM-B-008 | Technical | § 5 B-3 row 8 | Cap-2 | covered — D4 ratified by council, 2026-11-03 |
 | REQ-ARM-B-009 | Technical | § 5 B-3 row 10 | Cap-2 | covered |
 | REQ-ARM-B-010 | Technical | § 4.5, § 5 B-3 row 11 | Cap-2 | covered |
