@@ -927,21 +927,28 @@ private struct HeartbeatFrame: Decodable {
 // (an `{"error":…}` envelope on an invalid period is detected first, see `decodeStatsReply`). `#159`/`#160`
 // extend the contract ADDITIVELY without bumping `schema`, so absent keys are tolerated: `orphans`
 // (`skip_serializing_if` when empty), `period` / `since` (`Option::is_none`), and `config_unreadable`
-// (#642, `Option::is_none`) each decode to a default. NOTE this wire is versioned by its OWN `schema`
-// (`src/stats.rs` `JSON_SCHEMA_VERSION`), NOT by `STATUS_SCHEMA_VERSION` — that governs the separate
-// `status` / `watch` `VersionedStatus` payload mirrored above, which carries a `schema_version` object
-// this document does not have.
+// (#642, `Option::is_none`) each decode to a default. `schema` 2 made an account entry's four
+// session-keyed keys and its `weekly` key omittable too — EXISTING keys, which is why that change did
+// bump the version — and each decodes to `nil` (see `StatsAccountStats`). NOTE this wire is versioned
+// by its OWN `schema` (`src/stats.rs` `JSON_SCHEMA_VERSION`), NOT by `STATUS_SCHEMA_VERSION` — that
+// governs the separate `status` / `watch` `VersionedStatus` payload mirrored above, which carries a
+// `schema_version` object this document does not have.
 //
 // Source of truth (mirror, do not re-derive): `src/stats.rs` — `StatsWire`, `WindowWire`, `BucketWire`,
 // `PeriodWire`, `AccountWire`, `DimWire`, `RosterWire`, `SwapsWire`, `Band`, `CoverageClass`.
 
 /// The top-level `stats` reply document (`src/stats.rs` `StatsWire`).
 struct StatsWire: Decodable, Equatable {
+    /// The `stats` wire's own `JSON_SCHEMA_VERSION`. Decoded and deliberately unread: the daemon and
+    /// the app ship as one bundle, so the app never meets a `stats` document of another version, and
+    /// the byte-drift guard against the Rust golden pins the two in lockstep.
     let schema: UInt32
     let window: StatsWindow
     /// The applied account filter (redacted handles); empty means "all" — the socket verb never filters.
     let accounts: [String]
-    /// The per-bucket series — the Stats-tab sparkline source (one `session.peak` per bucket, #446).
+    /// The per-bucket series — the Stats-tab sparkline source (#446): `StatusPanelFormat.sparkSeries`
+    /// derives each account's line from its optional per-bucket session peak, and draws no line for an
+    /// account with no session window.
     let series: [StatsBucket]
     /// The whole-window aggregate — the Stats row's numeric body + the aggregate callout.
     let summary: StatsPeriodBody
@@ -989,7 +996,8 @@ struct StatsWindow: Decodable, Equatable {
 }
 
 /// One series bucket (`src/stats.rs` `BucketWire`): its `[start, end)` plus the same per-account + roster
-/// body as the summary. The `session.peak` of each account across the buckets IS the sparkline series.
+/// body as the summary. Each account's optional session peak across the buckets is what
+/// `StatusPanelFormat.sparkSeries` derives the sparkline from; an account with no session window draws no line.
 struct StatsBucket: Decodable, Equatable {
     let start: Int64
     let end: Int64
@@ -1006,16 +1014,31 @@ struct StatsPeriodBody: Decodable, Equatable {
 /// One account's window aggregate (`src/stats.rs` `AccountWire`). `session` / `weekly` are FRACTIONS
 /// (0…1, over the quota cap) — the panel renders them as percents; `band` is the neutral session-peak
 /// descriptor the Stats-tab signal pill collapses (`StatusPanelFormat.statsSignal`).
+///
+/// Since `schema` 2 the daemon OMITS the four session-keyed keys — `session`, `band`, `cap_hits` and
+/// `time_at_cap_secs` — for an account whose readings in the window carry no session reading (it has no
+/// five-hour session window, or none was observed on it), and `weekly` for one with no weekly reading.
+/// Each then decodes to `nil`: no reading on that axis, never a zero. The entry itself stays present
+/// with `seen`, `coverage`, `coverage_class` and `contribution_share`, so such an account is still
+/// distinguishable from an absent one. The explicit decoder reads the omittable keys with
+/// `decodeIfPresent`, so an absent key OR an explicit `null` decodes to `nil` — the same tolerance as
+/// the file's other optional decoders; the daemon never writes the `null` form, it omits the key. A
+/// PRESENT, non-null value of the wrong shape still throws, exactly as a required one does.
 struct StatsAccountStats: Decodable, Equatable {
     let seen: UInt32
     let coverage: Double
     let coverageClass: StatsCoverageClass
-    let session: StatsDim
-    let weekly: StatsDim
-    let capHits: UInt32
-    let timeAtCapSecs: Int64
+    /// `nil` when the account's readings carry no session reading — no reading on that axis.
+    let session: StatsDim?
+    /// `nil` when the account's readings carry no weekly reading — no reading on that axis.
+    let weekly: StatsDim?
+    /// `nil` exactly when `session` is: a cap count is a statistic of the session series.
+    let capHits: UInt32?
+    /// `nil` exactly when `session` is, for the reason `capHits` gives.
+    let timeAtCapSecs: Int64?
     let contributionShare: Double
-    let band: StatsBand
+    /// `nil` exactly when `session` is: the band classifies the session peak.
+    let band: StatsBand?
 
     private enum CodingKeys: String, CodingKey {
         case seen, coverage
@@ -1025,6 +1048,19 @@ struct StatsAccountStats: Decodable, Equatable {
         case timeAtCapSecs = "time_at_cap_secs"
         case contributionShare = "contribution_share"
         case band
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        seen = try c.decode(UInt32.self, forKey: .seen)
+        coverage = try c.decode(Double.self, forKey: .coverage)
+        coverageClass = try c.decode(StatsCoverageClass.self, forKey: .coverageClass)
+        session = try c.decodeIfPresent(StatsDim.self, forKey: .session)
+        weekly = try c.decodeIfPresent(StatsDim.self, forKey: .weekly)
+        capHits = try c.decodeIfPresent(UInt32.self, forKey: .capHits)
+        timeAtCapSecs = try c.decodeIfPresent(Int64.self, forKey: .timeAtCapSecs)
+        contributionShare = try c.decode(Double.self, forKey: .contributionShare)
+        band = try c.decodeIfPresent(StatsBand.self, forKey: .band)
     }
 }
 

@@ -1,0 +1,21 @@
+usage — last 24h (Jun 30–Jul 1)
+
+account  signal     session  weekly  runway  velocity  trend
+spare    —                —     [32m30%[0m       —         —
+work     [33msaturated[0m    [31m50/90[0m     [32m40%[0m     ~2h  0.2%/min  ▄▆▇
+
+contribution share
+spare  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    0%
+work   ████████████████████████████████████████  100%
+
+session pattern — hourly mean
+spare
+work   [32m▒[0m[33m▓[0m[33m▓[0m
+
+session distribution — mean · p95 · peak
+spare  ┤────────────────────────────────────────├  —
+work   ┤────────────────────m────────────P─x────├  50% · 85% · 90%
+
+  lowest utilisation: work (session mean 50%)
+  accounts last: ~2 days at the current combined rate (2 of 2 counted)
+roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): 0 episodes (0s) · capacity holds: —
