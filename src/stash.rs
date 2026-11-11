@@ -34,7 +34,7 @@
 //! their ACL identity is irrelevant — the `apple-tool:` preservation that matters
 //! for the canonical item does not apply here.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -50,6 +50,7 @@ use crate::claude_state::OauthAccount;
 use crate::error::{Error, Result};
 use crate::keychain::Credential;
 use crate::paths;
+use crate::security_write;
 
 /// Absolute path to the system `security` tool — absolute (not `$PATH`-resolved)
 /// so a hijacked `PATH` cannot substitute a different binary for this
@@ -127,7 +128,10 @@ impl RealAccountStash {
     /// driven through `security -i` (the command on stdin) so `payload` never
     /// reaches this process's argv (issue #39). This matters most for the
     /// `oauthAccount` half, whose hex carries the account's email: the previously
-    /// accepted argv exposure (wider than #2's opaque-token case) is now closed.
+    /// accepted argv exposure (wider than #2's opaque-token case) is now closed. The
+    /// one exception is a payload too long for a single `security -i` read — a
+    /// credential carrying `mcpOAuth` tokens — which goes on argv as `-X` hex rather
+    /// than being stored truncated ([`crate::security_write`]).
     async fn add_item(
         &self,
         service: &str,
@@ -136,9 +140,21 @@ impl RealAccountStash {
         payload: &[u8],
     ) -> Result<()> {
         // `line` (the command, payload included) is the only heap copy of the
-        // escaped secret and is `Zeroizing`; only `-i` ever reaches argv.
+        // escaped secret and is `Zeroizing`; only `-i` ever reaches argv — unless the
+        // line is too long for one `security -i` read, which would store a truncated
+        // payload, so it goes on argv as `-X` hex instead (see `crate::security_write`).
         let line = write_item_command_line(service, acct, keychain, payload)?;
-        let output = run_interactive_write(&line).await?;
+        let output = if security_write::fits_interactive_read(&line) {
+            run_interactive_write(&line).await?
+        } else {
+            security_write::run_argv_hex_write(
+                OsStr::new(service),
+                OsStr::new(acct),
+                keychain,
+                payload,
+            )
+            .await?
+        };
         if output.status.success() {
             Ok(())
         } else {
@@ -322,8 +338,9 @@ fn write_item_command_line(
 ) -> Result<Zeroizing<Vec<u8>>> {
     // Line-based reader: a newline in `payload` would truncate the command. The
     // stored halves never contain one (the credential is single-line OAuth JSON;
-    // the oauthAccount half is pure-ASCII hex) — and if one ever did, `security`
-    // exits non-zero and the caller surfaces it, never a silent partial write.
+    // the oauthAccount half is pure-ASCII hex). If one ever did, the split would NOT
+    // fail cleanly: as with an over-long line, the first fragment runs as a command
+    // of its own and stores a truncated payload (see `crate::security_write`).
     debug_assert!(
         !payload.contains(&b'\n'),
         "interactive command line is newline-delimited"
@@ -734,6 +751,37 @@ mod tests {
             let reread = stash.read(service).await.expect("re-read stash");
             assert_eq!(reread.credential.expose(), b"rotated-token");
 
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn a_credential_too_long_for_one_interactive_read_is_stashed_whole() {
+            // The shape that broke `capture`: a credential carrying `mcpOAuth` tokens
+            // beside `claudeAiOauth`, too long for one `security -i` read. It was
+            // stashed as a truncated, invalid-JSON prefix and the write exited 1.
+            let (_dir, kc) = fresh_keychain();
+            let stash = RealAccountStash::for_keychain(kc.clone());
+            let service = "Sessiometer/11111111-1111-1111-1111-111111111111";
+            let blob = format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"a\"b\\c"}},"mcpOAuth":{{"t":"{}"}}}}"#,
+                "m".repeat(5000)
+            )
+            .into_bytes();
+            let account = StashedAccount {
+                credential: Credential::new(blob.clone()),
+                oauth_account: OauthAccount::from_object_bytes(
+                    br#"{"accountUuid":"11111111-1111-1111-1111-111111111111"}"#,
+                )
+                .unwrap(),
+            };
+            stash.write(service, &account).await.expect("write stash");
+
+            let got = stash.read(service).await.expect("read stash");
+            assert_eq!(got.credential.expose(), &blob[..]);
+            assert_eq!(
+                got.oauth_account.account_uuid(),
+                "11111111-1111-1111-1111-111111111111"
+            );
             delete(&kc);
         }
 

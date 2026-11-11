@@ -59,7 +59,9 @@
 //!     strips so a read→write round-trip is byte-exact.
 //!   - **write** — `add-generic-password -U -s <service> -a <resolved-acct> -w <blob> <keychain>`,
 //!     fed to `security -i` on **stdin** (not argv) so the blob is never visible in
-//!     this process's command line (issue #39; `build/version-compat.md`).
+//!     this process's command line (issue #39; `build/version-compat.md`). A blob
+//!     whose command line is too long for one `security -i` read goes on argv as
+//!     `-X <hex>` instead, rather than being stored truncated ([`crate::security_write`]).
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -75,6 +77,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::paths;
+use crate::security_write;
 use crate::sha256::sha256_hex;
 
 /// Absolute path to the system `security` tool. Absolute (not bare `security`
@@ -621,9 +624,10 @@ fn write_command_line(
     blob: &[u8],
 ) -> Zeroizing<Vec<u8>> {
     // The interactive reader is line-based: an embedded newline would truncate
-    // the command. Real payloads (single-line OAuth JSON) never contain one — and
-    // if one ever did, `security` exits non-zero and `finish_write` reports the
-    // failure rather than writing a truncated secret (never a silent partial).
+    // the command. Real payloads (single-line OAuth JSON) never contain one. If one
+    // ever did, the split would NOT fail cleanly: as with an over-long line, the
+    // first fragment runs as a command of its own and stores a truncated secret
+    // (see `crate::security_write`, which `write_item` uses to avoid the latter).
     debug_assert!(
         !blob.contains(&b'\n'),
         "interactive command line is newline-delimited"
@@ -668,6 +672,23 @@ async fn run_interactive_write(line: &[u8]) -> Result<std::process::Output> {
         .write_all(line)
         .await?;
     Ok(child.wait_with_output().await?)
+}
+
+/// Write `blob` as the secret of `(service, acct)` in `keychain`, mapping the exit
+/// through [`finish_write`]. The command goes to `security -i` on stdin, so the blob
+/// never lands on this process's argv (issue #39) — unless its line is too long for
+/// one `security -i` read, which would store a truncated blob; that one goes on argv
+/// as `-X` hex instead, as Claude Code does for the same item
+/// ([`crate::security_write`]).
+async fn write_item(service: &str, acct: &OsStr, keychain: &Path, blob: &[u8]) -> Result<()> {
+    // `line` is the only heap copy of the escaped secret and is `Zeroizing`.
+    let line = write_command_line(service, acct, keychain, blob);
+    let output = if security_write::fits_interactive_read(&line) {
+        run_interactive_write(&line).await?
+    } else {
+        security_write::run_argv_hex_write(OsStr::new(service), acct, keychain, blob).await?
+    };
+    finish_write(output.status.success(), output.status.code().unwrap_or(-1))
 }
 
 /// Map a non-zero `security` exit `code` to a typed error. `36` is
@@ -957,12 +978,7 @@ impl CredentialStore for RealCredentialStore {
     async fn write(&self, credential: &Credential) -> Result<()> {
         let acct = self.acct().await?;
         let keychain = self.keychain_path()?;
-        // Build the command (blob included) and feed it to `security -i` on
-        // stdin, so the blob never lands on this process's argv (issue #39).
-        // `line` is the only heap copy of the escaped secret and is `Zeroizing`.
-        let line = write_command_line(self.service()?, &acct, &keychain, credential.expose());
-        let output = run_interactive_write(&line).await?;
-        finish_write(output.status.success(), output.status.code().unwrap_or(-1))
+        write_item(self.service()?, &acct, &keychain, credential.expose()).await
     }
 
     async fn probe_resolution(&self) -> Result<()> {
@@ -1232,9 +1248,7 @@ impl IsolatedKeychainItem {
 impl IsolatedKeychain for IsolatedKeychainItem {
     async fn seed(&self, blob: &[u8]) -> Result<()> {
         let keychain = self.keychain_path()?;
-        let line = write_command_line(&self.service, self.acct.as_os_str(), &keychain, blob);
-        let output = run_interactive_write(&line).await?;
-        finish_write(output.status.success(), output.status.code().unwrap_or(-1))
+        write_item(&self.service, self.acct.as_os_str(), &keychain, blob).await
     }
 
     async fn read_back(&self) -> Result<Credential> {
@@ -2588,6 +2602,47 @@ class: "genp"
                 .expect("write a blob with metacharacters");
             let got = store.read().await.expect("read it back");
             assert_eq!(got.expose(), nasty);
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn write_round_trips_a_blob_on_both_sides_of_the_interactive_line_limit() {
+            // A credential carrying `mcpOAuth` tokens is ~4 KB of JSON, past what one
+            // `security -i` read takes: fed whole, it stored a truncated prefix and
+            // exited 1. Size the blob so its command line lands exactly AT the limit
+            // (the `-i` path), one byte past it and far past it (the `-X` argv path),
+            // and require each back byte-exact — escaped `"` and `\` included.
+            let (_dir, kc) = fresh_keychain();
+            let acct = "sessiometer-size-acct";
+            seed(&kc, acct, "seed-token");
+            let store = RealCredentialStore::for_keychain(kc.clone());
+            let (head, tail) = (
+                br#"{"claudeAiOauth":{"t":"a\"b\\c"},"mcpOAuth":""#,
+                br#""}"#,
+            );
+            let base = write_command_line(
+                SERVICE_BASE,
+                OsStr::new(acct),
+                &kc,
+                &[&head[..], tail].concat(),
+            )
+            .len();
+            let limit = security_write::INTERACTIVE_LINE_MAX;
+
+            for (line_len, interactive) in [(limit, true), (limit + 1, false), (3 * limit, false)] {
+                let blob = [&head[..], &vec![b'z'; line_len - base], tail].concat();
+                let line = write_command_line(SERVICE_BASE, OsStr::new(acct), &kc, &blob);
+                assert_eq!(line.len(), line_len);
+                assert_eq!(security_write::fits_interactive_read(&line), interactive);
+
+                store
+                    .write(&Credential::new(blob.clone()))
+                    .await
+                    .unwrap_or_else(|e| panic!("write a {line_len}-byte line: {e}"));
+                // A successful resolve also proves the write stayed in place (`-U`).
+                let got = store.read().await.expect("read it back");
+                assert_eq!(got.expose(), &blob[..], "{line_len}-byte line");
+            }
             delete(&kc);
         }
 
