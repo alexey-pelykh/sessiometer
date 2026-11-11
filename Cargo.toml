@@ -109,3 +109,13 @@ tempfile = "3.27.0"
 # gives `#[tokio::test(start_paused = true)]` — the paused-time driver the refresh-tick
 # timeout test (#105) uses to fire the whole-cycle bound without waiting real seconds.
 tokio = { version = "1.52.3", features = ["test-util"] }
+
+# Build scripts and proc macros run on the build host and are never shipped, so they skip the
+# release profile's default debuginfo strip (#1709). With MACOSX_DEPLOYMENT_TARGET at 13.0 or
+# later, which Xcode exports into the menu-bar app's embed phase, a cold release build failed
+# with E0463 "can't find crate for `thiserror_impl`" once Xcode 27.2's `strip` had run on the
+# proc-macro dylibs. Measured on macOS 27.0.1 with rustc 1.96.0: forcing the strip onto a dev
+# build reproduces the failure, and turning it off here removes it. That the stripped dylib is
+# what rustc cannot load is the hypothesis this setting rests on.
+[profile.release.build-override]
+strip = false
