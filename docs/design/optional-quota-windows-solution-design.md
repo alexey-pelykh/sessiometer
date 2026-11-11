@@ -60,7 +60,8 @@ Carried from PRD § 3.3 and binding on this design:
   shortcut (§ 4.1).
 - No flag beside an unchanged `f64`; no reuse of `session_pct: null` for "no window" — except the documented transitional state of B-6t under D10, dated, bounded by its signpost and retired by B-6 (PRD § 3.3 carries the same exception beside its row).
 - **One exception: tranche 0, the hot-fix #1613 (AD-23).** The maintainer decided on 2026-11-01 that a hot-fix
-  path exists; the mechanism below is the scoping pipeline's design under that decision, ratification-pending.
+  path exists; the mechanism below is the scoping pipeline's design under that decision, settled by council
+  on 2026-11-04 at the maintainer's delegation (the record is a comment on #1590).
   The two bullets above stay binding on B-1 … B-12. #1613 sits outside the twelve blocks and is the only
   code that breaks them, for a bounded time, and tranche 1 removes it. It accepts exactly the cost § 4.1
   names for a flag beside an unchanged `f64`: the fabricated value stands wherever the flag is not
@@ -72,19 +73,27 @@ Carried from PRD § 3.3 and binding on this design:
     the weekly window alone absent, stays `Err(UsageParse)`, as today. The doc comment of `parse_usage`
     states the exception.
   - *How it is narrowed.* `append_sample_for_poll` returns early on `session_window_absent`, so no sample
-    line is written for such a reading: a gap, never a stored zero. That is the only place the flag is
-    consulted, so every other reader sees `0.0`; on the swap decision that reads as "not session-blocked",
+    line is written for such a reading: a gap, never a stored zero. That, and the poll loop's
+    once-per-episode stderr line (`DecisionState::note_session_window_absence`), are the two places the flag
+    is consulted; every other reader sees `0.0`; on the swap decision that reads as "not session-blocked",
     which is what an account with no session window needs. #1596 (B-1) removes the weekly-only branch and
     both flags (its § 7, AC-17); #1598 (B-7) replaces the sample skip with a `"session":null` line (its
     § 8, AC-16).
-  - *What it costs, until tranche 1 retires it — except the last cost below, which stands until #1614 is ruled.* The status/watch wire and the panel show 0% session for
-    a weekly-only account. Event-log lines that carry a session token (swap, `usage_velocity`, the blind
-    events) read 0, so `reliability` over the hot-fix window reads them as idle sessions. No usage sample
-    exists for such an account while it serves, so `stats` shows a gap, never a zero. The usage-gap tracker
-    counts such a poll as a reading (`maintain_stats_store` keys on `polled.is_err()`), so the account's gap
-    streak clears and no `usage_gap` event is logged while no sample is stored. A session window the reply
-    carries but the parser cannot read is served as no window, like an absent one; #1614 puts that to the
-    maintainer.
+  - *What it costs, settled by council on 2026-11-04 (the record is a comment on #1590); tranche 1's deploy
+    retires all but the unreadable-window cost, which #1614's pull request retires.* The status/watch wire
+    and the panel show 0% session for a weekly-only account. Event-log lines that carry a session token
+    (swap, `usage_velocity`, the blind events) read 0, so `reliability` over the hot-fix window reads them
+    as idle sessions. No usage sample exists for such an account while it serves, so `stats` shows a gap,
+    never a zero; a skipped sample is never written later, so the account's history for the interval is
+    lost. The usage-gap tracker counts such a poll as a reading (`maintain_stats_store` keys on
+    `polled.is_err()`), so the account's gap streak clears and no `usage_gap` event is logged while no
+    sample is stored. Because no sample exists, the store-derived roster-wide values leave the account out
+    while it is served: `fleet_runway` skips a `seen == 0` account, so the pool and its `n of m` cardinality
+    omit it; `capacity_holds` and the all-accounts-high census (`aggregate_with_roster`) keep it in the
+    roster intersection with nothing covering it, so the jointly covered time reads UNKNOWN for the whole
+    roster; and `fleet_runway_low` probes the same pooled figure (#1613's review, 2026-11-02). A session
+    window the reply carries but the parser cannot read is served as no window, like an absent one; #1614 is
+    ruled Answer 2.
   - *Where it stands.* It is deployed to the operator's machine before it merges, and it is invalidated
     if tranche 1 merges and deploys first. #1591's oracles (B-5) stay `#[ignore]`d; against the hot-fix,
     Oracle B fails on its session-window assertion (`Some(0.0)`) instead of the parse error, Oracle A
