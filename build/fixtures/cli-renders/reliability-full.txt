@@ -14,7 +14,7 @@ projective swap-out session_pct (reason=velocity_preempt), n=1
   P100 = 88  target <= 98  [ok]
 
 landing-point session_pct (post-swap peak of the outgoing account, window <= 900s)
-  measured n=2 of 2 reason=session swaps (0 with no post-swap sample)
+  measured n=2 of 2 reason=session swaps (0 with no post-swap session reading)
   P50  = 98
   P90  = 99  (issue #597 tail-calibration input)
   P100 = 99  vs ceiling < 99  [OVER]
