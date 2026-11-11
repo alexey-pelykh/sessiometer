@@ -1960,17 +1960,21 @@ impl ProjectiveSwapOutPct {
 /// (`active_at != acct`). Reconstructed by joining the event log's swap anchors with the daemon's
 /// `usage-samples.jsonl` per-account readings (spike #596's two-source recipe), so it surfaces the
 /// post-swap committed tail SLI 1 (the swap DECISION point) is blind to. Percentiles are `None` when
-/// no swap had a post-swap sample — cardinality-zero is not a passing 0 (the [`SwapOvershoot`]
-/// discipline). `p90` is the tail-calibration input the trigger-redesign sibling (issue #597) reads.
+/// no swap had a finite post-swap session reading — cardinality-zero is not a passing 0 (the
+/// [`SwapOvershoot`] discipline). `p90` is the tail-calibration input the trigger-redesign sibling
+/// (issue #597) reads.
 #[derive(Debug, PartialEq)]
 struct Landing {
     /// `reason=session` swap anchors in view (already `--since`-windowed) — the coverage denominator.
     swaps_total: usize,
-    /// Anchors with ≥1 post-swap sample of the parked account — the subject the percentiles summarize.
+    /// Anchors with ≥1 finite post-swap session reading of the parked account — the subject the
+    /// percentiles summarize.
     n_measured: usize,
-    /// Anchors with NO post-swap sample in the window: a sample-coverage gap, reported honestly
-    /// rather than fabricated as a `0` landing (a swap the store cannot reconstruct is UNMEASURED,
-    /// not on-target).
+    /// Anchors with NO finite post-swap session reading in the window: either the store holds no
+    /// sample of the parked account there (a coverage gap) or every sample it holds lacks a finite
+    /// session value (the account has no session window, or the value is not finite). Reported
+    /// honestly rather than fabricated as a `0` landing (a swap the store cannot reconstruct is
+    /// UNMEASURED, not on-target).
     n_unmeasured: usize,
     p50: Option<u8>,
     /// The 90th-percentile landing — the tail the #597 trigger redesign calibrates against.
@@ -2027,11 +2031,13 @@ struct OperatorLanding {
     /// Operator-initiated swap anchors in view (already `--since`-windowed), capacity-holds
     /// excluded — the coverage denominator.
     swaps_total: usize,
-    /// Anchors with ≥1 post-swap sample of the parked account — the subject the percentiles
-    /// summarize.
+    /// Anchors with ≥1 finite post-swap session reading of the parked account — the subject the
+    /// percentiles summarize.
     n_measured: usize,
-    /// Anchors with NO post-swap sample in the window: a sample-coverage gap, reported rather than
-    /// fabricated as a `0` landing.
+    /// Anchors with NO finite post-swap session reading in the window: either the store holds no
+    /// sample of the parked account there (a coverage gap) or every sample it holds lacks a finite
+    /// session value (the account has no session window, or the value is not finite). Reported
+    /// rather than fabricated as a `0` landing.
     n_unmeasured: usize,
     p50: Option<u8>,
     p90: Option<u8>,
@@ -2095,12 +2101,15 @@ impl ObservedPeak {
 /// landing means depends on whether the swap had a decision reading, and only one of the two
 /// populations does.
 struct LandingFold {
-    /// `(landing_pct, decision_pct)` for every anchor that had at least one post-swap sample, in
-    /// anchor order. The decision reading rides along because the breach classes are a question
-    /// about the PAIR — where it fired against where it landed — not about the landing alone.
+    /// `(landing_pct, decision_pct)` for every anchor that had at least one finite post-swap
+    /// session reading, in anchor order. The decision reading rides along because the breach
+    /// classes are a question about the PAIR — where it fired against where it landed — not about
+    /// the landing alone.
     measured: Vec<(u8, Option<u8>)>,
-    /// Anchors with NO post-swap sample in the window: a sample-coverage gap, reported honestly
-    /// rather than fabricated as a `0` landing.
+    /// Anchors with NO finite post-swap session reading in the window: either the store holds no
+    /// sample of the parked account there (a coverage gap) or every sample it holds lacks a finite
+    /// session value (the account has no session window, or the value is not finite). Reported
+    /// honestly rather than fabricated as a `0` landing.
     n_unmeasured: usize,
     /// Anchors excluded as `all_exhausted` capacity holds (issue #719).
     capacity_held: usize,
@@ -2804,7 +2813,7 @@ fn render_human(r: &Report) -> String {
                 "landing-point session_pct (post-swap peak of the outgoing account, window <= {LANDING_WINDOW_SECS}s)\n"
             ));
             out.push_str(&format!(
-                "  measured n={} of {} reason=session swaps ({} with no post-swap sample)\n",
+                "  measured n={} of {} reason=session swaps ({} with no post-swap session reading)\n",
                 r.landing.n_measured, r.landing.swaps_total, r.landing.n_unmeasured
             ));
             out.push_str(&format!("  P50  = {p50}\n"));
@@ -2831,7 +2840,7 @@ fn render_human(r: &Report) -> String {
             "landing-point session_pct (post-swap peak of the outgoing account): no reason=session swaps observed\n",
         ),
         _ => out.push_str(&format!(
-            "landing-point session_pct (post-swap peak of the outgoing account): no post-swap samples in window ({} of {} reason=session swaps unmeasured)\n",
+            "landing-point session_pct (post-swap peak of the outgoing account): no post-swap session readings in window ({} of {} reason=session swaps unmeasured)\n",
             r.landing.n_unmeasured, r.landing.swaps_total
         )),
     }
@@ -2853,7 +2862,7 @@ fn render_human(r: &Report) -> String {
                 "landing-point session_pct, OPERATOR-initiated swaps (reason=manual/forced, window <= {LANDING_WINDOW_SECS}s)\n"
             ));
             out.push_str(&format!(
-                "  measured n={} of {} operator swaps ({} with no post-swap sample)\n",
+                "  measured n={} of {} operator swaps ({} with no post-swap session reading)\n",
                 r.operator_landing.n_measured,
                 r.operator_landing.swaps_total,
                 r.operator_landing.n_unmeasured
@@ -2891,7 +2900,7 @@ fn render_human(r: &Report) -> String {
             }
         }
         _ => out.push_str(&format!(
-            "landing-point session_pct, OPERATOR-initiated swaps: no post-swap samples in window ({} of {} operator swaps unmeasured)\n",
+            "landing-point session_pct, OPERATOR-initiated swaps: no post-swap session readings in window ({} of {} operator swaps unmeasured)\n",
             r.operator_landing.n_unmeasured, r.operator_landing.swaps_total
         )),
     }
@@ -3364,15 +3373,18 @@ struct ProjectedSwapTargetsWire {
 
 /// Landing-point overshoot block (issue #595): where reason=session swaps actually landed — the
 /// post-swap peak of the parked account, reconstructed from the usage-sample store. `p50`/`p90`/
-/// `p100`/`p100_met` are `null` when no swap had a post-swap sample (an empty subject is not a
-/// passing `0`).
+/// `p100`/`p100_met` are `null` when no swap had a finite post-swap session reading (an empty
+/// subject is not a passing `0`).
 #[derive(serde::Serialize)]
 struct LandingWire {
     /// reason=session swap anchors in view (the coverage denominator).
     swaps_total: usize,
-    /// Anchors with >= 1 post-swap sample — the measured subject the percentiles summarize.
+    /// Anchors with >= 1 finite post-swap session reading — the measured subject the percentiles
+    /// summarize.
     n_measured: usize,
-    /// Anchors with no post-swap sample in the window — a coverage gap, not a `0` landing.
+    /// Anchors with no finite post-swap session reading in the window: either the store holds no
+    /// sample of the parked account there (a coverage gap) or every sample it holds lacks a finite
+    /// session value (no session window, or a non-finite value); not a `0` landing.
     n_unmeasured: usize,
     p50: Option<u8>,
     /// The 90th-percentile landing — the #597 tail-calibration input.
@@ -3404,8 +3416,8 @@ struct LandingClassesWire {
 
 /// Operator-initiated landing block (issue #1453): where `reason=manual` / `reason=forced` swaps
 /// left the accounts they parked — the population every other block here excludes. `p50`/`p90`/
-/// `p100` are `null` when no operator swap had a post-swap sample (an empty subject is not a passing
-/// `0`).
+/// `p100` are `null` when no operator swap had a finite post-swap session reading (an empty subject
+/// is not a passing `0`).
 ///
 /// No `classes` and no `p100_met`, unlike [`LandingWire`]: an operator swap records no decision
 /// reading, so neither a breach split nor an SLO verdict has an input. `n_at_or_over_ceiling` is
@@ -3415,9 +3427,12 @@ struct LandingClassesWire {
 struct OperatorLandingWire {
     /// Operator-initiated swap anchors in view, capacity-holds excluded (the coverage denominator).
     swaps_total: usize,
-    /// Anchors with >= 1 post-swap sample — the measured subject the percentiles summarize.
+    /// Anchors with >= 1 finite post-swap session reading — the measured subject the percentiles
+    /// summarize.
     n_measured: usize,
-    /// Anchors with no post-swap sample in the window — a coverage gap, not a `0` landing.
+    /// Anchors with no finite post-swap session reading in the window: either the store holds no
+    /// sample of the parked account there (a coverage gap) or every sample it holds lacks a finite
+    /// session value (no session window, or a non-finite value); not a `0` landing.
     n_unmeasured: usize,
     p50: Option<u8>,
     p90: Option<u8>,
@@ -5353,9 +5368,9 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "\n",
                 "projective swap-out session_pct (reason=velocity_preempt): no projective swaps observed\n",
                 "\n",
-                "landing-point session_pct (post-swap peak of the outgoing account): no post-swap samples in window (2 of 2 reason=session swaps unmeasured)\n",
+                "landing-point session_pct (post-swap peak of the outgoing account): no post-swap session readings in window (2 of 2 reason=session swaps unmeasured)\n",
                 "\n",
-                "landing-point session_pct, OPERATOR-initiated swaps: no post-swap samples in window (1 of 1 operator swaps unmeasured)\n",
+                "landing-point session_pct, OPERATOR-initiated swaps: no post-swap session readings in window (1 of 1 operator swaps unmeasured)\n",
                 "\n",
                 "observed session velocity (session_pct_per_min, positive climbs only; the v_peak reserve-coupling calibration input)\n",
                 "  measured n=1 usage_velocity samples\n",
@@ -7718,9 +7733,9 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
     }
 
     /// The canary (issue #1210): a non-finite reading of the parked account leaves its anchor
-    /// UNMEASURED — the same coverage gap
-    /// [`landing_swap_without_a_post_swap_sample_is_unmeasured_not_zero`] pins for an empty window —
-    /// rather than being fabricated into a landing.
+    /// UNMEASURED, like the empty window
+    /// [`landing_swap_without_a_post_swap_sample_is_unmeasured_not_zero`] pins, rather than being
+    /// fabricated into a landing.
     ///
     /// Deleting `.filter(|v| v.is_finite())` from the peak chain REDs this, and reds it naming the
     /// shape: the message prints every admitted shape beside the reading it fabricated, so the
@@ -7801,9 +7816,9 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
         assert_eq!(r.landing.p100_met(), Some(true));
     }
 
-    /// Issue #1600: a parked window whose readings carry no session value is an UNMEASURED landing,
-    /// the same coverage gap an empty window is, and never a `0 %` one; a window that mixes absent
-    /// and present readings lands at the peak of the present ones.
+    /// Issue #1600: a parked window whose readings carry no session value is an UNMEASURED landing
+    /// and never a `0 %` one: the store sampled the account and the account has no session window.
+    /// A window that mixes absent and present readings lands at the peak of the present ones.
     #[test]
     fn a_parked_window_with_no_session_reading_is_an_unmeasured_landing() {
         let log = "\
@@ -7825,6 +7840,15 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
             (0, 1, None, 0),
             "T7: a parked window with no session reading must leave its anchor unmeasured — \
              (n_measured, n_unmeasured, p100, post_swap_tail)"
+        );
+        // Issue #1685: the store holds samples here, so the label names the missing session
+        // reading, never a missing sample.
+        let human = render_human(&r);
+        assert!(
+            human.contains(
+                "no post-swap session readings in window (1 of 1 reason=session swaps unmeasured)"
+            ),
+            "{human}"
         );
 
         // A second anchor, whose window mixes absent readings with one present reading.
@@ -7875,7 +7899,9 @@ ts=2026-07-11T01:00:00Z event=swap from=spare to=work reason=session session_pct
             "{human}"
         );
         assert!(
-            human.contains("measured n=2 of 2 reason=session swaps (0 with no post-swap sample)"),
+            human.contains(
+                "measured n=2 of 2 reason=session swaps (0 with no post-swap session reading)"
+            ),
             "{human}"
         );
         assert!(
@@ -8220,7 +8246,7 @@ ts=2026-07-11T10:10:00Z event=swap from=held-from to=held-to reason=manual sessi
             block,
             concat!(
                 "landing-point session_pct, OPERATOR-initiated swaps (reason=manual/forced, window <= 900s)\n",
-                "  measured n=10 of 10 operator swaps (0 with no post-swap sample)\n",
+                "  measured n=10 of 10 operator swaps (0 with no post-swap session reading)\n",
                 "  P50  = 88\n",
                 "  P90  = 96\n",
                 "  P100 = 99  (no SLO: a manual swap records no decision reading)\n",
