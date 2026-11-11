@@ -65,6 +65,7 @@ mod reliability;
 #[cfg(test)]
 mod render_golden;
 mod roster_backup;
+mod security_write;
 mod service;
 mod sha256;
 mod stash;
