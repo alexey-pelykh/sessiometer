@@ -533,7 +533,7 @@ R-2 at `docs/requirements/session-warmup-on-reset.md:122-124`) and
 `docs/design/session-warmup-on-reset-solution-design.md` (C-1 at
 `docs/design/session-warmup-on-reset-solution-design.md:45`; the predicate
 `session_resets_at == None … clock stopped` at `docs/design/session-warmup-on-reset-solution-design.md:57`;
-its own R-3 at `docs/design/session-warmup-on-reset-solution-design.md:90`) are amended in place so
+its own R-3 at `docs/design/session-warmup-on-reset-solution-design.md:90`; every line citation in this paragraph is at `fd8640b`) are amended in place so
 C-1 reads two states instead of one: `session.is_none()` is **no window, nothing to warm** (R-2 never
 matches); `session.is_some() && session_resets_at.is_none()` is the **stopped-clock state** R-1's
 spike (#1231, closed GO on 2026-08-11; its AC-3 confirmed the stamp-versus-zero split) already
