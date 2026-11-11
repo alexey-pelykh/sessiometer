@@ -92,7 +92,7 @@ are the holds an earlier session reset could shorten, by up to the idle-clock du
 
 | Object | Core attributes | Relationships |
 |---|---|---|
-| **Account** | *Amended 2026-11-04 (issue #1595): since 2026-10-30 a verified Ultra account carries no five-hour session window at all, so the reading model (`docs/requirements/optional-quota-windows.md`, umbrella #1590) makes the session fraction itself optional. Read `session_pct` nullable as 'no session window applies' and `session_resets_at` nullable as 'no window running', a state that exists only where `session_pct` is present. For such an account the Session window relationship is 0 per Account by construction, not by idleness.* *Provenance: the operator's 2026-11-01 direction ("we need to make the parser more robust and flexible", `docs/requirements/optional-quota-windows.md` § 2.1), umbrella #1590. The requirement it implements (REQ-REC-B-001) is pipeline-authored and ratification-pending.* As first written: label, uuid, `session_pct`, `session_resets_at` (nullable = no window running), `weekly_pct`, `weekly_resets_at`, quarantined | belongs to Roster |
+| **Account** | *Amended 2026-11-04 (issue #1595): since 2026-10-30 a verified Ultra account carries no five-hour session window at all, so the reading model (`docs/requirements/optional-quota-windows.md`, umbrella #1590) makes the session fraction itself optional. Read `session_pct` nullable as 'no session window applies' and `session_resets_at` nullable as 'no window running', a state that exists only where `session_pct` is present. For an account with no session window the Session window relationship is 0 per Account by construction, not by idleness.* *Provenance: the operator's 2026-11-01 direction ("we need to make the parser more robust and flexible", `docs/requirements/optional-quota-windows.md` § 2.1), umbrella #1590. The requirement it implements (REQ-REC-B-001) is pipeline-authored and ratification-pending.* As first written: label, uuid, `session_pct`, `session_resets_at` (nullable = no window running), `weekly_pct`, `weekly_resets_at`, quarantined | belongs to Roster |
 | **Session window** | anchored-at (first use), resets-at, running? | 0..1 per Account |
 | **Warm-up attempt** | account, trigger instant, outcome, weekly cost observed | targets one Account |
 | **Warm-up policy** | enabled?, eligibility predicate, per-account throttle | governs Roster |
@@ -155,7 +155,7 @@ to determine whether idle-clock time actually fell.
 
 - R-1 returns a defensible per-warm-up weekly cost with its method stated, and a GO / NO-GO.
 - If GO: measured idle-clock total falls materially below the 582.52 h / 27.9 % baseline in § 2.1,
-  with the weekly-quota debit stated alongside it, so the trade is legible rather than assumed.
+  with the weekly-quota debit stated alongside it, so the trade is legible rather than assumed. *Amended 2026-11-11 (issue #1674): § 2's corpus ends before any account lost its session window (2026-10-30, § 3), so this comparison holds only over account-time in which the session fraction is present, with idle-clock taken as a share of that same account-time; an account with no session window has no clock to stop, and counting it moves either figure without any warm-up.*
 
 ## 8. Open question owned by the operator
 
