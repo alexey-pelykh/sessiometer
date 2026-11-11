@@ -35,7 +35,7 @@ Example Mapping: 🟦 6 rules · 🟩 25 examples · 🟥 0 open
 > runs are AC-1's, AC-2's and AC-3's to record), and (b) a test committed at `fd8640b` that the item
 > leaves unedited, carried as a ratification-pending reading. A type- or compile-gated test is graded under umbrella #1590's RED rule by the base build's compiler error inside it or a test helper it calls and its recorded mutant run on the pull-request head; a scenario whose named test has neither a RED nor those two records is Tier B, and names the missing row for #1599 § 8. Every "RED" below is a reading of the tree at `fd8640b` (`origin/main`,
 > 2026-11-01) and of the pull request's base, never a run. D10, D11 and D15 were settled by council on 2026-11-03
-> at the maintainer's delegation (D10 on #1597, D11 on #1599, D15 with D0 on #1594); #1599 § 2a's verdict representation (D3's surfacing half) stays open, because neither the D11 record (a comment on #1599) nor the D3/D4 record (a comment on #1602) rules it; every scenario
+> at the maintainer's delegation (D10 on #1597, D11 on #1599, D15 with D0 on #1594); #1599 § 2a's verdict representation (D3's surfacing half) was settled by council on 2026-11-04 (a comment on #1599); every scenario
 > title that names one of them says it is settled by council or names the interim it is written for. The minor itself is never a
 > number here: it is read from the queue at landing (AC-7). Every rule, tier and name here is
 > ratification-pending.
@@ -108,7 +108,7 @@ Scenario: a blind row carries no key — its "no session window" fact rides the 
         blindness there is none
 ```
 
-## Rule 2 — a weekly-only blind active keeps its blind block, with the percent omitted and never a fabricated `0`; the `1.14` no-block interim is retired, and the restored block reads DEGRADED past the gate, never OK (D10, settled by council; #1599 § 2a default)
+## Rule 2 — a weekly-only blind active keeps its blind block, with the percent omitted and never a fabricated `0`; the `1.14` no-block interim is retired, and the restored block reads DEGRADED past the gate, never OK (D10, settled by council; #1599 § 2a, settled by council, 2026-11-04)
 
 ```gherkin
 Scenario: a weekly-only blind active's block carries its duration and verdict and no percent key (D10, settled by council)
@@ -172,7 +172,7 @@ Scenario: the view emits the block for a session-less anchor and reads DEGRADED 
         intact" (`src/daemon/snapshot.rs:173-175`), the claim REQ-ARM-B-007 forbids and #1602 hands this
         item to prevent
     But NOT a new wire key for "gate not applicable" — the verdict field carries it (#1599 § 2a
-        alternatives (b) and (c), both rejected, ratification-pending)
+        alternatives (b) and (c), both rejected, settled by council, 2026-11-04)
     # `last_known_session_pct: anchor.session.map(to_pct)`; the fourth disjunct is
     # `blind_secs > BLIND_GATE_SECS && anchor.session.is_none()`, report-only like the #584 velocity
     # arm,
@@ -379,9 +379,8 @@ Scenario: the panel renders a decoded percent-less block as no block until #1594
     And the decoded model keeps the block (`blindActive != nil`), so #1594 renders it later without a
         second decode change
     And the menu-bar glance input `activeBlindDegraded` (`HonestStateMachine.swift:750`) reads the raw
-        block and is `true` — the expected value: #1599 § 5's glance sub-default (the D11 ruling leaves it undecided), reachable with no
-        `Retry-After` hold because #1599 § 2a makes the block DEGRADED past the gate (if the operator
-        overturns the sub-default before dispatch, this one step flips to `false`)
+        block and is `true` — the expected value: #1599 § 5's glance sub-default, settled by council, 2026-11-04, reachable with no
+        `Retry-After` hold because #1599 § 2a makes the block DEGRADED past the gate
     But NOT an invented held-block render — the mock authors no such state (REQ-CEL-C-001); the
         classified render is #1594's under D15
     But NOT an eye-slash or an orange or red rule on a row whose meters read `n/a`
