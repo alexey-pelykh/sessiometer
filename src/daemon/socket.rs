@@ -226,6 +226,8 @@ pub(crate) enum ControlYield {
     /// redacted ack — the config-editing sibling of `swap` / `capture`. (`config-get` is a spawned
     /// read, like `stats`, so it never yields here — it produces a bare [`Signal(None)`](ControlYield::Signal).)
     ConfigSet(ControlStream, Box<ConfigSetCommand>),
+    /// A usage poll answered only after the selected account's state has been updated.
+    Poll(ControlStream, PollCommand),
 }
 
 /// Control seam: serve control-socket connections. The production impl
@@ -340,6 +342,7 @@ impl Control for UnixControl {
                     // the OPEN connection back so the run loop performs the swap where
                     // `&mut Daemon` is available and writes the redacted ack itself.
                     Ok(ServeOutcome::Swap(stream, command)) => ControlYield::Swap(stream, command),
+                    Ok(ServeOutcome::Poll(stream, command)) => ControlYield::Poll(stream, command),
                     // A `capture` command (issue #359): an authenticated, well-formed request whose
                     // ack must reflect the REAL capture outcome (captured / refreshed / rejected).
                     // Like `swap`, a stranger was already answered inline (a `OneShot(None)` above);
@@ -464,6 +467,31 @@ pub(crate) struct SwapCommand {
     /// bypasses a safety invariant — the daemon's swap engine still aborts on a locked keychain
     /// and still serializes behind the single-writer swap lock.
     pub(crate) force: bool,
+}
+
+/// A same-user request to refresh one account's usage through the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PollCommand {
+    pub(crate) target: String,
+}
+
+/// A poll result carries roster handles and machine reasons only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "kebab-case")]
+pub(crate) enum PollAck {
+    Polled { label: String },
+    Rejected { reason: PollRejection },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PollRejection {
+    UnknownTarget,
+    AmbiguousTarget,
+    Quarantined,
+    BackingOff,
+    KeychainLocked,
+    Failed,
 }
 
 /// The redacted acknowledgement the daemon returns for a `swap` control command (issue #167) —
@@ -890,6 +918,7 @@ pub(crate) enum ServeOutcome<RW> {
     /// and write the redacted ack from the real outcome. An unauthenticated peer or an unparseable /
     /// forbidden-key request is answered inline (a `OneShot(None)`).
     ConfigSet(RW, Box<ConfigSetCommand>),
+    Poll(RW, PollCommand),
 }
 
 /// Serve one control exchange: read one newline-delimited JSON request and either write one
@@ -927,6 +956,22 @@ where
         // `control_reply`. Parse once and branch. `into_inner` drops the (empty — these clients send
         // only this one line) read buffer to yield a bare stream to hand back.
         match serde_json::from_str::<ControlRequest>(trimmed) {
+            Ok(request) if request.cmd == "poll" => {
+                if !peer_authenticated {
+                    write_line(&mut buffered, r#"{"error":"unauthorized"}"#).await?;
+                    return Ok(ServeOutcome::OneShot(None));
+                }
+                return match request.target.filter(|target| !target.is_empty()) {
+                    Some(target) => Ok(ServeOutcome::Poll(
+                        buffered.into_inner(),
+                        PollCommand { target },
+                    )),
+                    None => {
+                        write_line(&mut buffered, r#"{"error":"malformed request"}"#).await?;
+                        Ok(ServeOutcome::OneShot(None))
+                    }
+                };
+            }
             // A `watch` subscription (issue #165): a non-secret read stream (like `status`), so —
             // unlike `swap` below — it is NOT auth-gated; hand the connection to the streaming path.
             Ok(request) if request.cmd == "watch" => {
@@ -1072,6 +1117,7 @@ where
 impl<RW> ServeOutcome<RW> {
     pub(crate) fn one_shot(self) -> Option<ControlSignal> {
         match self {
+            ServeOutcome::Poll(..) => panic!("expected a one-shot reply, got a poll handoff"),
             ServeOutcome::OneShot(signal) => signal,
             ServeOutcome::Watch(_) => {
                 panic!("expected a one-shot reply, got a watch subscription")
@@ -1098,6 +1144,7 @@ impl<RW> ServeOutcome<RW> {
     /// on any other — for the issue-#167 swap-handoff tests, which always expect a swap.
     pub(crate) fn swap(self) -> (RW, SwapCommand) {
         match self {
+            ServeOutcome::Poll(..) => panic!("expected a swap handoff, got a poll handoff"),
             ServeOutcome::Swap(stream, command) => (stream, command),
             ServeOutcome::OneShot(_) => panic!("expected a swap handoff, got a one-shot reply"),
             ServeOutcome::Watch(_) => panic!("expected a swap handoff, got a watch subscription"),
@@ -1117,6 +1164,7 @@ impl<RW> ServeOutcome<RW> {
     /// capture.
     pub(crate) fn capture(self) -> (RW, CaptureCommand) {
         match self {
+            ServeOutcome::Poll(..) => panic!("expected a capture handoff, got a poll handoff"),
             ServeOutcome::Capture(stream, command) => (stream, command),
             ServeOutcome::OneShot(_) => panic!("expected a capture handoff, got a one-shot reply"),
             ServeOutcome::Watch(_) => {
@@ -1137,6 +1185,7 @@ impl<RW> ServeOutcome<RW> {
     /// on any other — for the issue-#356 stats-handoff tests, which always expect a stats handoff.
     pub(crate) fn stats(self) -> (RW, StatsRequest) {
         match self {
+            ServeOutcome::Poll(..) => panic!("expected a stats handoff, got a poll handoff"),
             ServeOutcome::Stats(stream, request) => (stream, request),
             ServeOutcome::OneShot(_) => panic!("expected a stats handoff, got a one-shot reply"),
             ServeOutcome::Watch(_) => panic!("expected a stats handoff, got a watch subscription"),
@@ -1155,6 +1204,7 @@ impl<RW> ServeOutcome<RW> {
     /// other — for the issue-#268 config-get-handoff tests, which always expect a config-get.
     pub(crate) fn config_get(self) -> RW {
         match self {
+            ServeOutcome::Poll(..) => panic!("expected a config-get handoff, got a poll handoff"),
             ServeOutcome::ConfigGet(stream) => stream,
             ServeOutcome::OneShot(_) => {
                 panic!("expected a config-get handoff, got a one-shot reply")
@@ -1178,6 +1228,7 @@ impl<RW> ServeOutcome<RW> {
     /// config-set.
     pub(crate) fn config_set(self) -> (RW, ConfigSetCommand) {
         match self {
+            ServeOutcome::Poll(..) => panic!("expected a config-set handoff, got a poll handoff"),
             ServeOutcome::ConfigSet(stream, command) => (stream, *command),
             ServeOutcome::OneShot(_) => {
                 panic!("expected a config-set handoff, got a one-shot reply")
@@ -1341,6 +1392,16 @@ pub(crate) const SWAP_ACK_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// best-effort. Serializing a finite enum cannot realistically fail; a defensive fallback keeps
 /// the write total rather than dropping a completed swap's ack on an impossible encode error.
 pub(crate) async fn write_swap_ack<W>(mut stream: W, ack: &SwapAck) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let line = serde_json::to_string(ack)
+        .unwrap_or_else(|_| r#"{"result":"rejected","reason":"failed"}"#.to_owned());
+    write_line(&mut stream, &line).await
+}
+
+/// Write the non-secret result of a completed usage poll.
+pub(crate) async fn write_poll_ack<W>(mut stream: W, ack: &PollAck) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -1746,6 +1807,61 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
+
+    #[tokio::test]
+    async fn poll_handoff_is_authenticated_and_requires_a_target() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (request, authenticated, expected) in [
+            (
+                "{\"cmd\":\"poll\",\"target\":\"spare\"}\n",
+                false,
+                "unauthorized",
+            ),
+            ("{\"cmd\":\"poll\"}\n", true, "malformed request"),
+        ] {
+            let (mut client, server) = tokio::io::duplex(1024);
+            client.write_all(request.as_bytes()).await.unwrap();
+            assert!(matches!(
+                serve_control(server, &StatusSnapshot::default(), authenticated)
+                    .await
+                    .unwrap(),
+                ServeOutcome::OneShot(None)
+            ));
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).await.unwrap();
+            assert!(reply.contains(expected));
+        }
+        let (mut client, server) = tokio::io::duplex(1024);
+        client
+            .write_all(b"{\"cmd\":\"poll\",\"target\":\"spare\"}\n")
+            .await
+            .unwrap();
+        match serve_control(server, &StatusSnapshot::default(), true)
+            .await
+            .unwrap()
+        {
+            ServeOutcome::Poll(stream, command) => {
+                assert_eq!(command.target, "spare");
+                write_poll_ack(
+                    stream,
+                    &PollAck::Polled {
+                        label: "spare".to_owned(),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            _ => panic!("authenticated poll must hand off without acknowledging early"),
+        }
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<PollAck>(&reply).unwrap(),
+            PollAck::Polled {
+                label: "spare".to_owned()
+            }
+        );
+    }
 
     /// Every [`CaptureRejection`] the daemon can emit, paired with the wire tag it serializes as.
     ///
