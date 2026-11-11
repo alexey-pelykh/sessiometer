@@ -53,7 +53,7 @@ final class StatsTests: XCTestCase {
         guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsBasic) else {
             return XCTFail("expected a StatsWire document, not an error envelope")
         }
-        XCTAssertEqual(wire.schema, 1)
+        XCTAssertEqual(wire.schema, 2)
 
         // Window
         XCTAssertEqual(wire.window.start, 1_782_864_000)
@@ -72,7 +72,7 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(bucket.start, 0)
         XCTAssertEqual(bucket.end, 21_600)
         let bucketWork = try XCTUnwrap(bucket.accounts["work"])
-        XCTAssertEqual(bucketWork.session.peak, 0.9, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(bucketWork.session).peak, 0.9, accuracy: 1e-9)
 
         // Summary roster: the aggregate callout's source.
         XCTAssertEqual(wire.summary.roster.swapCount, 1)
@@ -89,24 +89,64 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(work.seen, 3)
         XCTAssertEqual(work.coverage, 1.0, accuracy: 1e-9)
         XCTAssertEqual(work.coverageClass, .complete)
-        XCTAssertEqual(work.session.mean, 0.5, accuracy: 1e-9)
-        XCTAssertEqual(work.session.peak, 0.9, accuracy: 1e-9)
-        XCTAssertEqual(work.session.p95, 0.85, accuracy: 1e-9)
-        XCTAssertEqual(work.weekly.mean, 0.3, accuracy: 1e-9)
-        XCTAssertEqual(work.weekly.peak, 0.4, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.session).mean, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.session).peak, 0.9, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.session).p95, 0.85, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.weekly).mean, 0.3, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(work.weekly).peak, 0.4, accuracy: 1e-9)
         XCTAssertEqual(work.capHits, 1)
         XCTAssertEqual(work.timeAtCapSecs, 300)
         XCTAssertEqual(work.contributionShare, 1.0, accuracy: 1e-9)
         XCTAssertEqual(work.band, .high)
 
         // Back-compat (#642): the golden is emitted from a HEALTHY report, so `config_unreadable` is
-        // ABSENT (not null) and decodes to nil — the `decodeIfPresent` additive-default path. These
-        // are the same bytes a PRE-#642 daemon sends, so the ~40 assertions above are also the proof
-        // that an older daemon's reply still decodes field-for-field: that is what makes the field
-        // safe WITHOUT a `schema` bump. The panel renders no caveat and reads the numbers as the
-        // operator's own.
+        // ABSENT (not null) and decodes to nil — the `decodeIfPresent` additive-default path. A
+        // PRE-#642 daemon's reply lacks the key the same way, so the ~40 assertions above are also the
+        // proof that a reply without it still decodes field-for-field: that is what makes the field
+        // safe WITHOUT a `schema` bump of its own. The panel renders no caveat and reads the numbers as
+        // the operator's own.
         XCTAssertNil(wire.configUnreadable,
                      "a healthy (or pre-#642) daemon omits `config_unreadable` entirely — no caveat to render")
+    }
+
+    // An entry for an account with no session window OMITS the four session-keyed keys, and decodes with
+    // `nil` in each — a decodable state, never a lost reply — while the full entry beside it keeps every
+    // figure. Read off the byte-pinned golden, so the omission bytes it decodes are the daemon's own.
+    func testDecodesAWeeklyOnlyEntryWithTheFourSessionKeysOmitted() throws {
+        guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsBasic) else {
+            return XCTFail("expected a StatsWire document, not an error envelope")
+        }
+        XCTAssertEqual(wire.schema, 2)
+
+        func assertWeeklyOnly(_ entry: StatsAccountStats, _ place: String) {
+            XCTAssertNil(entry.session, "\(place): an omitted `session` decodes to nil")
+            XCTAssertNil(entry.band, "\(place): an omitted `band` decodes to nil")
+            XCTAssertNil(entry.capHits, "\(place): an omitted `cap_hits` decodes to nil")
+            XCTAssertNil(entry.timeAtCapSecs, "\(place): an omitted `time_at_cap_secs` decodes to nil")
+            XCTAssertNotNil(entry.weekly, "\(place): the weekly block is kept")
+        }
+        let others = wire.summary.accounts.filter { $0.key != "work" }
+        XCTAssertEqual(others.count, 1, "the summary carries exactly one entry other than `work`")
+        for (handle, entry) in others {
+            assertWeeklyOnly(entry, "summary.\(handle)")
+        }
+        XCTAssertFalse(wire.series.isEmpty, "the golden has a series bucket")
+        for (index, bucket) in wire.series.enumerated() {
+            let bucketOthers = bucket.accounts.filter { $0.key != "work" }
+            XCTAssertLessThanOrEqual(bucketOthers.count, 1, "series[\(index)] holds at most that one entry")
+            XCTAssertEqual(bucketOthers.count, 1,
+                           "series[\(index)] holds that one entry — a loop over none would pass vacuously")
+            for (handle, entry) in bucketOthers {
+                assertWeeklyOnly(entry, "series[\(index)].\(handle)")
+            }
+        }
+
+        let work = try XCTUnwrap(wire.summary.accounts["work"])
+        XCTAssertEqual(work.session, StatsDim(mean: 0.5, peak: 0.9, p95: 0.85))
+        XCTAssertEqual(work.weekly, StatsDim(mean: 0.3, peak: 0.4, p95: 0.38))
+        XCTAssertEqual(work.capHits, 1)
+        XCTAssertEqual(work.timeAtCapSecs, 300)
+        XCTAssertEqual(work.band, .high)
     }
 
     // MARK: - #642: the malformed-config wire signal
@@ -131,9 +171,21 @@ final class StatsTests: XCTestCase {
         XCTAssertFalse(detail.contains("@"), "no address-shaped token from an echoed config line")
         // The series is still fully served — the panel keeps its best-effort data and qualifies it, rather
         // than losing the tab. That is why the daemon does NOT degrade to an `{"error":…}` envelope here.
-        XCTAssertEqual(wire.schema, 1, "an additive field, so still schema:1 — no bump")
+        XCTAssertEqual(wire.schema, 2,
+                       "an additive field, so no bump of its own — the version is 2 since the session keys "
+                       + "became omittable")
         XCTAssertEqual(wire.series.count, 1, "the series survives the degraded path")
         XCTAssertEqual(try XCTUnwrap(wire.summary.accounts["work"]).capHits, 1)
+    }
+
+    // The degraded-config fixture is the golden plus its one key, byte for byte — so a regenerated
+    // `statsBasic` cannot leave `statsConfigUnreadable` on a stale shape (an older schema digit, a lost
+    // entry) while every decode-level assertion on it still passes.
+    func testTheConfigUnreadableFixtureIsTheGoldenPlusItsOneKey() {
+        XCTAssertTrue(Fixtures.statsBasic.hasSuffix("}"), "the golden is one JSON object")
+        let reason = "config.toml is not valid TOML — run `sessiometer config validate` for the detail"
+        XCTAssertEqual(Fixtures.statsConfigUnreadable,
+                       String(Fixtures.statsBasic.dropLast()) + #","config_unreadable":""# + reason + #""}"#)
     }
 
     // The panel copy: it must state the CONSEQUENCE (numbers rest on defaults), not merely that something
@@ -167,6 +219,45 @@ final class StatsTests: XCTestCase {
     func testUnknownBandIsADecodeError() {
         let line = Fixtures.statsBasic.replacingOccurrences(of: #""band":"high""#, with: #""band":"nova""#)
         XCTAssertThrowsError(try decodeStatsReply(line), "an unknown band must not silently decode")
+    }
+
+    // A PRESENT `session` block of the wrong shape still throws: the optional decode tolerates an ABSENT
+    // key (or an explicit `null`), never a malformed value — a decoder that swallowed the error into `nil`
+    // would read a drifted daemon as an account with no session window.
+    func testAMalformedPresentSessionBlockStillThrows() {
+        let line = Fixtures.statsBasic.replacingOccurrences(
+            of: #""session":{"mean":0.5,"peak":0.9,"p95":0.85}"#, with: #""session":{"mean":"x"}"#)
+        XCTAssertNotEqual(line, Fixtures.statsBasic, "the replacement found its target")
+        XCTAssertThrowsError(try decodeStatsReply(line), "a malformed present session block must not decode")
+    }
+
+    // The same guarantee on every other omittable key the explicit decoder reads with `decodeIfPresent`
+    // (`band` has its own, `testUnknownBandIsADecodeError`): a PRESENT value of the wrong shape throws,
+    // never decodes to the `nil` that means "no reading on that axis".
+    func testAMalformedPresentWeeklyCapHitsOrTimeAtCapStillThrows() {
+        let cases: [(key: String, of: String, with: String)] = [
+            ("weekly", #""weekly":{"mean":0.3,"peak":0.4,"p95":0.38}"#, #""weekly":{"mean":"x"}"#),
+            ("cap_hits", #""cap_hits":1"#, #""cap_hits":"one""#),
+            ("time_at_cap_secs", #""time_at_cap_secs":300"#, #""time_at_cap_secs":"300s""#),
+        ]
+        for c in cases {
+            let line = Fixtures.statsBasic.replacingOccurrences(of: c.of, with: c.with)
+            XCTAssertNotEqual(line, Fixtures.statsBasic, "`\(c.key)`: the replacement found its target")
+            XCTAssertThrowsError(try decodeStatsReply(line), "a malformed present `\(c.key)` must not decode")
+        }
+    }
+
+    // An explicit `null` on an omittable key decodes to `nil`, exactly as an absent key does — the
+    // `decodeIfPresent` tolerance `StatsAccountStats`' doc states. The daemon never writes this form (it
+    // omits the key), so this pins the decoder's documented reading, not a wire shape.
+    func testAnExplicitNullSessionDecodesAsAnAbsentOne() throws {
+        let line = Fixtures.statsBasic.replacingOccurrences(
+            of: #""session":{"mean":0.5,"peak":0.9,"p95":0.85}"#, with: #""session":null"#)
+        XCTAssertNotEqual(line, Fixtures.statsBasic, "the replacement found its target")
+        guard case .ok(let wire) = try decodeStatsReply(line) else {
+            return XCTFail("expected a StatsWire document, not an error envelope")
+        }
+        XCTAssertNil(try XCTUnwrap(wire.summary.accounts["work"]).session)
     }
 
     // A non-JSON line throws (→ the model's `.undecodable`), exactly like the `watch` decoder.
@@ -272,6 +363,39 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.sparkSeries(wire.series, handle: "absent-handle"), [0.0])
     }
 
+    // An account with no session window draws NO line: any bucket holding a SAMPLED (`seen > 0`) entry for
+    // the handle whose `session` is nil empties the whole series, so no floor line poses as a reading. A
+    // `seen == 0` entry — the contribution-only record, which holds no reading on any axis — keeps today's
+    // floor, exactly as a bucket with no entry for the handle does.
+    func testSparkSeriesIsEmptyForAnAccountWithANoSessionBucketNeverAFloorLine() throws {
+        guard case .ok(let base) = try decodeStatsReply(Fixtures.statsBasic) else {
+            return XCTFail("expected a StatsWire document")
+        }
+        let work = try XCTUnwrap(base.summary.accounts["work"])
+        let spare = try JSONDecoder().decode(StatsAccountStats.self, from: Data(
+            #"{"seen":3,"coverage":1.0,"coverage_class":"complete","weekly":{"mean":0.5,"peak":0.9,"p95":0.9},"contribution_share":0.0}"#.utf8))
+        let dark = try JSONDecoder().decode(StatsAccountStats.self, from: Data(
+            #"{"seen":0,"coverage":0.0,"coverage_class":"absent","contribution_share":0.0}"#.utf8))
+        let roster = try XCTUnwrap(base.series.first).roster
+        let buckets = [
+            StatsBucket(start: 0, end: 3600, roster: roster,
+                        accounts: ["work": work, "spare": spare, "mixed": work, "dark": work]),
+            StatsBucket(start: 3600, end: 7200, roster: roster, accounts: ["mixed": spare, "dark": dark]),
+            StatsBucket(start: 7200, end: 10800, roster: roster, accounts: ["work": work, "spare": spare, "dark": work]),
+        ]
+        XCTAssertEqual(StatusPanelFormat.sparkSeries(buckets, handle: "spare"), [])
+        XCTAssertEqual(StatusPanelFormat.sparkSeries(buckets, handle: "mixed"), [],
+                       "a present session in bucket 0 and a nil one in bucket 1")
+        XCTAssertEqual(StatusPanelFormat.sparkSeries(buckets, handle: "work"), [0.9, 0.0, 0.9],
+                       "bucket 1 has no `work` entry, so today's floor stands")
+        XCTAssertEqual(StatusPanelFormat.sparkSeries(buckets, handle: "dark"), [0.9, 0.0, 0.9],
+                       "bucket 1's `seen == 0` entry keeps today's floor, like an absent entry")
+        XCTAssertEqual(StatusPanelFormat.sparkSeries(buckets, handle: "absent-handle"), [0.0, 0.0, 0.0])
+        XCTAssertTrue(StatusPanelFormat.sparkPoints(StatusPanelFormat.sparkSeries(buckets, handle: "spare"),
+                                                    width: 200, height: 28, inset: 3).isEmpty,
+                      "an empty series yields no point, so the view draws nothing")
+    }
+
     // MARK: - Signal (band → the mock's three-way descriptor)
 
     func testSignalCollapsesTheBandLikeTheCLI() {
@@ -316,6 +440,45 @@ final class StatsTests: XCTestCase {
         let work = try XCTUnwrap(wire.summary.accounts["work"])
         XCTAssertEqual(StatusPanelFormat.statsSessionMeanPeak(work), "50 / 90%")
         XCTAssertEqual(StatusPanelFormat.statsWeeklyPeak(work), "40%")
+    }
+
+    // A weekly-only account renders the panel's transitional `n/a` where its session figures and cap hits
+    // would sit, draws no signal pill, and speaks only its handle, its active marker and its weekly peak —
+    // no `0 / 0%`, no `0`, no pill classifying a reading nobody made. A full row reads exactly as before.
+    func testAWeeklyOnlyStatsRowRendersTheTransitionalNAAndSpeaksOnlyItsWeeklyPeak() throws {
+        let spare = try JSONDecoder().decode(StatsAccountStats.self, from: Data(
+            #"{"seen":3,"coverage":1.0,"coverage_class":"complete","weekly":{"mean":0.5,"peak":0.9,"p95":0.9},"contribution_share":0.0}"#.utf8))
+        guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsBasic) else {
+            return XCTFail("expected a StatsWire document")
+        }
+        let work = try XCTUnwrap(wire.summary.accounts["work"])
+
+        XCTAssertEqual(StatusPanelFormat.statsSessionMeanPeak(spare), "n/a")
+        XCTAssertEqual(StatusPanelFormat.statsWeeklyPeak(spare), "90%")
+        XCTAssertNil(StatusPanelFormat.statsSignal(spare.band), "no band, so no signal pill")
+        XCTAssertEqual(StatusPanelFormat.statsCapHits(spare), "n/a")
+        XCTAssertEqual(StatusPanelFormat.statsRowAccessibilityLabel(handle: "spare", account: spare, isActive: false),
+                       "spare. Weekly peak 90 percent.")
+        XCTAssertEqual(StatusPanelFormat.statsRowAccessibilityLabel(handle: "spare", account: spare, isActive: true),
+                       "spare, active. Weekly peak 90 percent.")
+
+        XCTAssertEqual(StatusPanelFormat.statsCapHits(work), "1")
+        XCTAssertEqual(StatusPanelFormat.statsRowAccessibilityLabel(handle: "work", account: work, isActive: false),
+                       "work. saturated. Session mean 50 percent, peak 90 percent. Weekly peak 40 percent. 1 cap hits.")
+    }
+
+    // The weekly twin: a weekly-less account renders `n/a` in its `Weekly pk` cell and its spoken summary
+    // drops the weekly clause, while its session figures, its signal and its cap hits read as measured.
+    func testAWeeklyLessStatsRowRendersTheTransitionalNAAndDropsTheWeeklyClause() throws {
+        let future = try JSONDecoder().decode(StatsAccountStats.self, from: Data(
+            #"{"seen":3,"coverage":1.0,"coverage_class":"complete","session":{"mean":0.42,"peak":0.42,"p95":0.42},"cap_hits":0,"time_at_cap_secs":0,"contribution_share":1.0,"band":"low"}"#.utf8))
+        XCTAssertNil(future.weekly)
+        XCTAssertEqual(StatusPanelFormat.statsWeeklyPeak(future), "n/a")
+        XCTAssertEqual(StatusPanelFormat.statsSessionMeanPeak(future), "42 / 42%")
+        XCTAssertEqual(StatusPanelFormat.statsSignal(future.band), .underused)
+        XCTAssertEqual(StatusPanelFormat.statsCapHits(future), "0")
+        XCTAssertEqual(StatusPanelFormat.statsRowAccessibilityLabel(handle: "future", account: future, isActive: false),
+                       "future. underused. Session mean 42 percent, peak 42 percent. 0 cap hits.")
     }
 
     func testStatsDurationIsCoarseTwoUnit() {
@@ -742,7 +905,7 @@ final class StatsTests: XCTestCase {
     /// gate survives the DECODE: a misnamed `CodingKey` yields `nil`, which takes the drop path and
     /// would render this exact payload as a confident `0 episodes (0s)`.
     func testAnEmptyRosterReportsUnknownRatherThanAMeasuredZero() throws {
-        let line = #"{"schema":1,"window":{"start":0,"end":604800,"label":"last 7 days","period":"week"},"# +
+        let line = #"{"schema":2,"window":{"start":0,"end":604800,"label":"last 7 days","period":"week"},"# +
                    #""accounts":[],"series":[],"summary":{"roster":{"swap_count":0,"# +
                    #""swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"# +
                    #""all_high_episodes":0,"all_high_secs":0,"all_high_threshold":0.95,"# +
@@ -919,7 +1082,7 @@ final class StatsTests: XCTestCase {
         guard case .loaded(let wire) = model.phase else {
             return XCTFail("expected .loaded, got \(model.phase)")
         }
-        XCTAssertEqual(wire.schema, 1)
+        XCTAssertEqual(wire.schema, 2)
         XCTAssertEqual(wire.summary.accounts["work"]?.band, .high)
     }
 

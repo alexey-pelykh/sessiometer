@@ -184,7 +184,11 @@ private struct StatStripRow: View {
                     // issue #700's untruncated-label criterion: dropping the sparkline alone left the longest
                     // handle ~9 pt short.
                     .frame(maxWidth: .infinity, alignment: .leading)
-                SignalPill(signal: signal)
+                // No `band` (an account with no session reading) → no pill: there is no session peak to
+                // classify, and a pill would name a class for a reading nobody made.
+                if let signal {
+                    SignalPill(signal: signal)
+                }
             }
             // The chart on its OWN full-width row (issue #700), inset to the metrics block's leading edge
             // below it (mock `.stat-chart { margin-left:17px }`) rather than the card edge — so the series
@@ -196,7 +200,7 @@ private struct StatStripRow: View {
             HStack(alignment: .top, spacing: 8 * scale) {
                 StatCell(label: "Session m/pk", value: StatusPanelFormat.statsSessionMeanPeak(account))
                 StatCell(label: "Weekly pk", value: StatusPanelFormat.statsWeeklyPeak(account))
-                StatCell(label: "Cap-hits", value: "\(account.capHits)")
+                StatCell(label: "Cap-hits", value: StatusPanelFormat.statsCapHits(account))
             }
             .padding(.leading, StatusPanelFormat.statsChartLeadingInset * scale)  // aligns the body under the name
         }
@@ -212,15 +216,9 @@ private struct StatStripRow: View {
     }
 
     /// The spoken row summary — identity + signal + the numeric body, so the sparkline (accessibility-hidden,
-    /// a purely visual trend) is still conveyed as facts.
+    /// a purely visual trend) is still conveyed as facts (`StatusPanelFormat.statsRowAccessibilityLabel`).
     private var accessibilityLabel: String {
-        let signal = StatusPanelFormat.statsSignal(account.band)
-        let sessionMean = StatusPanelFormat.statsPercent(account.session.mean)
-        let sessionPeak = StatusPanelFormat.statsPercent(account.session.peak)
-        let weeklyPeak = StatusPanelFormat.statsPercent(account.weekly.peak)
-        let active = isActive ? ", active" : ""
-        return "\(handle)\(active). \(signal.label). Session mean \(sessionMean) percent, "
-            + "peak \(sessionPeak) percent. Weekly peak \(weeklyPeak) percent. \(account.capHits) cap hits."
+        StatusPanelFormat.statsRowAccessibilityLabel(handle: handle, account: account, isActive: isActive)
     }
 }
 
@@ -275,10 +273,13 @@ private struct Sparkline: View {
             // Fewer than two BUCKETS is not a trend, so the wider band is left empty rather than filled with
             // a confident-looking line. The guard is on point COUNT (and `sparkPoints` returns none for a
             // degenerate box), so it is width-independent: widening cannot turn "nothing to plot" into a
-            // drawn baseline. Note what this does NOT cover — an account with no readings at all never
+            // drawn baseline. The same guard draws nothing for an account with no session window: its
+            // series is empty (`sparkSeries`), so there is no line at all rather than a floor line for
+            // readings nobody made. Note what this does NOT cover — an account with no readings at all never
             // reaches here, because `StatsContent` lists only handles the summary measured; and a genuinely
             // all-zero 7-bucket series DOES draw a flat line along the floor, deliberately (`sparkSeries`:
-            // "an unmeasured bucket is a real low"). That line is a true reading, not a fabricated one.
+            // "an unmeasured bucket is a real low"). That line is drawn from session readings the daemon
+            // made, or from buckets it never sampled — never from an account that has no session window.
             guard points.count >= 2 else { return }
             let color = Color.spark(dark: colorScheme == .dark)
 
