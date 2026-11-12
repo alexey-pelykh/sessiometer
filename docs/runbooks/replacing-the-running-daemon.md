@@ -506,17 +506,30 @@ date -u +%Y-%m-%dT%H:%M:%SZ
 "$S" status --json | jq -c '[.accounts | to_entries[] | select(.value.enabled and .value.auth == "healthy" and .value.weekly_pct == null) | .key + 1]'
 ```
 
-Goal: at take 2 the first command prints `H0/H0 healthy accounts served`, both numbers equal to
-the `H0` you recorded, and the second prints `[]`. An `H0` of 0 proves nothing. A denominator below
-`H0` is not met, whatever the numerator: an account left the healthy set. Repair that credential
-and read again at the next take; this check does not judge why it left. The result then follows
-the take: `late` when take 3 prints `H0/H0`, and FAIL when take 3 still shows a denominator below
-`H0`. A position the second command lists at take 2 means
+Goal: at take 2 the first command prints `N/N healthy accounts served`, both numbers equal and
+`N` at least the `H0` you recorded, and the second prints `[]`. An `H0` of 0 proves nothing. A
+denominator above `H0` is met: the daemon keeps credential health in memory, so the restart
+clears it, and an account the old daemon did not count can poll healthy under the new one;
+record the denominator beside the result. A denominator below `H0` is not met, whatever the
+numerator: an account left the healthy set. Repair that credential and read again at the next
+take; this check does not judge why it left. The result then follows the take: `late` when take 3
+prints `N/N` with `N` at least `H0`, and FAIL when take 3 still shows a denominator below `H0`.
+A position the second command lists at take 2 means
 the reading is not met: run route (e) for it at take 3 or later. A reading whose second command
 first prints `[]` at take 3 is `late`. FAIL: the second command lists any position at take 3.
 Why `weekly_pct`: a failed poll nulls both percentages, while a served account without a
 session window carries `session_pct: null` beside a present `weekly_pct`, so `weekly_pct` tells
-the two apart and `session_pct` does not.
+the two apart and `session_pct` does not. Readings (b) and (d) assume every served account has a
+weekly window, as REQ-DEP-Q-001's one SCALE does ("`weekly_pct` non-null in `status --json`");
+when this was written no account had a five-hour window without a weekly one. Such an account
+shows `weekly_pct: null` beside a non-null `session_pct`, a pair no failed poll produces, and (b)
+lists it as unserved and (d) as unread. Before you run route (e) for a position either reading
+lists, read that row's `session_pct`:
+`"$S" status --json | jq --argjson p 7 '.accounts[$p - 1].session_pct'`, with 7 replaced by the
+position. If it prints a number, the account is served on its session window only and the
+reading's result says nothing about the deploy: record the result the take gives with that
+position, run no route for it, file nothing against the deploy, and say on the work item that
+REQ-DEP-Q-001's SCALE, not the deploy, is what needs amending.
 
 **(c) Sampling resumed, takes 2 and 3.** Every enabled, healthy account should have written a
 sample line since the restart:
@@ -568,15 +581,21 @@ date -u +%Y-%m-%dT%H:%M:%SZ
         else "fail" end)'
 ```
 
-A spare is an enabled, healthy, non-active row. The program computes the target's 1-based
+A spare is an enabled, healthy, non-active row. Like (b), the program counts a spare as read when
+its `weekly_pct` is non-null, so a served spare with no weekly window is unread here; (b) states
+that assumption and the read that detects it. The program computes the target's 1-based
 position and never prints `to`. `verdict` reads `met` when the daemon names a target in the
 roster; `retake` while it is `awaiting_data`, or `no_viable_target` with a spare unread;
 `met_weekly_blocked` when it is `no_viable_target` with `cause` `weekly`, no spare unread, and
 every spare `weekly_exhausted`, with `weekly_blocked_spares` naming each spare by position and
 `weekly_resets_at`. That arm reads REQ-DEP-B-002's exception, "every enabled spare has a served
 reading and each is at or above the weekly line (none unread)"; the requirement also has the daemon
-name "the soonest-returning spare and its weekly reset", which the reading records as `resets_at`
-beside the list. `verdict` reads `no-anchor` when
+name "the soonest-returning spare and its weekly reset". Under `no_viable_target` the wire carries
+`cause` and `resets_at` and no `to`, so no reading can check which spare the daemon means, and the
+daemon takes `resets_at` over every enabled non-active account it holds a reading for, healthy or
+not, and over both windows. The reading records `resets_at` beside the list; a non-null
+`resets_at` that matches no `weekly_resets_at` in `weekly_blocked_spares` goes on the work item
+with the takes, and does not change the verdict. `verdict` reads `no-anchor` when
 `next_swap` is `null`, which the daemon writes when there is no active anchor to swap from; and
 `fail` otherwise: in particular `cause` `session` or absent, and any spare with weekly headroom. A
 weekly-only one passed over is a defect. A two-window one may be held by the daemon's session
@@ -659,7 +678,8 @@ writes a `usage_gap` and never a `usage_backoff`.
     listed, take the operator-capture route above.
 - **Reading (d): `fail` at take 2 or later, or `retake` at take 2.** For a `fail`, file a
   `(fix) swap:` issue there with every take's output. For each position in `unread_spares` at
-  take 2, run the block above and the first bullet's branches. A `retake` at take 2 that reads
+  take 2, first read its `session_pct` as reading (b)'s last paragraph says, then run the block
+  above and the first bullet's branches. A `retake` at take 2 that reads
   `met` or `met_weekly_blocked` at take 3 is `late`: record it and file nothing.
 
 Post every take of (b), (c) and (d), each with its UTC timestamp, then each reading's result
