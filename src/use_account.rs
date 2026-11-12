@@ -3225,6 +3225,17 @@ mod tests {
         ("reconcile_login", NotHandleResolution, "`CaptureReport.label`"),
         ("serve_control", NotHandleResolution, "the control request's own `label` field, forwarded into a `CaptureCommand`"),
         ("to_log_line", NotHandleResolution, "`Event::UncapturedLogin { account_uuid }` — a MATCH ARM binding the event's OWN uuid payload to render it into the `acct=` field of a log line. Only the `Event` definition binds one; the `Diagnostic` one at `src/observability.rs:3252` does not, so this stays a single-site row"),
+        // --- a TEST function in a test-module CHILD FILE the non-test boundary cannot see -----
+        //
+        // A child file DECLARED from inside a host's `#[cfg(test)] mod tests { … }` — the line
+        // `mod oracle_1599;`, resolving to `<host>/tests/oracle_1599.rs` — is test code, but
+        // carries no `#[cfg(test)]` of its own, so `non_test_region` scans all of it. That is the
+        // over-scan bias that function's doc chooses on purpose, and each such row is its cost
+        // showing up: the read sits in a test, never in production code. Issue #1599's frozen
+        // oracles were the first files of this shape; a frozen test is not edited to dodge the
+        // scan, and narrowing the walk to skip `tests/` directories would trade this register line
+        // for a silent green on any production file placed there.
+        ("a_retry_after_blind_swap_off_a_session_less_anchor_narrates_the_swap_with_no_percent_on_the_wire", NotHandleResolution, "issue #1599's RT-9 oracle (`src/daemon/tests/oracle_1599.rs`) — reads the snapshot's per-account `label` / `active` to find the swap's target and assert the notice's bytes; a test, not a resolver"),
     ];
 
     /// Names that read an identity field from MORE THAN ONE definition, and why ONE
@@ -3532,7 +3543,7 @@ mod tests {
         for (arm, expected) in [
             (SharedResolver, 1),
             (ViaSharedResolver, 4),
-            (NotHandleResolution, 92),
+            (NotHandleResolution, 93),
         ] {
             let actual = HANDLE_READ_REGISTER
                 .iter()
@@ -5499,6 +5510,7 @@ mod tests {
             // Likewise the #882 refresh-token expiry modifier: surfaced, never acted upon, so the
             // viability gate does not read it.
             expiry: None,
+            absent_windows: Vec::new(),
         }
     }
 

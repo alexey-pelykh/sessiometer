@@ -1141,6 +1141,30 @@ final class StatusPanelFormatTests: XCTestCase {
             "work, active, auth healthy, blind for 4m, last-known session 64 percent, auto-protection okay, daemon self-resolving")
     }
 
+    // Issue #1599 § 5: the panel interim's ONE gate. A percent-less block (an anchor with no session
+    // window) is no block to the row until #1594 classifies it; a block with a percent passes through
+    // untouched; no block stays no block. The row's spoken label, built through the gate, is then the
+    // failed-poll row's label byte for byte. (The frozen ST-5 pins the observable half: the model keeps
+    // the block, the glance reads it raw, and a present percent is spoken as a number.)
+    func testHeldBlindGatesAPercentLessBlockOutOfTheRowAndPassesAPresentOneThrough() {
+        let percentLess = BlindActive(blindSecs: 480, lastKnownSessionPct: nil, autoProtectionDegraded: true)
+        let held = BlindActive(blindSecs: 480, lastKnownSessionPct: 87, autoProtectionDegraded: true)
+        XCTAssertNil(StatusPanelFormat.heldBlind(percentLess), "a percent-less block renders as no block")
+        XCTAssertEqual(StatusPanelFormat.heldBlind(held), held, "a block with its percent passes unchanged")
+        XCTAssertNil(StatusPanelFormat.heldBlind(nil), "no block stays no block")
+
+        let speak = { (blind: BlindActive?) in
+            StatusPanelFormat.rowAccessibilityLabel(
+                label: "work", isActive: true, auth: .healthy, recovering: false, enabled: true,
+                quarantined: false, sessionPct: nil, weeklyPct: nil, sessionReset: "n/a", weeklyReset: "n/a",
+                blind: blind)
+        }
+        let failedPoll = speak(nil)
+        XCTAssertEqual(failedPoll, "work, active, auth healthy, session n/a resets in n/a, weekly n/a resets in n/a")
+        XCTAssertEqual(speak(percentLess), failedPoll,
+                       "a percent-less block speaks the failed-poll label — no blind clause, no Optional")
+    }
+
     // A blind row whose credential is ALSO in a warning state speaks BOTH — the at-risk auth verdict is not
     // dropped because the poll went blind (the a11y half of #485's orthogonal-axes fix; the visual half rides
     // `blindCoShowsAuthWarning`). Orthogonal facts, both voiced.

@@ -484,21 +484,29 @@ extension CanaryStatus: Decodable {
 
 /// The active account's bounded-blindness projection (issues #479/#485) — mirrors the daemon's
 /// `BlindActive` (`src/daemon/snapshot.rs`): how long the active account has been blind, the retained
-/// last-known session %, and whether ADR-0017 preemptive auto-protection is DEGRADED (armed, but acting
-/// on a STALE anchor). Wire key `blind_active`, present ONLY on a blind active account — the daemon OMITS
-/// the key otherwise (`skip_serializing_if`), so a non-blind line's bytes are unchanged (additive minor
-/// 1.3 → 1.4). All three inner fields are required WHEN the object is present (the Rust fields carry no
-/// default), so a malformed `blind_active` missing one throws rather than mis-reads. Non-secret — a
-/// duration and two small numbers, never a token or email (issue #15).
+/// last-known session % when the anchor has one, and whether ADR-0017 preemptive auto-protection is
+/// DEGRADED (an arm reports the account unprotected — armed but acting on a STALE anchor, or, for an
+/// anchor with no session window, no session window for the gate to guard; issue #1599). Wire key
+/// `blind_active`, present ONLY on a blind active account — the daemon OMITS the key otherwise
+/// (`skip_serializing_if`), so a non-blind line's bytes are unchanged (additive minor 1.3 → 1.4).
+/// `blind_secs` and `auto_protection_degraded` are required WHEN the object is present (the Rust fields
+/// carry no default), so a malformed `blind_active` missing either throws rather than mis-reads; the
+/// percent is optional since 1.15, `nil` when the anchor carries no session window, never a fabricated
+/// `0`. Non-secret — a duration and two small numbers, never a token or email (issue #15).
 struct BlindActive: Decodable, Equatable, Sendable {
     /// Seconds the active account has been blind (`blind_secs`) — a DURATION the client renders verbatim
     /// against its own clock-free `humanizeUntil`, never an absolute instant.
     let blindSecs: UInt64
     /// The retained pre-blind SESSION-window usage percent (`0…100`, `last_known_session_pct`) — the
     /// last-known reading before the account went blind. Why the row shows a HELD value, not "no data".
-    let lastKnownSessionPct: UInt8
-    /// Whether ADR-0017 auto-protection is DEGRADED — the gate is armed but acting on a STALE anchor.
-    /// `false` = OK (blind, but not yet past the gate threshold, or the anchor sat below the risk band).
+    /// `nil` when the anchor carries no session window (a weekly-only account; the daemon omits the key,
+    /// issue #1599) — never a fabricated `0`. Read through `StatusPanelFormat.heldBlind`, which renders
+    /// such a block as no block until #1594 classifies it.
+    let lastKnownSessionPct: UInt8?
+    /// Whether ADR-0017 auto-protection is DEGRADED — an arm reports the account unprotected: the gate
+    /// armed but acting on a STALE anchor, or (issue #1599) an anchor with no session window for the gate
+    /// to guard, past the gate. `false` = OK (blind, but not yet past the gate threshold, or the anchor
+    /// sat below the risk band).
     let autoProtectionDegraded: Bool
 
     private enum CodingKeys: String, CodingKey {
@@ -531,9 +539,10 @@ struct BlindActive: Decodable, Equatable, Sendable {
 ///     `next_swap.reason.kind` (#412) and `systemic_refresh_source` (#813) already declined.
 ///  2. **It matches the daemon's own posture for this object.** `AccountExpiry.horizon_state` is
 ///     `#[serde(default)]` on the Rust side precisely so a partial `expiry` degrades to the fail-safe
-///     `Unknown` instead of throwing — deliberately unlike `BlindActive`, whose fields have no honest
-///     default. Degrading an unrecognised TOKEN to the same fail-safe extends that rule rather than
-///     inventing one.
+///     `Unknown` instead of throwing — deliberately unlike `BlindActive`, whose `blind_secs` and
+///     `auto_protection_degraded` have no honest default and so throw when missing (its
+///     `last_known_session_pct` is optional since 1.15 and decodes as `nil`). Degrading an
+///     unrecognised TOKEN to the same fail-safe extends that rule rather than inventing one.
 ///
 /// The cost is that a future fifth classification renders as the gap `—` on an un-updated client
 /// instead of announcing itself. That is the safe direction: a gap claims nothing, and the minor bump
@@ -586,8 +595,8 @@ extension ExpiryHorizon: Decodable {
 ///
 /// Both fields decode via `decodeIfPresent`, mirroring the Rust `#[serde(default)]` on each: a partial
 /// `expiry` object DEGRADES (a missing `horizon_state` → the fail-safe `.unknown`) rather than throwing,
-/// deliberately unlike `BlindActive`. Non-secret — one timestamp and one classification, never a token
-/// or email (issue #15).
+/// deliberately unlike `BlindActive`, whose `blind_secs` and `auto_protection_degraded` throw when
+/// missing. Non-secret — one timestamp and one classification, never a token or email (issue #15).
 ///
 /// The daemon's `cohort_id` is deliberately NOT mirrored, and since issue #879 shipped the detector
 /// that is a CHOICE rather than a vacancy: a 1.13 daemon really does emit the key on every account
@@ -644,13 +653,21 @@ struct AccountStatusLine: Decodable, Equatable {
     let quarantined: Bool
     /// Whether a quarantined account is mid-recovery (issue #109). Defaults `false`.
     let recovering: Bool
-    /// Last-polled session-window usage percent (`0…100`); `nil` if the last poll failed.
-    /// Transitionally, until issue #1599 lands the wire's no-window key, `nil` beside a non-nil
-    /// `weeklyPct` means the served reading carried no session window (a failed poll nils both
-    /// percents); #1599 deletes this sentence.
+    /// Last-polled session-window usage percent (`0…100`); `nil` if the last poll failed. A `nil` on a
+    /// line whose `absentWindows` lists `session` is not a failed poll: the served reading carries no
+    /// session window, and that key is the only way to tell the two apart.
     let sessionPct: UInt8?
-    /// Last-polled weekly-window usage percent (`0…100`).
+    /// Last-polled weekly-window usage percent (`0…100`); `nil` if the last poll failed. A `nil` on a
+    /// line whose `absentWindows` lists `weekly` is not a failed poll: the served reading carries no
+    /// weekly window, and that key is the only way to tell the two apart.
     let weeklyPct: UInt8?
+    /// The quota windows the daemon says this account's served reading does not carry — wire key
+    /// `absent_windows`, `["session"]` for a weekly-only account; `[]` when the key is absent OR null (a
+    /// two-window row, a failed poll, a blind row, or a pre-1.15 daemon). The ONLY discriminator for
+    /// "no session window"; `sessionPct == nil` alone means the last poll failed. A string list, not an
+    /// enum: an unknown future token must not cost the frame (issue #1599). Carrying it into the row
+    /// model is #1594's.
+    let absentWindows: [String]
     /// Epoch seconds at which the rolling 5-hour session window resets; `nil` when unknown.
     let sessionResetsAt: Int64?
     /// Epoch seconds at which the weekly window resets; `nil` when unknown.
@@ -667,8 +684,10 @@ struct AccountStatusLine: Decodable, Equatable {
     /// The active account's bounded-blindness projection (issues #479/#485), wire key `blind_active`;
     /// present ONLY on a blind active account (the daemon omits the key otherwise). The panel renders it
     /// as a SEMANTIC per-row state — blind duration, last-known session %, and whether ADR-0017
-    /// auto-protection is OK or DEGRADED — in place of a false-healthy row (#137). Reflect-only: the
-    /// surface never self-polls or self-swaps off it (#169).
+    /// auto-protection is OK or DEGRADED — in place of a false-healthy row (#137). A block with no
+    /// last-known percent (an anchor with no session window, issue #1599) is kept here but rendered as
+    /// no block on the row until #1594 (`StatusPanelFormat.heldBlind`); the glance still reads it.
+    /// Reflect-only: the surface never self-polls or self-swaps off it (#169).
     let blindActive: BlindActive?
     /// This account's REFRESH-token expiry modifier (issues #878/#882), wire key `expiry`; present only
     /// once the account has been POLLED (the daemon omits the key otherwise). Mirrored here by #884 —
@@ -687,6 +706,7 @@ struct AccountStatusLine: Decodable, Equatable {
         case recovering
         case sessionPct = "session_pct"
         case weeklyPct = "weekly_pct"
+        case absentWindows = "absent_windows"
         case sessionResetsAt = "session_resets_at"
         case weeklyResetsAt = "weekly_resets_at"
         case weeklyExhausted = "weekly_exhausted"
@@ -706,6 +726,7 @@ struct AccountStatusLine: Decodable, Equatable {
         recovering = try c.decodeIfPresent(Bool.self, forKey: .recovering) ?? false
         sessionPct = try c.decodeIfPresent(UInt8.self, forKey: .sessionPct)
         weeklyPct = try c.decodeIfPresent(UInt8.self, forKey: .weeklyPct)
+        absentWindows = try c.decodeIfPresent([String].self, forKey: .absentWindows) ?? []
         sessionResetsAt = try c.decodeIfPresent(Int64.self, forKey: .sessionResetsAt)
         weeklyResetsAt = try c.decodeIfPresent(Int64.self, forKey: .weeklyResetsAt)
         weeklyExhausted = try c.decodeIfPresent(Bool.self, forKey: .weeklyExhausted) ?? false

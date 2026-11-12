@@ -263,6 +263,37 @@ and that approval is the ruling. The pull request author is asked to open an iss
 concern and to split the pull request by concern; the split drops the probe, the `User-Agent`
 override, the widening of the egress guard, the README probe paragraphs and the hunk on this record.
 
+**Amended 2026-11-12 (#1599)**: the **REPORT** side of this ADR (the `status`
+`auto_protection_degraded` projection, not the swap decision) gains a **fourth arm**: an active
+blind past `BLIND_GATE_SECS` whose retained anchor carries **no session window** reads DEGRADED.
+`blind_active_view` (`src/daemon/records.rs`) now projects the `blind_active` block for such an
+anchor, with `blind_secs`, with the verdict, and with `last_known_session_pct` omitted rather than a
+fabricated `0`; the new disjunct keys on the raw `anchor.session` being absent, the same value the
+omitted percent maps, so the verdict and the absent percent state one fact. Why: the anchor arm
+compares a *level to a level*, and an anchor with no session window has no level to compare, so
+`blind_gate_armed` reads false on it; with the #584 velocity arm also reading false there, a
+restored block with no `Retry-After` hold would report `auto-protection OK` for an account no
+session gate can protect. The one-sided invariant the arms serve, never "OK" while the daemon is
+not protecting the account, needs a disjunct, and adding one can only move OK to DEGRADED. Before
+the gate such a block reads OK, the pre-gate verdict every blind account gets. The arm is
+**REPORT-ONLY**, like the #584 velocity arm: no swap fires on it, and no daemon decision reads
+`auto_protection_degraded`. Whether a weekly anchor should **arm** a swap is not decided here: that
+is D3's arming half, the design's OAD-2, settled by council on 2026-11-03 as option (a), leave such
+an account unprotected and say so, rather than (b), arm on a weekly anchor against a new weekly
+band (the record is a comment on #1602). It stays outside umbrella #1590 until its reopening
+evidence is observed: a `blind_exit` line from a weekly-only anchor with `was_active=true`,
+`swapped_away=false` and no `session_pct=` token, whose `weekly_pct` is below the weekly rotation
+line and whose `weekly_at_recovery` is at or over it, a weekly wall reached while blind with no arm
+acting. D3
+itself was settled by council on 2026-11-03 under the maintainer's 2026-11-02 delegation, which
+supersedes the "ratification-pending, not an operator ruling" and "the ruling on D3 is the
+operator's" of the #1593 paragraph above, left unedited here. The representation recorded here,
+the fourth report-only arm, was settled by council on 2026-11-04 over a new omittable key and over
+a client-side exception (the record is a comment on #1599). The same change gives the
+`recent_blind_preempt_swap` notice an optional percent, because #582's `Retry-After` arm swaps off a
+session-less anchor without reading the session. The core **#452** decision and its constants are
+unchanged.
+
 ## Context
 
 sessiometer keeps **one** live Claude Code credential active by rotating across a

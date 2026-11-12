@@ -210,12 +210,20 @@ struct AccountRowView: View {
         StatusPanelFormat.weeklySeverity(weeklyPct: row.weeklyPct, weeklyExhausted: row.weeklyExhausted)
     }
 
+    /// The blind block this row renders — `StatusPanelFormat.heldBlind` applied ONCE (issue #1599): the
+    /// decoded block when it carries a last-known percent, `nil` otherwise, so a percent-less block draws
+    /// as today's failed-poll row until #1594. The only read of the decoded block in this view; every
+    /// blind-keyed visual below reads this instead.
+    private var heldBlind: BlindActive? {
+        StatusPanelFormat.heldBlind(row.blindActive)
+    }
+
     /// This row's blind severity (#485 OK/DEGRADED, #572 CORNERED) — `.ok` when not blind. Composes the
     /// row's `autoProtectionDegraded` with the snapshot `nextSwap` (only the active account is ever blind,
     /// and `nextSwap` is its swap candidate), mirroring the CLI's `cornered_state`. Drives the eye-slash
     /// tint (`authView`), the leading rule (`blindRuleTint`), and the `BlindMeter` verdict — one source.
     private var blindSeverity: StatusPanelFormat.BlindSeverity {
-        guard let blind = row.blindActive else { return .ok }
+        guard let blind = heldBlind else { return .ok }
         return StatusPanelFormat.blindSeverity(degraded: blind.autoProtectionDegraded, nextSwap: nextSwap)
     }
 
@@ -431,13 +439,14 @@ struct AccountRowView: View {
                     .accessibilityHidden(true)
             }
 
-            if let blind = row.blindActive {
+            if let blind = heldBlind, let lastKnown = blind.lastKnownSessionPct {
                 // The active account's poll is blind — replace the two (now `n/a`) live meters with the
                 // SEMANTIC held-state block: a held session bar, blind duration, and the auto-protection
                 // verdict (#485; #572 adds the CORNERED verdict), the panel's render of the CLI's blind line.
                 // A healthy row keeps its meters. `blindSeverity` composes this row's `autoProtectionDegraded`
                 // with the snapshot `nextSwap` (cornered iff DEGRADED + no viable target).
-                BlindMeter(blind: blind, severity: blindSeverity, nextSwap: nextSwap, now: now)
+                BlindMeter(blind: blind, lastKnownSessionPct: lastKnown, severity: blindSeverity,
+                           nextSwap: nextSwap, now: now)
             } else {
                 VStack(spacing: 6 * scale) {
                     UsageMeter(label: "Session", pct: row.sessionPct, severity: sessionSeverity,
@@ -619,7 +628,7 @@ struct AccountRowView: View {
     /// `.body` point size the ambient font was already giving them, which is why the goldens do not move.
     @ViewBuilder
     private var authView: some View {
-        if row.blindActive != nil {
+        if heldBlind != nil {
             // Usage visibility lost (#485): an eye-slash, a DISTINCT shape from every auth glyph. OK is
             // calm secondary; DEGRADED tints it at-risk orange (redundant with the row's rule + verdict).
             // If the credential is ITSELF in a warning state (stale/at-risk — orthogonal to usage-blindness),
@@ -701,7 +710,7 @@ struct AccountRowView: View {
             weeklyPct: row.weeklyPct,
             sessionReset: sessionReset,
             weeklyReset: weeklyReset,
-            blind: row.blindActive,
+            blind: heldBlind,
             nextSwap: nextSwap,
             now: now,
             expiry: row.expiry,
@@ -894,6 +903,10 @@ private struct BlindMeter: View {
     /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
     @Environment(\.panelScale) private var scale
     let blind: BlindActive
+    /// The block's last-known percent, UNWRAPPED at the row's choice site where `heldBlind` has already
+    /// proved it present (issue #1599) — so `utilSeverity`, `Double(…)` and `pct` below can never be
+    /// handed a `nil` that reads as `0` or as `n/a` inside a held bar.
+    let lastKnownSessionPct: UInt8
     /// The composed blind severity (#485 OK/DEGRADED, #572 CORNERED) — resolved once by `AccountRowView`
     /// so the held block, the eye-slash, and the leading rule all read one source.
     let severity: StatusPanelFormat.BlindSeverity
@@ -908,7 +921,7 @@ private struct BlindMeter: View {
         // the eye glyph, the leading rule, and the shield line below (two orthogonal facts, two colour
         // channels). Named distinctly from the stored `severity` (the composed `BlindSeverity`) so the two
         // never shadow — the bar keys off the % BAND, the verdict off the auto-protection state.
-        let lastKnownBand = StatusPanelFormat.utilSeverity(blind.lastKnownSessionPct)
+        let lastKnownBand = StatusPanelFormat.utilSeverity(lastKnownSessionPct)
         VStack(alignment: .leading, spacing: 4 * scale) {
             HStack(spacing: 9 * scale) {
                 Text("SESSION")
@@ -919,9 +932,9 @@ private struct BlindMeter: View {
                     // structurally true rather than two literals that happen to agree today.
                     .frame(width: StatusPanelFormat.meterLabelCellWidth * scale, alignment: .leading)
 
-                HeldUsageBar(fraction: Double(blind.lastKnownSessionPct) / 100.0, color: barColor(lastKnownBand))
+                HeldUsageBar(fraction: Double(lastKnownSessionPct) / 100.0, color: barColor(lastKnownBand))
 
-                Text(StatusPanelFormat.pct(blind.lastKnownSessionPct))
+                Text(StatusPanelFormat.pct(lastKnownSessionPct))
                     .font(.panel(12, .semibold, scale: scale)).monospacedDigit()
                     .foregroundStyle(Color.panel(StatusPanelFormat.usageTextTint(lastKnownBand)))
                     .frame(width: StatusPanelFormat.meterPercentCellWidth * scale, alignment: .trailing)

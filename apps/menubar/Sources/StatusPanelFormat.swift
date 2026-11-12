@@ -14,7 +14,7 @@
 //   * `src/cli.rs` `legacy_health_tags`→ `legacyHealthTags` (the pre-#119 auth-nil fallback)
 //   * `src/cli.rs` `reset_cell`        → `resetCell`        (one window's "resets in", or `n/a`)
 //   * `src/cli.rs` `humanize_until`    → `humanizeUntil`    (two-largest-unit compact duration)
-//   * `src/cli.rs` `pct`               → `pct`              (`N%` or `n/a`, never a fabricated 0 except #1613's stand-in)
+//   * `src/cli.rs` `pct`               → `pct`              (`N%` or `n/a`, never a fabricated 0)
 //
 // The panel's SINGLE per-row reset-in pick (weekly-exhausted → weekly, else session), the honest-state
 // banners, and the `next_swap` footer wording are #326's OWN panel spec (the issue AC), not a
@@ -860,9 +860,9 @@ enum StatusPanelFormat {
     // MARK: - Percentage cell (mirror `src/cli.rs` `pct`)
 
     /// A `0...100` percent as `N%`, or `n/a` when the last poll failed — never a fabricated `0`
-    /// (mirrors `src/cli.rs` `pct`). Transitionally (see `session_pct`'s doc in
-    /// `src/daemon/snapshot.rs`), a served reading with no session window also renders `n/a` here,
-    /// beside its weekly figures.
+    /// (mirrors `src/cli.rs` `pct`). A served reading with no session window (its line's
+    /// `absentWindows` lists `session`) also renders `n/a` here, beside its weekly figures, until #1594
+    /// gives a missing session window its own token.
     static func pct(_ percent: UInt8?) -> String {
         percent.map { "\($0)%" } ?? "n/a"
     }
@@ -1229,6 +1229,20 @@ enum StatusPanelFormat {
         guard degraded else { return .ok }
         if case .noViableTarget = nextSwap { return .cornered }
         return .degraded
+    }
+
+    /// The blind block the ROW may render: the block itself when it carries a last-known percent, `nil`
+    /// otherwise (issue #1599, § 5's interim until #1594). A block with NO percent — an anchor with no
+    /// session window — is a panel state the design mock draws no frame for, so the row renders it AS NO
+    /// BLOCK: today's failed-poll row, two `n/a` meters, no eye-slash, no blind rule, the failed-poll
+    /// spoken label. The ONE gate every blind-keyed visual on the row reads (the blind severity behind the
+    /// eye-slash tint and the leading rule, the meter choice, the eye-slash, the spoken label), so none
+    /// of them can disagree. The decoded model keeps the block, and the menu-bar glance reads it RAW
+    /// (`activeBlindDegraded`), never through this gate, so a DEGRADED percent-less block still escalates
+    /// the glance (§ 5's sub-default, settled by council, 2026-11-04).
+    static func heldBlind(_ blind: BlindActive?) -> BlindActive? {
+        guard let blind, blind.lastKnownSessionPct != nil else { return nil }
+        return blind
     }
 
     /// The `nextSwap` the switchable roster may compose blind verdicts from — gated on a VOUCHED connection.
@@ -2190,13 +2204,15 @@ enum StatusPanelFormat {
         var parts: [String] = [label]
         if isActive { parts.append("active") }
         parts.append(authSpoken(auth: auth, recovering: recovering, enabled: enabled, quarantined: quarantined))
-        if let blind = blind {
+        // Through the row's one gate (issue #1599): a block with no last-known percent speaks as the
+        // failed-poll row it renders as, and the percent is spoken UNWRAPPED — never `Optional(…)`.
+        if let blind = heldBlind(blind), let lastKnown = blind.lastKnownSessionPct {
             // Blind active row (#485): speak the SEMANTIC held state the row shows — blind duration,
             // last-known session %, and the auto-protection verdict — in place of the two `n/a` meters the
             // row no longer draws. Mirrors the CLI's spoken facts (blind for {dur} · last-known {pct} · OK/
             // DEGRADED/CANNOT-ACT); never a fabricated live reading (#137).
             parts.append("blind for \(humanizeUntil(Int64(blind.blindSecs)))")
-            parts.append("last-known session \(blind.lastKnownSessionPct) percent")
+            parts.append("last-known session \(lastKnown) percent")
             switch blindSeverity(degraded: blind.autoProtectionDegraded, nextSwap: nextSwap) {
             case .ok:
                 parts.append("auto-protection okay, daemon self-resolving")

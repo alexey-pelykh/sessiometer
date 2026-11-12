@@ -924,6 +924,7 @@ mod tests {
             // Nor is the #882 refresh-token expiry modifier: poke keys off the auth rollup, and the
             // expiry axis is orthogonal to it (surfaced, never acted upon).
             expiry: None,
+            absent_windows: Vec::new(),
         }
     }
 
