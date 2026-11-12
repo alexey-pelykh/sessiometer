@@ -2944,12 +2944,17 @@ fn active_blind_projection(response: &StatusResponse) -> Option<(&str, BlindActi
 type CorneredState<'a> = (&'a str, BlindActive, Option<NoTargetCause>, Option<i64>);
 
 /// CORNERED (issue #479, surface 3): the active account is blind, ADR-0017 auto-protection is
-/// DEGRADED (the preemptive gate is armed but acting on a STALE anchor), AND there is no viable
-/// target to swap to — the one bounded-blindness state the daemon CANNOT resolve itself, so the
-/// operator must act. Keying off `auto_protection_degraded` (blind PAST the interim gate window,
-/// anchor at/over the risk band) rather than the raw last-known % is deliberate: before the gate
-/// window the daemon is still self-resolving by waiting out a transient blind blip, so a loudest
-/// alarm THEN would cry wolf — DEGRADED is exactly "auto-protection WOULD swap now but can't".
+/// DEGRADED (an arm reports the account unprotected: the preemptive gate armed but acting on a STALE
+/// anchor, a `Retry-After` hold, the #584 velocity projection, or — issue #1599 — an anchor with no
+/// session window for the gate to compare), AND there is no viable target to swap to — the one
+/// bounded-blindness state the daemon CANNOT resolve itself, so the operator must act. Keying off
+/// `auto_protection_degraded` (an arm tripped, and every arm, the velocity and no-session-window arms
+/// included, trips only past the interim gate window) rather than the raw last-known % is deliberate:
+/// before the gate window the daemon is still self-resolving by waiting out a transient blind blip,
+/// so a loudest alarm THEN would cry wolf.
+/// DEGRADED reads "auto-protection is compromised and nothing can swap": for the anchor and server
+/// arms that is "WOULD swap now but can't"; the report-only velocity and no-session-window arms front
+/// no swap, so for them it is "nothing is protecting this account, and there is nowhere to go".
 /// Composes two daemon verdicts (`blind_active` + `next_swap == no_viable_target`) already on the
 /// wire, so it needs no new field.
 fn cornered_state<'a>(
@@ -3195,9 +3200,10 @@ fn daemon_fault_line(body: &str, fault: DaemonPayloadFault, color: bool) -> Stri
 }
 
 /// The loudest, distinct state: blind + DEGRADED + nowhere to swap. Names the source, how long
-/// blind, the stale last-known %, THAT the fleet is out of capacity and WHEN it returns (the relief
-/// reset FOLDED IN from `next_swap`, so the relief instant is not lost when this alarm replaces
-/// that footer), and the ONE remedy
+/// blind, the stale last-known % (dropped when the block carries none — an anchor with no session
+/// window, issue #1599; never a fabricated `0`), THAT the fleet is out of capacity and WHEN it
+/// returns (the relief reset FOLDED IN from `next_swap`, so the relief instant is not lost when
+/// this alarm replaces that footer), and the ONE remedy
 /// only the operator can apply — add or free an account. Printed as DATA (unconditional, survives a
 /// pipe / redirect), red-emphasized when the color gate is open (the SAME SGR the DEGRADED /
 /// systemic lines use); the plain text conveys it under `--no-color`. The surface only REFLECTS
@@ -3205,7 +3211,10 @@ fn daemon_fault_line(body: &str, fault: DaemonPayloadFault, color: bool) -> Stri
 fn render_cornered(cornered: CorneredState<'_>, now: i64, color: bool) -> String {
     let (label, blind, cause, resets_at) = cornered;
     let dur = humanize_until(blind.blind_secs as i64);
-    let last_known = blind.last_known_session_pct;
+    // Issue #1599: no percent clause at all for an anchor without a session window.
+    let at_last_known = blind
+        .last_known_session_pct
+        .map_or_else(String::new, |pct| format!(" at last-known session {pct}%"));
     let relief = match resets_at {
         Some(at) => format!(", resets in {}", humanize_until(at - now)),
         None => String::new(),
@@ -3221,8 +3230,8 @@ fn render_cornered(cornered: CorneredState<'_>, now: i64, color: bool) -> String
         None => "no viable target".to_owned(),
     };
     let body = format!(
-        "CORNERED: active {label} blind for {dur} at last-known session {last_known}% and \
-         auto-protection cannot act — {blocked}; add or free an account"
+        "CORNERED: active {label} blind for {dur}{at_last_known} and auto-protection cannot act \
+         — {blocked}; add or free an account"
     );
     red_line(&body, color)
 }
@@ -3231,26 +3240,32 @@ fn render_cornered(cornered: CorneredState<'_>, now: i64, color: bool) -> String
 /// the active account is blind but NOT cornered: narrate the REAL state — how long blind,
 /// last-known session %, and whether ADR-0017 auto-protection is OK or DEGRADED — instead of the
 /// content-free `n/a … 🟡`. Printed as DATA (unconditional), like the systemic-refresh line; only
-/// the DEGRADED emphasis is color-gated. DEGRADED is a fault: the gate is armed but acting on a
-/// STALE anchor.
+/// the DEGRADED emphasis is color-gated. DEGRADED is a fault, and its parenthetical names the reason
+/// the block carries: with a last-known percent, the gate is armed but acting on a STALE anchor;
+/// without one (an anchor with no session window, issue #1599), there is no session window for the
+/// gate to guard. The last-known clause is dropped when the block carries no percent — never a
+/// fabricated `0` or a token. The renderer prints the daemon's verdict and never decides it.
 fn render_blind_active(label: &str, blind: BlindActive, color: bool) -> String {
     let dur = humanize_until(blind.blind_secs as i64);
-    let last_known = blind.last_known_session_pct;
-    let verdict = if blind.auto_protection_degraded {
-        "DEGRADED (acting on a stale anchor)"
-    } else {
-        "OK"
+    let verdict = match (blind.auto_protection_degraded, blind.last_known_session_pct) {
+        (false, _) => "OK",
+        (true, Some(_)) => "DEGRADED (acting on a stale anchor)",
+        (true, None) => "DEGRADED (no session window to guard)",
     };
-    let body = format!(
-        "active {label}: blind for {dur} — last-known session {last_known}% — \
-         auto-protection {verdict}"
-    );
+    let body = match blind.last_known_session_pct {
+        Some(last_known) => format!(
+            "active {label}: blind for {dur} — last-known session {last_known}% — \
+             auto-protection {verdict}"
+        ),
+        None => format!("active {label}: blind for {dur} — auto-protection {verdict}"),
+    };
     red_line(&body, color && blind.auto_protection_degraded)
 }
 
 /// The #452 preemptive-swap NARRATION (issue #479, surface 2): when the daemon swapped a BLIND
 /// active account away on its stale pre-blind anchor, `status` narrates it — the source, the
-/// last-known % the gate FIRED on, the target, and the `use <from>` undo — so an operator can
+/// last-known % the gate FIRED on (dropped when the anchor carried no session window, issue #1599 —
+/// never a fabricated `0`), the target, and the `use <from>` undo — so an operator can
 /// reverse it if the swapped-away account has since recovered. The SAME information the durable
 /// `event=swap … reason=blind_preempt` log line holds, reflected HERE because `render_status`
 /// reads only this wire, never the event log — each medium in its own idiom (R-2 STATE-parity, as
@@ -3264,9 +3279,11 @@ fn render_blind_preempt_swap(response: &StatusResponse) -> String {
     };
     let from = &swap.from_label;
     let to = &swap.to_label;
-    let pct = swap.last_known_session_pct;
+    let at_last_known = swap
+        .last_known_session_pct
+        .map_or_else(String::new, |pct| format!(" @ last-known {pct}%"));
     format!(
-        "swapped off {from} (blind @ last-known {pct}%) → {to}; \
+        "swapped off {from} (blind{at_last_known}) → {to}; \
          undo with 'use {from}' if it recovered\n"
     )
 }
@@ -3806,7 +3823,9 @@ const STATUS_PAIR_GAP: usize = 1;
 struct StatusRow {
     /// `* label` (active) or `  label` — the marker folds into this column.
     account: String,
-    /// SESSION usage percent, or `n/a` when the last poll failed.
+    /// SESSION usage percent, or `n/a` when the last poll failed. A served reading with no
+    /// session window also shows `n/a` here, until #1594 gives a missing session window its own
+    /// token.
     session: String,
     /// Compact time until the SESSION window resets, or `n/a` when that instant is
     /// unknown (issue #94).
@@ -3861,10 +3880,14 @@ impl StatusRow {
             // A blind active account with a retained anchor shows its last-known session % with a
             // `~` (stale / approximate) marker, NOT a bare `n/a` — the row stops reporting "no data"
             // when the daemon holds a pre-blind anchor (#479); the full state (blind duration +
-            // auto-protection OK/DEGRADED) trails as the footer line. Every other account keeps the
-            // fresh-reading-or-`n/a` cell.
+            // auto-protection OK/DEGRADED) trails as the footer line. A block with NO last-known
+            // percent (an anchor with no session window, issue #1599) falls back to the cleared live
+            // reading — `n/a` — never `~0%` or `~n/a`, until #1594 gives it its own token. Every
+            // other account keeps the fresh-reading-or-`n/a` cell.
             session: match account.blind_active {
-                Some(blind) => format!("~{}%", blind.last_known_session_pct),
+                Some(blind) => blind
+                    .last_known_session_pct
+                    .map_or_else(|| pct(account.session_pct), |p| format!("~{p}%")),
                 None => pct(account.session_pct),
             },
             session_reset: reset_cell(account.session_resets_at, now),
@@ -3879,10 +3902,11 @@ impl StatusRow {
             // reading stays `None` (uncolored).
             account_severity: severity(account, now),
             // A blind active account colors its stale `~%` by the last-known utilization band — the
-            // anchor's near-limit reading IS the risk the operator should see (#479); otherwise the
-            // fresh reading's band, or uncolored when there is no reading.
+            // anchor's near-limit reading IS the risk the operator should see (#479); uncolored when
+            // the block carries no last-known percent (issue #1599); otherwise the fresh reading's
+            // band, or uncolored when there is no reading.
             session_severity: match account.blind_active {
-                Some(blind) => Some(util_severity(blind.last_known_session_pct)),
+                Some(blind) => blind.last_known_session_pct.map(util_severity),
                 None => account.session_pct.map(util_severity),
             },
             session_reset_severity: proximity_severity(account.session_resets_at, now),
@@ -4588,9 +4612,9 @@ fn expiry_view(expiry: Option<AccountExpiry>, now: i64) -> ExpiryView {
 }
 
 /// A `0..=100` percent as `N%`, or `n/a` when the wire carries no percent (never a
-/// fabricated `0`): the last poll for that account failed. Transitionally (see
-/// `session_pct`'s doc in `src/daemon/snapshot.rs`), a served reading with no session
-/// window also renders `n/a` here, beside its weekly figures.
+/// fabricated `0`): the last poll for that account failed. A served reading with no session
+/// window (its line's `absent_windows` lists `session`) also renders `n/a` here, beside its
+/// weekly figures, until #1594 gives a missing session window its own token.
 fn pct(percent: Option<u8>) -> String {
     match percent {
         Some(percent) => format!("{percent}%"),
@@ -6040,6 +6064,7 @@ fn remove_confirmation(label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod oracle_1599;
     use crate::config::Tunables;
     use crate::daemon::{
         AccountStatusLine, BlindActive, BlindPreemptSwap, LandingOvershoot, NextSwap, NoTargetCause,
@@ -7339,7 +7364,7 @@ spare  22222222-2222\n\
             health: Some(CredentialHealth::Stale),
             blind_active: Some(BlindActive {
                 blind_secs: 480,
-                last_known_session_pct: 87,
+                last_known_session_pct: Some(87),
                 auto_protection_degraded: true,
             }),
             ..status_line("work", true, None, None)
@@ -7379,7 +7404,7 @@ spare  22222222-2222\n\
         let ok = AccountStatusLine {
             blind_active: Some(BlindActive {
                 blind_secs: 30,
-                last_known_session_pct: 42,
+                last_known_session_pct: Some(42),
                 auto_protection_degraded: false,
             }),
             ..status_line("work", true, None, None)
@@ -7450,7 +7475,7 @@ spare  22222222-2222\n\
             accounts: vec![AccountStatusLine {
                 blind_active: Some(BlindActive {
                     blind_secs: 480,
-                    last_known_session_pct: 87,
+                    last_known_session_pct: Some(87),
                     auto_protection_degraded: degraded,
                 }),
                 ..status_line("work", true, None, None)
@@ -7487,7 +7512,7 @@ spare  22222222-2222\n\
             accounts: vec![AccountStatusLine {
                 blind_active: Some(BlindActive {
                     blind_secs: 480,
-                    last_known_session_pct: 87,
+                    last_known_session_pct: Some(87),
                     auto_protection_degraded: true,
                 }),
                 ..status_line("work", true, None, None)
@@ -7589,7 +7614,7 @@ spare  22222222-2222\n\
             accounts: vec![AccountStatusLine {
                 blind_active: Some(BlindActive {
                     blind_secs: 30,
-                    last_known_session_pct: 62,
+                    last_known_session_pct: Some(62),
                     auto_protection_degraded: false,
                 }),
                 ..status_line("work", true, None, None)
@@ -7648,7 +7673,7 @@ spare  22222222-2222\n\
             recent_blind_preempt_swap: Some(BlindPreemptSwap {
                 from_label: "spare".to_owned(),
                 to_label: "work".to_owned(),
-                last_known_session_pct: 68,
+                last_known_session_pct: Some(68),
             }),
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -9275,6 +9300,7 @@ spare  22222222-2222\n\
             // every layout / alignment / colouring test below keeps pinning the pre-#883 table.
             // The column's own tests build their lines with `status_line_expiry`.
             expiry: None,
+            absent_windows: Vec::new(),
         }
     }
 
@@ -9347,6 +9373,7 @@ spare  22222222-2222\n\
             health: None,
             blind_active: None,
             expiry: None,
+            absent_windows: Vec::new(),
         }
     }
 
@@ -14352,7 +14379,7 @@ spare  22222222-2222\n\
         ("daemon_fault_line", NotRendered, "the plain-branch line-join skeleton"),
         ("pad_end", NotRendered, "the display-width pad skeleton"),
         ("expiry_table_cell", NotRendered, "the horizon-bracket skeleton around `expiry_cell`"),
-        ("new", NotRendered, "`StatusRow`'s active-marker skeleton"),
+        ("new", NotRendered, "`StatusRow`'s active-marker and held-percent (`~{p}%`) skeletons"),
         ("socket_shutdown", NotRendered, "interpolates its two callers' words; `daemon_stop` authors them"),
         ("status", NotRendered, "interpolates the serialized `--json` snapshot"),
         // --- operator-facing, and no framing scan reaches it (issue #1167) ---------------------
@@ -14448,8 +14475,8 @@ spare  22222222-2222\n\
         );
         assert_eq!(
             literals.len(),
-            288,
-            "expected 288 inline word-bearing literals; the count moved — check whether the \
+            293,
+            "expected 293 inline word-bearing literals; the count moved — check whether the \
              function that gained one is still dispositioned correctly, then update this"
         );
 
@@ -16827,6 +16854,7 @@ impl Nested {
                 // [`expiry_roster`] beside this one instead, so the two directions are pinned
                 // separately. Read that fixture's doc before reaching for this line.
                 expiry: None,
+                absent_windows: Vec::new(),
             }
         }
 
@@ -18544,7 +18572,7 @@ impl Nested {
                         );
                         let blind = BlindActive {
                             blind_secs: 900,
-                            last_known_session_pct: 80,
+                            last_known_session_pct: Some(80),
                             auto_protection_degraded: true,
                         };
                         let line = render_blind_active("work", blind, true);

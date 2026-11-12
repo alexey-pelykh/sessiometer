@@ -316,18 +316,21 @@ pub(super) struct ObservationGapAnchor {
 /// Cleared in [`Daemon::record_swap`] (so a later same-active swap supersedes it before
 /// [`blind_swap`](Daemon::blind_swap) re-sets its own); a differently-targeted swap self-invalidates
 /// it at projection time instead. DEDICATED — kept SEPARATE from the cooldown-bearing [`LastSwap`]
-/// (read on every swap path) exactly as [`LastGood`] is kept separate from the account's `last_reading`, so the
-/// narration state never burdens the cooldown primitive. Non-secret — two operator handles + a `u8`
-/// + a process-local [`Instant`] (never serialized), never a token or email (issue #15).
+/// (read on every swap path) exactly as [`LastGood`] is kept separate from the account's
+/// `last_reading`, so the narration state never burdens the cooldown primitive. Non-secret — two
+/// operator handles + an optional `u8` + a process-local [`Instant`] (never serialized), never a
+/// token or email (issue #15).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct BlindPreemptSwapRecord {
     /// The label swapped AWAY FROM (the blind account) — the undo the surface names is `use <from>`.
     pub(super) from: String,
     /// The label swapped TO (now active) — the target-still-active projection gate compares against it.
     pub(super) to: String,
-    /// The stale pre-blind session % the gate fired on (`to_pct(anchor.session)`), captured at
-    /// swap-time (by projection time the anchor `last_good` is `None`).
-    pub(super) last_known_session_pct: u8,
+    /// The stale pre-blind session % the gate fired on (`anchor.session.map(to_pct)`), captured at
+    /// swap-time (by projection time the anchor `last_good` is `None`). `None` when the anchor
+    /// carried no session window — a weekly-only account swapped on #582's `Retry-After` arm, which
+    /// never reads the session — never a fabricated `0` (issue #1599).
+    pub(super) last_known_session_pct: Option<u8>,
     /// When the swap fired — monotonic ([`Instant`]), so the [`BLIND_PREEMPT_NOTICE_SECS`] window is
     /// measured against the SAME clock as the anchor / cooldown. Process-local: never serialized.
     pub(super) at: Instant,
@@ -465,31 +468,38 @@ impl CredentialReadSource {
 /// - `!quarantined` — a DEAD (#42) blind active belongs to the `emergency_swap` path, not bounded
 ///   blindness; ADR-0017 keeps the two separate, so a quarantined active is excluded, AND
 /// - a retained anchor exists (`anchor.last_good` is `Some`, #450) — never a spurious projection on a
-///   genuinely-unknown account with no reading to key off, AND
-/// - that anchor's SESSION window applies (`anchor.session` is `Some`, issue #1602): under
-///   `STATUS_SCHEMA_VERSION` `1.14` the block's `last_known_session_pct` is a `u8` that cannot say
-///   "none", so a weekly-only blind active emits no block rather than a fabricated `0` (D10's
-///   transitional default; the status-wire item #1599 lifts the field and restores the block).
+///   genuinely-unknown account with no reading to key off.
 ///
-/// `auto_protection_degraded` is `true` when ANY of THREE arms is active on this blind account:
+/// An anchor whose SESSION window does not apply (`anchor.session` is `None` — a weekly-only
+/// account) still projects the block (issue #1599): `blind_secs` and the verdict as for any anchor,
+/// and `last_known_session_pct` ABSENT (`anchor.session.map(to_pct)`), never a fabricated `0`.
+///
+/// `auto_protection_degraded` is `true` when ANY of FOUR arms is active on this blind account:
 /// - the ANCHOR arm ([`blind_gate_armed`] — the SAME arming test
 ///   [`Daemon::note_blind_gate_eligibility`] gates on, there as its negation), fronting the #452 swap,
 ///   on the #619 plausibility-corrected anchor session (`anchor.high_water`) so this projection
 ///   tracks the swap the gate actually fires rather than a stale-low pre-blind reading;
 /// - the #582 SERVER-directed arm (`server_retry_after_hold` AND blind past the interim
-///   [`BLIND_GATE_SECS`]), fronting the #582 swap-away; and
+///   [`BLIND_GATE_SECS`]), fronting the #582 swap-away;
 /// - the #584 VELOCITY-projection arm ([`blind_velocity_projected_armed`]) — the first arm mirroring NO
 ///   decision: it reports a BELOW-band anchor whose retained #539 velocity, projected over the blind
 ///   window, could PLAUSIBLY reach the trigger (a burn the anchor arm cannot see, because the frozen
 ///   anchor sits below the band). The daemon fires no swap on it (report-only, ADR-0017 / issue #584), so
-///   this arm makes `status` HONEST about a blind account it cannot protect rather than protecting it.
+///   this arm makes `status` HONEST about a blind account it cannot protect rather than protecting it;
+///   and
+/// - the #1599 NO-SESSION-WINDOW arm (blind past the interim [`BLIND_GATE_SECS`] AND the RAW
+///   `anchor.session` is `None`) — report-only like the velocity arm: the level-vs-level anchor arm
+///   has nothing to compare on an anchor with no session window, so the ADR-0017 session gate cannot
+///   arm, and a block reading OK past the gate would claim protection nobody provides. It keys on the
+///   raw `anchor.session`, the value the omitted percent maps, so the verdict and the absent percent
+///   state one fact. No swap fires on it.
 ///
 /// The invariant the arms serve is ONE-SIDED — `status` must never claim "auto-protection OK" while the
 /// daemon has actually stopped protecting the account. #582's episode was a below-band account blind
 /// behind a `Retry-After: 3600`, burning, while `status` said OK; #584 is its velocity twin — a
 /// below-band account burning fast with NO directive at all. Each arm is a disjunct, so adding one can
-/// only move OK→DEGRADED, never the reverse: the first two mirror a swap DECISION, the velocity arm is
-/// pure honesty with no swap behind it.
+/// only move OK→DEGRADED, never the reverse: the anchor and server arms mirror a swap DECISION, the
+/// velocity and no-session-window arms are pure honesty with no swap behind them.
 ///
 /// `server_retry_after_hold` is [`server_retry_after_holding`]`.is_some()` for THIS account — the
 /// same shared predicate `blind_swap` decides on, so the report and the decision cannot drift. The
@@ -511,14 +521,6 @@ pub(super) fn blind_active_view(
     // Bind the mark BEFORE the anchor is shadowed to its inner `LastGood` below.
     let high_water = anchor.high_water;
     let anchor = anchor.last_good?;
-    // Issue #1602 (D10, the transitional `STATUS_SCHEMA_VERSION` `1.14` state): an anchor whose
-    // session window does not APPLY (`session: None` — a weekly-only account) emits NO block. The
-    // wire's `last_known_session_pct` is a `u8` under this minor and cannot say "none", and a `0`
-    // there would be the fabrication this item forbids — byte-identical to a measured idle window.
-    // Until the status-wire item (#1599) lifts that field, such an account reads as a plain
-    // failed-poll row; the session gate below reads false on it in its own right
-    // (`blind_gate_armed` on a `None`), so `status` claims no auto-protection on its strength.
-    let anchor_session = anchor.session?;
     let blind_secs = at.saturating_duration_since(anchor.at).as_secs();
     // Issue #619: the anchor ARM decides on the anchor's PLAUSIBLE session (raised to the frozen
     // high-water mark when the pre-blind reading was stale-low), the SAME value `blind_swap` /
@@ -532,16 +534,20 @@ pub(super) fn blind_active_view(
     let gate_session = swap::plausible_anchor_session(high_water, anchor.session);
     Some(BlindActive {
         blind_secs,
-        last_known_session_pct: to_pct(anchor_session),
+        // Issue #1599: absent when the anchor carries no session window, never a fabricated `0`.
+        last_known_session_pct: anchor.session.map(to_pct),
         auto_protection_degraded: blind_gate_armed(blind_secs, gate_session)
             || (blind_secs > BLIND_GATE_SECS && server_retry_after_hold)
-            || blind_velocity_projected_armed(blind_secs, gate_session, velocity, session_ceiling),
+            || blind_velocity_projected_armed(blind_secs, gate_session, velocity, session_ceiling)
+            // Issue #1599, the report-only no-session-window arm: on the RAW anchor session.
+            || (blind_secs > BLIND_GATE_SECS && anchor.session.is_none()),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod oracle_1599;
 
     /// An epoch-second session-window stamp for the #619 plausibility case below. A local copy of
     /// `daemon`'s same-named test helper (which carries it for the #614 tests): test helpers are
@@ -634,7 +640,7 @@ mod tests {
         )
         .expect("a blind active account with an anchor projects a state");
         assert_eq!(ok.blind_secs, BLIND_GATE_SECS);
-        assert_eq!(ok.last_known_session_pct, 70);
+        assert_eq!(ok.last_known_session_pct, Some(70));
         assert!(
             !ok.auto_protection_degraded,
             "at exactly T the strict `>` gate is not yet armed",
@@ -925,7 +931,7 @@ mod tests {
         // The DISPLAYED last-known pct stays the RAW measurement — only the arm decision is corrected.
         assert_eq!(
             corrected.last_known_session_pct,
-            to_pct(stale_low.session.expect("session window present")),
+            Some(to_pct(stale_low.session.expect("session window present"))),
             "the displayed last-known % is the raw anchor, never the synthesized correction",
         );
     }
@@ -1034,59 +1040,8 @@ mod tests {
         // The DISPLAYED last-known pct stays the RAW measurement — only the arm decision is corrected.
         assert_eq!(
             corrected.last_known_session_pct,
-            to_pct(stale_low.session.expect("session window present")),
+            Some(to_pct(stale_low.session.expect("session window present"))),
             "the displayed last-known % is the raw anchor, never the synthesized correction",
         );
-    }
-
-    #[test]
-    fn blind_active_view_emits_no_block_for_a_weekly_only_blind_active_until_the_wire_can_say_so() {
-        // Issue #1602 (row 7; D10's transitional default under `STATUS_SCHEMA_VERSION` `1.14`): the
-        // block's `last_known_session_pct` is a `u8` that cannot say "none", so a blind active whose
-        // retained anchor has NO session window emits no block at all — never one carrying a
-        // fabricated `0`, byte-identical to a measured idle window (mutant M-c). Blind past
-        // `BLIND_GATE_SECS`, with or without a server hold or a retained velocity, the projection is
-        // `None`; the status-wire item #1599 lifts the field and restores the block (its percent
-        // omitted, `auto_protection_degraded: true` — the fourth, status-only arm).
-        let base = Instant::now();
-        let weekly_only = AnchorArmInputs {
-            last_good: Some(LastGood {
-                session: None,
-                weekly: Some(0.30),
-                at: base,
-            }),
-            high_water: None,
-        };
-        let past_t = base + Duration::from_secs(BLIND_GATE_SECS + 1);
-        assert!(
-            blind_active_view(weekly_only, true, false, false, None, 0.95, past_t).is_none(),
-            "an anchor without a session window projects no block under the 1.14 wire",
-        );
-        assert!(
-            blind_active_view(weekly_only, true, false, true, None, 0.95, past_t).is_none(),
-            "…even blind behind a server hold: the block cannot carry a session percent it lacks",
-        );
-        let climbing = Some(VelocityEma {
-            rate: 0.01,
-            samples: 3,
-        });
-        assert!(
-            blind_active_view(weekly_only, true, false, false, climbing, 0.95, past_t).is_none(),
-            "…and a retained velocity has no session anchor to project from",
-        );
-        // Control: the same episode with a session window projects the block, degraded — so the
-        // `None` above is the absent window's, not the fixture's.
-        let two_window = AnchorArmInputs {
-            last_good: Some(LastGood {
-                session: Some(0.70),
-                weekly: Some(0.30),
-                at: base,
-            }),
-            high_water: None,
-        };
-        let block = blind_active_view(two_window, true, false, false, None, 0.95, past_t)
-            .expect("an anchor with a session window still projects");
-        assert_eq!(block.last_known_session_pct, 70);
-        assert!(block.auto_protection_degraded);
     }
 }

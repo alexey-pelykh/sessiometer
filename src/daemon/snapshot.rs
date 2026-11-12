@@ -148,11 +148,11 @@ pub(crate) struct RefreshHealth {
 /// The active account's BOUNDED-BLINDNESS state (issue #479, umbrella #363 Path B) — present only
 /// when the active account has gone blind (its `/oauth/usage` poll is failing / backing off, so its
 /// live reading is cleared) AND the daemon still holds a retained pre-blind anchor (`last_good`,
-/// #450). Surfaced so `status` renders a SEMANTIC line — blind duration, last-known session %, and
-/// whether ADR-0017 auto-protection is OK or DEGRADED — instead of the content-free `n/a … 🟡` a
-/// bare failed-poll row shows. The surface only REFLECTS this daemon-pushed state; it never
-/// self-polls or self-swaps (the #169 UI-never-acts invariant). Non-secret — a duration and two
-/// small numbers, never a token or email (issue #15).
+/// #450). Surfaced so `status` renders a SEMANTIC line — blind duration, last-known session % (when
+/// the anchor carries a session window, issue #1599), and whether ADR-0017 auto-protection is OK or
+/// DEGRADED — instead of the content-free `n/a … 🟡` a bare failed-poll row shows. The surface only
+/// REFLECTS this daemon-pushed state; it never self-polls or self-swaps (the #169 UI-never-acts
+/// invariant). Non-secret — a duration and two small numbers, never a token or email (issue #15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BlindActive {
     /// Seconds the active account has been blind — `blind_elapsed`, measured from the retained
@@ -163,17 +163,27 @@ pub(crate) struct BlindActive {
     pub(crate) blind_secs: u64,
     /// The retained pre-blind SESSION-window usage percent (`0..=100`) the anchor holds
     /// (`last_good.session`, #450) — the last-known reading before the account went blind. This is
-    /// why the row stops reporting "no data": the daemon DID retain a reading.
-    pub(crate) last_known_session_pct: u8,
+    /// why the row stops reporting "no data": the daemon DID retain a reading. ABSENT when the
+    /// anchor carries no session window (a weekly-only account, since 2026-10-30): omitted from the
+    /// wire exactly as [`RefreshHealth::rotated`] is, and never a fabricated `0`, which would read as
+    /// a measured idle window. `blind_secs` and `auto_protection_degraded` stay required whenever the
+    /// block is present. A client that still types this field as required (a pre-1.15 app) fails to
+    /// decode a weekly-only blind active's block, which is why the Swift mirror moves in the same
+    /// change (issue #1599).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_known_session_pct: Option<u8>,
     /// Whether ADR-0017 preemptive auto-protection is DEGRADED for this blind account — `true` when ANY
-    /// of the daemon's three report arms is active (see `blind_active_view`): the ANCHOR arm (blind past
+    /// of the daemon's four report arms is active (see `blind_active_view`): the ANCHOR arm (blind past
     /// `BLIND_GATE_SECS` AND the anchor at/over `BLIND_GATE_RISK_BAND` — the #452 swap's premise), the
-    /// #582 SERVER-directed arm (a `Retry-After` still holding the account off its poll), or the #584
+    /// #582 SERVER-directed arm (a `Retry-After` still holding the account off its poll), the #584
     /// VELOCITY-projection arm (the anchor, projected forward over the blind window at its retained #539
-    /// rate, could plausibly reach the trigger — a below-band burn the anchor arm cannot see). `false` =
-    /// OK: blind, but not yet past the gate threshold and with no arm tripped — auto-protection is
-    /// nominally intact. The first two arms front a swap the daemon fires; the velocity arm is
-    /// report-only (issue #584), so DEGRADED here means "compromised", not always "a swap is acting".
+    /// rate, could plausibly reach the trigger — a below-band burn the anchor arm cannot see), or the
+    /// #1599 NO-SESSION-WINDOW arm (blind past `BLIND_GATE_SECS` with an anchor that carries no session
+    /// window, so the session gate has nothing to compare and cannot arm). `false` = OK: blind, but
+    /// not yet past the gate threshold and with no arm tripped — auto-protection is nominally intact.
+    /// The anchor and server arms front a swap the daemon fires; the velocity and no-session-window
+    /// arms are report-only (issues #584, #1599), so DEGRADED here means "compromised", not always "a
+    /// swap is acting".
     pub(crate) auto_protection_degraded: bool,
 }
 
@@ -198,10 +208,14 @@ pub(crate) struct BlindPreemptSwap {
     /// (issue #15).
     pub(crate) to_label: String,
     /// The stale pre-blind SESSION-window usage percent (`0..=100`) the gate FIRED on — the same
-    /// `to_pct(anchor.session)` the `event=swap … session_pct=` log line records and the Part-1
+    /// `anchor.session.map(to_pct)` the `event=swap … session_pct=` log line records and the Part-1
     /// [`BlindActive::last_known_session_pct`] shows, captured at swap-time (by projection time the
     /// anchor `last_good` has been reset to `None`). Gives R-2 content-parity across all three surfaces.
-    pub(crate) last_known_session_pct: u8,
+    /// ABSENT when the anchor carried no session window (a weekly-only account swapped on #582's
+    /// `Retry-After` arm, which never reads the session): omitted from the wire, never a fabricated
+    /// `0`, so the notice still names both labels and its `use <from_label>` undo (issue #1599).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_known_session_pct: Option<u8>,
 }
 
 /// A just-observed RUNTIME landing-point overshoot (issue #613), retained so `status` can surface it —
@@ -524,20 +538,46 @@ pub(crate) struct SchemaVersion {
 /// gone. A refreshed account still carries the AC-3 durability signal in both directions
 /// (`"rotated": true` / `false`) — the signal is preserved, only the fabricated value is dropped.
 ///
-/// **This is the one entry that RESHAPES an existing key rather than adding a new one, so its
-/// forward-compat is asymmetric — deliberately, and unlike the omit-when-absent siblings above.** A
-/// pre-#1070 client typed the key as REQUIRED, so a 1.14 daemon's non-refreshed frame does not
-/// decode against it (Swift `WatchStatusStore` drops the line). The Rust `status` client is immune
-/// by construction — it ships in the same binary as the daemon it reads — so the exposure is exactly
-/// one consumer, the separately-installed menubar app, which this bump updates in lockstep. The
-/// bump is MINOR because [`SchemaVersion`] support gates on the MAJOR and the reshape is the
-/// narrowest one that removes the false value; an operator running a 1.14 daemon against a
-/// pre-#1070 app must update the app, which is the same lockstep every wire change here already
-/// assumes. The reverse direction is clean: a 1.14 client reading a ≤1.13 daemon decodes the
-/// always-present key as `Some(_)`.
+/// **This is the first entry that RESHAPES an existing key rather than adding a new one (the 1.15
+/// entry below reshapes two more), so its forward-compat is asymmetric — deliberately, and unlike
+/// the omit-when-absent siblings above.** A pre-#1070 client typed the key as REQUIRED, so a 1.14
+/// daemon's non-refreshed frame does not decode against it (Swift `WatchStatusStore` drops the
+/// line). The Rust `status` client is immune by construction — it ships in the same binary as the
+/// daemon it reads — so the exposure is exactly one consumer, the separately-installed menubar app,
+/// which this bump updates in lockstep. The bump is MINOR because [`SchemaVersion`] support gates
+/// on the MAJOR and the reshape is the narrowest one that removes the false value; an operator
+/// running a 1.14 daemon against a pre-#1070 app must update the app, which is the same lockstep
+/// every wire change here already assumes. The reverse direction is clean: a 1.14 client reading a
+/// ≤1.13 daemon decodes the always-present key as `Some(_)`.
+///
+/// `1.15` makes the wire say "no session window" (issue #1599), in four changes that ride one
+/// minor. (1) It ADDS the per-account [`AccountStatusLine::absent_windows`] list (`["session"]`,
+/// `["weekly"]`), emitted only from a SERVED reading whose window is absent and omitted whenever
+/// empty (via `skip_serializing_if`), so a two-window row's bytes are unchanged and a failed poll
+/// (`session_pct: null` WITHOUT the key) differs by bytes from a weekly-only reading
+/// (`session_pct: null` WITH it); a pre-#1599 client ignores the unknown key. (2) It RESHAPES
+/// [`BlindActive::last_known_session_pct`] from a required `u8` to an omittable `Option<u8>`, so a
+/// weekly-only blind active keeps its block — `blind_secs` and the verdict — with no fabricated
+/// `0`. (3) It reshapes [`BlindPreemptSwap::last_known_session_pct`] the same way, so a swap off a
+/// session-less anchor (#582's `Retry-After` arm, which never reads the session) is still narrated
+/// with both labels and its undo, and no percent. (4) It ships the fourth, report-only arm of
+/// [`BlindActive::auto_protection_degraded`]: blind past `BLIND_GATE_SECS` with an anchor that
+/// carries no session window reads DEGRADED, never "auto-protection OK" on a session gate that
+/// cannot arm. The arm adds no key and moves no byte shape — the #582 and #584 arms changed this
+/// bool's values with no minor — and it is named here because the first frame that carries a
+/// percent-less DEGRADED block is a frame at this minor.
+///
+/// **The two reshapes repeat 1.14's asymmetric forward-compat, for the same reason.** A pre-1.15
+/// client types `BlindActive`'s percent as REQUIRED, so while a weekly-only active is blind it fails
+/// to decode the whole frame (Swift `WatchStatusStore` drops the line) and reads stale until the app
+/// is updated; that latency is the lockstep cost. The Rust `status` client ships in the same binary
+/// as the daemon, and no Swift reader decodes the swap notice, so the exposure is again exactly the
+/// separately-installed menubar app, which this bump updates in lockstep (its `lastKnownSessionPct`
+/// becomes `UInt8?`). The reverse direction is clean: a 1.15 client reading a ≤1.14 daemon decodes
+/// the always-present percent as `Some(_)` and the absent list as `[]`.
 pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion {
     major: 1,
-    minor: 14,
+    minor: 15,
 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
@@ -756,12 +796,15 @@ pub(crate) struct AccountStatusLine {
     #[serde(default)]
     pub(crate) recovering: bool,
     /// Last-polled session-window usage percent (`0..=100`); `null` if the last
-    /// poll for this account failed (never a fabricated `0`). Transitionally, until the
-    /// status-wire item #1599 lands its no-window key, also `null` when the served
-    /// reading carried no session window, then beside a non-null `weekly_pct`, because
-    /// a failed poll nulls both percents; that item reverts this sentence.
+    /// poll for this account failed (never a fabricated `0`). A `null` on a line whose
+    /// [`absent_windows`](Self::absent_windows) lists `session` is not a failed poll: the
+    /// served reading carries no session window, and that key is the only way to tell the
+    /// two apart.
     pub(crate) session_pct: Option<u8>,
-    /// Last-polled weekly-window usage percent (`0..=100`).
+    /// Last-polled weekly-window usage percent (`0..=100`); `null` if the last poll for this
+    /// account failed (never a fabricated `0`). A `null` on a line whose
+    /// [`absent_windows`](Self::absent_windows) lists `weekly` is not a failed poll: the served
+    /// reading carries no weekly window, and that key is the only way to tell the two apart.
     pub(crate) weekly_pct: Option<u8>,
     /// Epoch seconds at which the rolling 5-hour SESSION window resets, or `null`
     /// when the last poll failed or the API supplied no parseable timestamp.
@@ -808,9 +851,10 @@ pub(crate) struct AccountStatusLine {
     #[serde(default, rename = "auth")]
     pub(crate) health: Option<CredentialHealth>,
     /// The active account's bounded-blindness projection (issue #479, umbrella #363 Path B): blind
-    /// duration + last-known session % + whether ADR-0017 auto-protection is DEGRADED — or absent
-    /// when the active account is not blind (or this is not the active account). The client renders
-    /// it as a SEMANTIC status line in place of the bare `n/a … 🟡` active row. `#[serde(default)]`
+    /// duration + last-known session % (omitted when the anchor carries no session window, issue
+    /// #1599) + whether ADR-0017 auto-protection is DEGRADED — or absent when the active account is
+    /// not blind (or this is not the active account). The client renders it as a SEMANTIC status
+    /// line in place of the bare `n/a … 🟡` active row. `#[serde(default)]`
     /// decodes an omitting daemon to `None`; `skip_serializing_if` OMITS it whenever absent, so a
     /// non-blind account's per-line wire bytes are byte-for-byte unchanged — the additive MINOR
     /// `1.3 → 1.4` field appears ONLY on a blind active account (a pre-#479 client ignores the
@@ -858,10 +902,53 @@ pub(crate) struct AccountStatusLine {
     ///
     /// A partial `expiry` OBJECT is the one case that degrades instead of throwing: `horizon_state`
     /// defaults to the fail-safe [`ExpiryHorizon::Unknown`] (see
-    /// [`AccountExpiry::horizon_state`]), deliberately unlike [`BlindActive`], whose fields have no
-    /// honest default and so throw.
+    /// [`AccountExpiry::horizon_state`]), deliberately unlike [`BlindActive`], whose `blind_secs` and
+    /// `auto_protection_degraded` have no honest default and so throw when missing; its
+    /// `last_known_session_pct` is optional since `1.15` and decodes as absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) expiry: Option<AccountExpiry>,
+    /// The quota windows this account's SERVED reading does NOT carry — `["session"]` for a
+    /// verified Ultra account since 2026-10-30, `["weekly"]` for an account with no weekly window,
+    /// and `["session","weekly"]` for a reply that carries neither window, which only a parser that
+    /// serves such a reply would produce. Emitted ONLY from a served reading
+    /// whose window is `None` ([`windows_absent_from`]); a failed poll has no reading and emits
+    /// nothing, and a blind row carries none either (its live reading is cleared, and the key is
+    /// never derived from the retained anchor — a weekly-only blind active's fact rides the
+    /// percent-less [`BlindActive`] block). So "no reading" stays `session_pct: null` WITHOUT this
+    /// key and "no session window" is `session_pct: null` WITH it — the two differ by bytes.
+    /// Omitted whenever empty (the `canonical_scrub` / `blind_active` / `expiry` omit-when-absent
+    /// convention), so every two-window row's bytes are unchanged; added at the MINOR `1.15`
+    /// (issue #1599). `#[serde(default)]` decodes an omitted key to `[]`; an explicit
+    /// `"absent_windows": null` does not decode on this Rust side, and no emitter writes one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) absent_windows: Vec<AbsentWindow>,
+}
+
+/// One quota window a served reading can lack — the token [`AccountStatusLine::absent_windows`]
+/// lists (issue #1599). Serialised lowercase as `session` / `weekly`; those wire tokens are the
+/// contract, not this Rust name (deliberately not `WindowKind`, which already names a private
+/// `stats` selector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AbsentWindow {
+    /// The five-hour SESSION window.
+    Session,
+    /// The WEEKLY window.
+    Weekly,
+}
+
+/// The windows a SERVED reading does not carry, in the fixed order `session` before `weekly` so
+/// the wire bytes are deterministic — empty for a two-window reading (issue #1599). Pure: the
+/// caller decides that the reading was served (a failed poll has no [`Usage`] to pass).
+pub(crate) fn windows_absent_from(usage: &Usage) -> Vec<AbsentWindow> {
+    let mut absent = Vec::new();
+    if usage.session.is_none() {
+        absent.push(AbsentWindow::Session);
+    }
+    if usage.weekly.is_none() {
+        absent.push(AbsentWindow::Weekly);
+    }
+    absent
 }
 
 /// The next swap candidate shown by `status` (issue #88): who the daemon would
@@ -1016,6 +1103,13 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 // the account has been polled at all, so `skip_serializing_if` omits it there — and
                 // that absence means "never observed", never "not expiring" (issue #137).
                 expiry: account.expiry,
+                // The windows the SERVED reading lacks (issue #1599): computed from the live
+                // reading only, so a failed poll (`usage: None`) and a blind row (reading cleared)
+                // carry none, and a two-window row's empty list is omitted from the wire.
+                absent_windows: account
+                    .usage
+                    .map(|u| windows_absent_from(&u))
+                    .unwrap_or_default(),
             })
             .collect(),
         // Already computed at snapshot build (issue #88); copy it to the wire.

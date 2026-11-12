@@ -5195,7 +5195,7 @@ where
                 // The active is BLIND, so the stale pre-blind anchor is the only session signal — the
                 // same value the `swap` log line records and the narration surfaces (#479). `None`
                 // when the anchor's session window did not apply (issue #1602): the line then omits
-                // its `session_pct=` token, and no notice is retained (below).
+                // its `session_pct=` token, and the notice below carries no percent (issue #1599).
                 let last_known_session_pct = anchor.session.map(to_pct);
                 self.record_swap(target_idx, &incoming, at).await;
                 events.push(Event::Swap {
@@ -5215,22 +5215,15 @@ where
                 // prior notice (superseding a same-active one), so set THIS swap's as the current one.
                 // `recent_blind_preempt_swap_view` projects it onto the wire only while still-current +
                 // recent; the narration names the `use <from>` undo (derived from `from`, not stored).
-                //
-                // Issue #1602 (D10's analogue, the transitional `STATUS_SCHEMA_VERSION` `1.14`
-                // state): the record, its wire projection and the CLI narration ("last-known N%")
-                // all carry a `u8` that cannot say "none", so a swap off an anchor whose session
-                // window did not apply retains NO record — `record_swap` above already cleared any
-                // earlier notice, so none survives. Never a `0` default: the wire and the CLI would
-                // then show a fabricated "last-known 0%". The swap itself, its `swap` line and the
-                // #582 walk record below are unchanged; the status-wire item (#1599) lifts the
-                // record's field and restores the notice with its percent omitted.
-                self.state.last_blind_preempt_swap =
-                    last_known_session_pct.map(|last_known_session_pct| BlindPreemptSwapRecord {
-                        from: from_label,
-                        to: to_label,
-                        last_known_session_pct,
-                        at,
-                    });
+                // Built for every swap, a session-less anchor's included (issue #1599): its percent
+                // is then `None` and omitted from the wire, never a fabricated `0`, so the swap and
+                // its undo hint stay visible.
+                self.state.last_blind_preempt_swap = Some(BlindPreemptSwapRecord {
+                    from: from_label,
+                    to: to_label,
+                    last_known_session_pct,
+                    at,
+                });
                 // Issue #582: record a swap fired away from a SERVER-THROTTLED active — the
                 // evidence the walk breaker above counts. Recorded on `retry_after` (any swap the
                 // directive was live for), NOT on `speculative`: the throttle moved whichever arm
@@ -6434,6 +6427,7 @@ fn capture_event_outcome_rejected(reason: CaptureRejection) -> CaptureEventOutco
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod oracle_1599;
     use crate::claude_state::OauthAccount;
     use crate::config::Tunables;
     // `SweepOutcome` is named only in test code here (the run loop consumes it by
@@ -10356,7 +10350,8 @@ mod tests {
             "narrates the target the swap landed on",
         );
         assert_eq!(
-            record.last_known_session_pct, 68,
+            record.last_known_session_pct,
+            Some(68),
             "carries the stale anchor pct"
         );
 
@@ -10369,7 +10364,7 @@ mod tests {
             .expect("the wire narrates the recent preemptive swap (#479)");
         assert_eq!(narrated.from_label, "work");
         assert_eq!(narrated.to_label, daemon.roster[new_active].label);
-        assert_eq!(narrated.last_known_session_pct, 68);
+        assert_eq!(narrated.last_known_session_pct, Some(68));
     }
 
     #[tokio::test]
@@ -11025,7 +11020,7 @@ mod tests {
             out.snapshot.accounts[0].blind_active,
             Some(BlindActive {
                 blind_secs: BLIND_GATE_SECS + 1,
-                last_known_session_pct: 29,
+                last_known_session_pct: Some(29),
                 auto_protection_degraded: true,
             }),
             "status reports auto-protection DEGRADED during a #582 reserve hold, not OK",
@@ -12508,7 +12503,7 @@ mod tests {
         let record = BlindPreemptSwapRecord {
             from: "spare".to_owned(),
             to: "work".to_owned(),
-            last_known_session_pct: 68,
+            last_known_session_pct: Some(68),
             at: base,
         };
 
@@ -12522,7 +12517,7 @@ mod tests {
         .expect("a current, recent preemptive swap is narrated");
         assert_eq!(shown.from_label, "spare");
         assert_eq!(shown.to_label, "work");
-        assert_eq!(shown.last_known_session_pct, 68);
+        assert_eq!(shown.last_known_session_pct, Some(68));
 
         // Superseded — the active account is NO LONGER the swap target (a later swap / manual `use` /
         // external login moved it away): the narration is stale → dropped, even well within the window.
@@ -12632,7 +12627,8 @@ mod tests {
             "blind past T with an in-band anchor is DEGRADED: {blind:?}",
         );
         assert_eq!(
-            blind.last_known_session_pct, 70,
+            blind.last_known_session_pct,
+            Some(70),
             "the projection carries the retained anchor's last-known session pct",
         );
         assert!(
@@ -21616,9 +21612,24 @@ mod tests {
             out.events,
         );
         assert!(daemon.state.last_blind_preempt_swap.is_none());
-        // And `status` projects no `blind_active` block for it (D10; the pure seam is
-        // `blind_active_view_emits_no_block_for_a_weekly_only_blind_active_until_the_wire_can_say_so`).
-        assert_eq!(out.snapshot.accounts[0].blind_active, None);
+        // And `status` projects the block with its percent ABSENT and the verdict DEGRADED past
+        // the gate — the no-session-window arm, report-only, so no swap above (issue #1599; the
+        // pure seam is `blind_active_view_emits_the_block_for_a_session_less_anchor_with_the_percent_absent`).
+        let blind = out.snapshot.accounts[0]
+            .blind_active
+            .expect("a weekly-only blind active keeps its block");
+        assert_eq!(
+            blind.last_known_session_pct, None,
+            "never a fabricated percent"
+        );
+        assert!(
+            blind.blind_secs > BLIND_GATE_SECS,
+            "blind past the gate: {blind:?}"
+        );
+        assert!(
+            blind.auto_protection_degraded,
+            "never auto-protection OK on a session gate that cannot arm: {blind:?}"
+        );
     }
 
     #[tokio::test]
@@ -21827,10 +21838,15 @@ mod tests {
         // fires for a session-less anchor exactly as before — `reason: BlindPreempt` with
         // `session_pct: None`, the line carrying no `session_pct=` token (never a fabricated `0`,
         // mutant M-e). What the swap retains for `status` is
-        // `a_retry_after_blind_preempt_from_a_weekly_only_anchor_retains_no_status_notice`'s to
-        // assert.
+        // `a_retry_after_blind_swap_off_a_session_less_anchor_narrates_the_swap_with_no_percent_on_the_wire`'s
+        // to assert (issue #1599). The swap also joins the #582 walk record, as #1602's deleted
+        // interim test asserted before #1599 restored the notice.
         let mut daemon =
             blind_retry_after_daemon_without_a_session_window(Duration::from_secs(3600)).await;
+        assert!(
+            daemon.state.retry_after_swaps.is_empty(),
+            "fixture: no `Retry-After` swap has fired yet",
+        );
         let swapped = daemon.tick().await;
         assert!(
             matches!(
@@ -21839,6 +21855,16 @@ mod tests {
             ),
             "the server directive swaps the blind weekly-only active away: {:?}",
             swapped.action,
+        );
+        assert_ne!(
+            daemon.state.active,
+            Some(0),
+            "the active moved off the throttled u-A"
+        );
+        assert_eq!(
+            daemon.state.retry_after_swaps.len(),
+            1,
+            "the #582 walk record gains the swap off a session-less anchor",
         );
         let swap = swapped
             .events
@@ -21961,56 +21987,6 @@ mod tests {
             "exactly as a two-window active whose session sits below the raw ceiling",
         );
         assert!(canonical_a);
-    }
-
-    #[tokio::test]
-    async fn a_retry_after_blind_preempt_from_a_weekly_only_anchor_retains_no_status_notice() {
-        // Issue #1602 (Specification § 4, D10's analogue — the transitional `1.14` interim; #1599
-        // retires this test when it restores the notice): a `Retry-After` blind-preempt swap off a
-        // session-less anchor FIRES and joins the #582 walk record, yet retains no
-        // `BlindPreemptSwapRecord` — its `last_known_session_pct` is a `u8` that cannot say
-        // "none" — so `status` carries no `recent_blind_preempt_swap` (encoded as an absent key by
-        // the committed `snapshot_frame_encodes_recent_blind_preempt_swap_only_when_present`).
-        // Mutant M-ae retains the record off a `0` default, and `status` would narrate
-        // "last-known 0%". The committed `blind_swap_fires_past_t_with_a_viable_target` keeps a
-        // two-window anchor's notice, with its percent, green beside this.
-        let mut daemon =
-            blind_retry_after_daemon_without_a_session_window(Duration::from_secs(3600)).await;
-        let swapped = daemon.tick().await;
-        assert!(
-            matches!(
-                swapped.action,
-                TickAction::PreemptivelySwapped { from: 0, .. }
-            ),
-            "the swap fires: {:?}",
-            swapped.action,
-        );
-        assert_ne!(
-            daemon.state.active,
-            Some(0),
-            "the active moved off the throttled u-A"
-        );
-        assert_eq!(
-            daemon.state.retry_after_swaps.len(),
-            1,
-            "the #582 walk record gains the swap",
-        );
-        assert!(
-            daemon.state.last_blind_preempt_swap.is_none(),
-            "no notice is retained for an anchor without a session window (1.14 interim)",
-        );
-        assert!(
-            swapped.snapshot.recent_blind_preempt_swap.is_none(),
-            "…so the same tick's status snapshot narrates nothing",
-        );
-        let readings = daemon.decision_readings(daemon.state.active);
-        assert!(
-            daemon
-                .snapshot(daemon.state.active, &readings, 0)
-                .recent_blind_preempt_swap
-                .is_none(),
-            "…and neither does a later one",
-        );
     }
 
     /// Issue #1443: the poll-tick disk-versus-memory roster check.

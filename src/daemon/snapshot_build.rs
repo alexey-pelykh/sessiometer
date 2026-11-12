@@ -637,6 +637,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod oracle_1599;
 
     use crate::daemon::tests::*;
 
@@ -724,11 +725,12 @@ mod tests {
     #[test]
     fn status_response_maps_an_absent_session_window_to_null_beside_a_present_weekly() {
         // Issue #1597 (M5): a served weekly-only reading — its session window absent (#1596) —
-        // rides the status/watch wire as `session_pct: null` beside a present `weekly_pct`: the
-        // transitional `1.14` state (decision D10's default), under which the session cell's
-        // `null` also means "no such window" until the status-wire item #1599 adds its no-window
-        // key. `to_pct` is applied through `Option::map`, so no number is invented for a window
-        // the account lacks — never a fabricated `0`, which is a measured idle window's byte.
+        // rides the status/watch wire as `session_pct: null` beside a present `weekly_pct`, and
+        // the line's `absent_windows` key (issue #1599, graded by
+        // `status_response_says_no_session_window_with_the_absent_windows_key_and_a_failed_poll_without_it`)
+        // is what tells that `null` from a failed poll's. `to_pct` is applied through
+        // `Option::map`, so no number is invented for a window the account lacks — never a
+        // fabricated `0`, which is a measured idle window's byte.
         let snapshot = StatusSnapshot {
             generated_at: 0,
             accounts: vec![AccountReading {
@@ -3944,6 +3946,47 @@ mod tests {
         encode_snapshot_frame(&versioned_status_response(&snapshot))
     }
 
+    /// A snapshot frame carrying the two "no session window" states issue #1599 adds, the sixth
+    /// committed golden: a blind ACTIVE weekly-only account whose `blind_active` block carries no
+    /// `last_known_session_pct` (its live reading cleared, so no `absent_windows` key either), and a
+    /// healthy SERVED weekly-only account carrying `"absent_windows":["session"]` beside its weekly
+    /// percent and reset. A NEW fixture, never a re-baseline: every row of the five older goldens is
+    /// a two-window `session_pct: 60` row.
+    ///
+    /// The block is hand-built and copied straight to the wire by `status_response`, so these bytes
+    /// pin the ENCODING only — the `auto_protection_degraded: true` derivation (480 s past the gate,
+    /// no `Retry-After` hold, the no-session-window arm alone) is graded through `blind_active_view`
+    /// by its own tests, never by this golden. Mirrored by Swift `Fixtures.snapshotNoSessionWindow`.
+    fn wire_golden_snapshot_no_window_frame() -> String {
+        let mut snapshot = watch_snapshot("work", 42, 0.60);
+        snapshot.accounts = vec![
+            AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                enabled: true,
+                usage: None,
+                blind_active: Some(BlindActive {
+                    blind_secs: 480,
+                    last_known_session_pct: None,
+                    auto_protection_degraded: true,
+                }),
+                ..Default::default()
+            },
+            AccountReading {
+                label: "spare".to_owned(),
+                enabled: true,
+                usage: Some(Usage {
+                    session: None,
+                    weekly: Some(0.90),
+                    weekly_resets_at: Some(1_794_005_999),
+                    session_resets_at: None,
+                }),
+                ..Default::default()
+            },
+        ];
+        encode_snapshot_frame(&versioned_status_response(&snapshot))
+    }
+
     /// One-time emitter for the committed wire goldens. `#[ignore]` — NOT part of the suite; it
     /// WRITES the bytes the pin test and the Swift fixtures consume. Run it ONLY alongside a
     /// deliberate wire-contract change:
@@ -3980,6 +4023,11 @@ mod tests {
             wire_golden_snapshot_expiry_frame(),
         )
         .expect("write wire-snapshot-expiry golden");
+        std::fs::write(
+            dir.join("wire-snapshot-no-window.json"),
+            wire_golden_snapshot_no_window_frame(),
+        )
+        .expect("write wire-snapshot-no-window golden");
     }
 
     /// The committed snapshot-frame golden — the exact bytes Swift `Fixtures.snapshotBasic` is
@@ -4016,6 +4064,13 @@ mod tests {
     const WIRE_SNAPSHOT_EXPIRY_GOLDEN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/build/fixtures/wire-snapshot-expiry.json"
+    ));
+
+    /// The committed "no session window" snapshot golden (issue #1599) — the exact bytes Swift
+    /// `Fixtures.snapshotNoSessionWindow` is pinned to.
+    const WIRE_SNAPSHOT_NO_WINDOW_GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/wire-snapshot-no-window.json"
     ));
 
     #[test]
@@ -4061,6 +4116,14 @@ mod tests {
             WIRE_SNAPSHOT_EXPIRY_GOLDEN,
             "the committed wire-snapshot-expiry golden drifted from the AccountExpiry / ExpiryCohort \
              encoders (issues #878/#882/#879) — re-run `cargo test -- --ignored \
+             emit_wire_golden_fixtures`, then update the Swift mirror (apps/menubar) so its fixtures \
+             stay byte-identical"
+        );
+        assert_eq!(
+            wire_golden_snapshot_no_window_frame(),
+            WIRE_SNAPSHOT_NO_WINDOW_GOLDEN,
+            "the committed wire-snapshot-no-window golden drifted from the absent_windows / \
+             percent-less BlindActive encoders (issue #1599) — re-run `cargo test -- --ignored \
              emit_wire_golden_fixtures`, then update the Swift mirror (apps/menubar) so its fixtures \
              stay byte-identical"
         );
@@ -4170,7 +4233,7 @@ mod tests {
         snapshot.recent_blind_preempt_swap = Some(BlindPreemptSwap {
             from_label: "work".to_owned(),
             to_label: "spare".to_owned(),
-            last_known_session_pct: 68,
+            last_known_session_pct: Some(68),
         });
         let frame = encode_snapshot_frame(&versioned_status_response(&snapshot));
         assert!(
@@ -4308,8 +4371,10 @@ mod tests {
         // key is a HARD decode error that costs the whole frame, not just the cell.
         //
         // Defaulting rather than throwing is the DELIBERATE choice here, and it is the opposite of
-        // the sibling `BlindActive` posture ("the daemon always sends all three, so a malformed
-        // `blind_active` missing one throws rather than mis-reads"). The difference is that this
+        // the sibling `BlindActive` posture ("the daemon always sends `blind_secs` and
+        // `auto_protection_degraded`, so a malformed `blind_active` missing either throws rather than
+        // mis-reads" — its percent is optional since 1.15, absent for an anchor with no session
+        // window, issue #1599, never defaulted to `0`). The difference is that this
         // enum has a fail-SAFE default: `ExpiryHorizon::Unknown` means "no deadline observed", never
         // "not expiring" (issue #137, and exactly why #878 made `Unknown` the `#[default]` — "a
         // consumer that forgets to classify gets the honest answer, not the dangerous one"). So the
@@ -4689,7 +4754,7 @@ mod tests {
                     active: true,
                     blind_active: Some(BlindActive {
                         blind_secs: 480,
-                        last_known_session_pct: 87,
+                        last_known_session_pct: Some(87),
                         auto_protection_degraded: true,
                     }),
                     ..Default::default()
@@ -4721,7 +4786,7 @@ mod tests {
             work.blind_active,
             Some(BlindActive {
                 blind_secs: 480,
-                last_known_session_pct: 87,
+                last_known_session_pct: Some(87),
                 auto_protection_degraded: true,
             }),
         );
