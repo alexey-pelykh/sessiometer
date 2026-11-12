@@ -273,23 +273,22 @@ omitted percent maps, so the verdict and the absent percent state one fact. Why:
 compares a *level to a level*, and an anchor with no session window has no level to compare, so
 `blind_gate_armed` reads false on it; with the #584 velocity arm also reading false there, a
 restored block with no `Retry-After` hold would report `auto-protection OK` for an account no
-session gate can protect. The one-sided invariant the arms serve, never "OK" while the daemon is
-not protecting the account, needs a disjunct, and adding one can only move OK to DEGRADED. Before
-the gate such a block reads OK, the pre-gate verdict every blind account gets. The arm is
+session gate can protect. The one-sided invariant the arms serve, never "OK" while the daemon is not
+protecting the account, needs a disjunct, and adding one can only move OK to DEGRADED. Before the
+gate such a block reads OK, the pre-gate verdict every blind account gets. The arm is
 **REPORT-ONLY**, like the #584 velocity arm: no swap fires on it, and no daemon decision reads
 `auto_protection_degraded`. Whether a weekly anchor should **arm** a swap is not decided here: that
 is D3's arming half, the design's OAD-2, settled by council on 2026-11-03 as option (a), leave such
-an account unprotected and say so, rather than (b), arm on a weekly anchor against a new weekly
-band (the record is a comment on #1602). It stays outside umbrella #1590 until its reopening
-evidence is observed: a `blind_exit` line from a weekly-only anchor with `was_active=true`,
-`swapped_away=false` and no `session_pct=` token, whose `weekly_pct` is below the weekly rotation
-line and whose `weekly_at_recovery` is at or over it, a weekly wall reached while blind with no arm
-acting. D3
+an account unprotected and say so, rather than (b), arm on a weekly anchor against a new weekly band
+(the record is a comment on #1602). It stays outside umbrella #1590 until its reopening evidence is
+observed: a `blind_exit` line from a weekly-only anchor with `was_active=true`, `swapped_away=false`
+and no `session_pct=` token, whose `weekly_pct` is below the weekly rotation line and whose
+`weekly_at_recovery` is at or over it, a weekly wall reached while blind with no arm acting. D3
 itself was settled by council on 2026-11-03 under the maintainer's 2026-11-02 delegation, which
 supersedes the "ratification-pending, not an operator ruling" and "the ruling on D3 is the
-operator's" of the #1593 paragraph above, left unedited here. The representation recorded here,
-the fourth report-only arm, was settled by council on 2026-11-04 over a new omittable key and over
-a client-side exception (the record is a comment on #1599). The same change gives the
+operator's" of the #1593 paragraph above, left unedited here. The representation recorded here, the
+fourth report-only arm, was settled by council on 2026-11-04 over a new omittable key and over a
+client-side exception (the record is a comment on #1599). The same change gives the
 `recent_blind_preempt_swap` notice an optional percent, because #582's `Retry-After` arm swaps off a
 session-less anchor without reading the session. The core **#452** decision and its constants are
 unchanged.

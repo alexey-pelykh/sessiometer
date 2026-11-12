@@ -611,8 +611,8 @@ final class WireDecoderTests: XCTestCase {
     // AC (#884): a PARTIAL `expiry` object degrades rather than throwing — deliberately unlike
     // `BlindActive`, whose two required fields (`blind_secs`, `auto_protection_degraded`) have no
     // honest default and so throw when one is missing — its percent is optional since 1.15, `nil` for
-    // an anchor with no session window (issue #1599), never a defaulted `0`. Both
-    // of this object's fields carry `#[serde(default)]` on the daemon side; the mirror matches.
+    // an anchor with no session window (issue #1599), never a defaulted `0`. Both `expiry` fields
+    // the mirror reads carry `#[serde(default)]` on the daemon side; the mirror matches.
     func testPartialExpiryObjectDegradesToTheFailSafeRatherThanThrowing() throws {
         let frame = #"""
         {"type":"snapshot","schema_version":{"major":1,"minor":15},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{}}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":true,"systemic_refresh_failure":null}

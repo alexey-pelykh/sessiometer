@@ -241,8 +241,9 @@ enum Fixtures {
     /// active account's usage poll is blind (429 / ADR-0017): `session_pct` / `weekly_pct` are null (the
     /// daemon's `usage: None`), and `blind_active` carries the SEMANTIC line — blind duration, the retained
     /// last-known session %, and `auto_protection_degraded: false`. A viable `spare` exists (non-cornered).
-    /// NOT byte-pinned — the goldens cover non-blind frames that omit the key (`skip_serializing_if`), so a
-    /// non-blind frame stays byte-unchanged; this hand-built frame gives `blind_active` decode coverage.
+    /// NOT byte-pinned — no golden carries a block with a percent: the goldens pin non-blind frames, which
+    /// omit the key (`skip_serializing_if`), and `wire-snapshot-no-window.json`'s percent-less block
+    /// (issue #1599); this hand-built frame gives the percent-carrying `blind_active` block decode coverage.
     static let snapshotBlindActiveOK = #"""
     {"type":"snapshot","schema_version":{"major":1,"minor":15},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","blind_active":{"blind_secs":240,"last_known_session_pct":64,"auto_protection_degraded":false}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":true,"systemic_refresh_failure":null}
     """#
