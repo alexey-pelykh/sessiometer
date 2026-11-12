@@ -77,7 +77,8 @@
 //! `null` lines out; and on every machine that has run this build, every older build's
 //! `stats` and compaction stay stopped, which is the fence's purpose. No older build
 //! runs as the daemon against a store that holds a `null` line (the deployment rule of
-//! issue #1604).
+//! issue #1604, stated in `docs/runbooks/replacing-the-running-daemon.md` § Prerequisites,
+//! "Both halves of the binary change together").
 //!
 //! # Roll-once-per-whole-day, so the aggregates are exact
 //!
