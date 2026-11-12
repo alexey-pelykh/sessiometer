@@ -480,7 +480,7 @@ impl CredentialReadSource {
 ///   on the #619 plausibility-corrected anchor session (`anchor.high_water`) so this projection
 ///   tracks the swap the gate actually fires rather than a stale-low pre-blind reading;
 /// - the #582 SERVER-directed arm (`server_retry_after_hold` AND blind past the interim
-///   [`BLIND_GATE_SECS`]), fronting the #582 swap-away; and
+///   [`BLIND_GATE_SECS`]), fronting the #582 swap-away;
 /// - the #584 VELOCITY-projection arm ([`blind_velocity_projected_armed`]) — the first arm mirroring NO
 ///   decision: it reports a BELOW-band anchor whose retained #539 velocity, projected over the blind
 ///   window, could PLAUSIBLY reach the trigger (a burn the anchor arm cannot see, because the frozen

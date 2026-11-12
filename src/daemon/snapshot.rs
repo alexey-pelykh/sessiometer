@@ -538,17 +538,17 @@ pub(crate) struct SchemaVersion {
 /// gone. A refreshed account still carries the AC-3 durability signal in both directions
 /// (`"rotated": true` / `false`) — the signal is preserved, only the fabricated value is dropped.
 ///
-/// **This is the one entry that RESHAPES an existing key rather than adding a new one, so its
-/// forward-compat is asymmetric — deliberately, and unlike the omit-when-absent siblings above.** A
-/// pre-#1070 client typed the key as REQUIRED, so a 1.14 daemon's non-refreshed frame does not
-/// decode against it (Swift `WatchStatusStore` drops the line). The Rust `status` client is immune
-/// by construction — it ships in the same binary as the daemon it reads — so the exposure is exactly
-/// one consumer, the separately-installed menubar app, which this bump updates in lockstep. The
-/// bump is MINOR because [`SchemaVersion`] support gates on the MAJOR and the reshape is the
-/// narrowest one that removes the false value; an operator running a 1.14 daemon against a
-/// pre-#1070 app must update the app, which is the same lockstep every wire change here already
-/// assumes. The reverse direction is clean: a 1.14 client reading a ≤1.13 daemon decodes the
-/// always-present key as `Some(_)`.
+/// **This is the first entry that RESHAPES an existing key rather than adding a new one (the 1.15
+/// entry below reshapes two more), so its forward-compat is asymmetric — deliberately, and unlike
+/// the omit-when-absent siblings above.** A pre-#1070 client typed the key as REQUIRED, so a 1.14
+/// daemon's non-refreshed frame does not decode against it (Swift `WatchStatusStore` drops the
+/// line). The Rust `status` client is immune by construction — it ships in the same binary as the
+/// daemon it reads — so the exposure is exactly one consumer, the separately-installed menubar app,
+/// which this bump updates in lockstep. The bump is MINOR because [`SchemaVersion`] support gates
+/// on the MAJOR and the reshape is the narrowest one that removes the false value; an operator
+/// running a 1.14 daemon against a pre-#1070 app must update the app, which is the same lockstep
+/// every wire change here already assumes. The reverse direction is clean: a 1.14 client reading a
+/// ≤1.13 daemon decodes the always-present key as `Some(_)`.
 ///
 /// `1.15` makes the wire say "no session window" (issue #1599), in four changes that ride one
 /// minor. (1) It ADDS the per-account [`AccountStatusLine::absent_windows`] list (`["session"]`,
