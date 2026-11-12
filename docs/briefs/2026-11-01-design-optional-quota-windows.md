@@ -30,7 +30,10 @@ as the author's own choice had no pipeline recommendation in the PRD; each is no
    `BlindAnchor` take `Option<f64>` per window, `Copy` kept on the three that carry it — `UsageReport` is `Clone`, never `Copy` (AD-1). The compiler then enumerates every
    consumer (33 + 17 production errors measured); a flag beside an `f64` must be consulted at all 93
    reads or the fabricated value stands, and a sentinel `0.0` is byte-identical to an idle window. One bounded exception: the tranche-0 hot-fix serves a weekly-only reply with a `0.0` session and stores no sample for it (decision 16).
-2. **The parser composes per-window Options from the unchanged `dimension` lookup**; a 200 reply with
+2. **The parser composes per-window Options from the unchanged `dimension` lookup**, each window
+   served, absent (`None`), or present but unreadable: a window the reply carries in no shape that
+   yields a numeric fraction is `Err(UsageParse)` naming the window, which fails the whole reply
+   (#1614, ruled Answer 2 by council on 2026-11-04; the record is a comment on #1590); a 200 reply with
    *neither* window stays a hard `UsageParse` (D1 option a), and `"five_hour": null` is treated
    identically to an absent key (D2) (AD-2). Two invariants are pinned by tests: a reset stamp implies
    its fraction; a served reading carries at least one window (AD-3).
